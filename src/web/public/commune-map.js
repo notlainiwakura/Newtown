@@ -1,4 +1,4 @@
-/* Commune Map - Live character activity dashboard */
+/* Commune Map — Live character activity dashboard */
 
 (function () {
   'use strict';
@@ -87,18 +87,18 @@
   const eventSources = new Map();
   const charEventCounts = {};
   const charLastType = {};
-  const charLocations = {};
+  const charLocations = {}; // charId -> buildingId
   const logEntries = [];
   const MAX_LOG = 100;
   const MAX_NOTIFICATIONS = 20;
   let notifCount = 0;
-  let currentView = 'town';
+  let currentView = 'town'; // 'town' or 'network'
 
   // Chat state
   let chatCharId = null;
   let chatAbortController = null;
-  const chatSessions = {};
-  const chatHistories = {};
+  const chatSessions = {}; // charId -> sessionId (persisted to localStorage)
+  const chatHistories = {}; // charId -> [{role, text}] (ephemeral)
 
   // ===== DOM refs =====
   const townGrid = document.getElementById('town-grid');
@@ -130,8 +130,9 @@
     bindLogToggle();
     bindViewToggle();
     bindChat();
+    // Skip SSE connections — they consume all 6 HTTP/1.1 slots per host,
+    // blocking activity fetches. Activity loads on-demand instead.
     fetchAllLocations();
-    connectAll();
     window.addEventListener('resize', drawConnections);
     updateConnectionStatus(0);
   }
@@ -147,6 +148,7 @@
         `<div class="building-name">${building.name}</div>` +
         `<div class="building-residents" id="residents-${building.id}"></div>`;
 
+      // Click building background → select first resident for activity panel
       cell.addEventListener('click', () => {
         const resident = CHARACTERS.find((c) => charLocations[c.id] === building.id);
         if (resident) selectCharacter(resident.id);
@@ -157,11 +159,13 @@
   }
 
   function fetchAllLocations() {
+    // Initialize with defaults
     for (const char of CHARACTERS) {
       charLocations[char.id] = DEFAULT_LOCATIONS[char.id] || 'square';
     }
     renderResidents();
 
+    // Fetch actual locations from each character's server
     for (const char of CHARACTERS) {
       fetch(char.locationPath)
         .then((resp) => {
@@ -175,17 +179,19 @@
           }
         })
         .catch(() => {
-          // Keep default location.
+          // Keep default location
         });
     }
   }
 
   function renderResidents() {
+    // Clear all resident containers
     for (const building of BUILDINGS) {
       const container = document.getElementById('residents-' + building.id);
       if (container) container.innerHTML = '';
     }
 
+    // Place characters in their buildings
     for (const char of CHARACTERS) {
       const buildingId = charLocations[char.id];
       if (!buildingId) continue;
@@ -216,12 +222,14 @@
   }
 
   function animateMovement(char, fromId, toId) {
+    // Flash the destination cell
     const destCell = document.querySelector(`.building-cell[data-building="${toId}"]`);
     if (destCell) {
       destCell.classList.add('arrival');
       setTimeout(() => destCell.classList.remove('arrival'), 1500);
     }
 
+    // Create a town-level notification if in town view
     if (currentView === 'town') {
       const fromBuilding = BUILDINGS.find((b) => b.id === fromId);
       const toBuilding = BUILDINGS.find((b) => b.id === toId);
@@ -286,6 +294,7 @@
     svgLines.innerHTML = '';
     const rect = nodeMap.getBoundingClientRect();
 
+    // Connect the whole three-person town
     const pairs = [
       ['neo', 'plato'],
       ['neo', 'joe'],
@@ -331,7 +340,7 @@
         retryDelay = 1000;
         if (onOpen) {
           onOpen();
-          onOpen = null;
+          onOpen = null; // only call once
         }
       };
 
@@ -340,13 +349,14 @@
           const event = JSON.parse(e.data);
           handleEvent(char, event);
         } catch {
-          // Ignore parse errors.
+          // ignore parse errors
         }
       };
 
       es.onerror = () => {
         es.close();
         eventSources.delete(char.id);
+        // Exponential backoff
         setTimeout(connect, retryDelay);
         retryDelay = Math.min(retryDelay * 2, 30000);
       };
@@ -374,24 +384,29 @@
     charEventCounts[char.id] = (charEventCounts[char.id] || 0) + 1;
     charLastType[char.id] = event.type || '';
 
+    // Update node UI
     const countEl = document.getElementById('count-' + char.id);
     if (countEl) countEl.textContent = charEventCounts[char.id] + ' events';
 
     const infoEl = document.getElementById('info-' + char.id);
     if (infoEl) infoEl.textContent = event.type || '...';
 
+    // Pulse orb
     const orb = document.getElementById('orb-' + char.id);
     if (orb) {
       orb.classList.remove('pulse');
-      void orb.offsetWidth;
+      void orb.offsetWidth; // reflow
       orb.classList.add('pulse');
     }
 
+    // Flash connection lines involving this character
     flashLines(char.id);
 
+    // Handle movement events
     if (event.type === 'movement') {
       const key = event.sessionKey || '';
       const parts = key.split(':');
+      // sessionKey format: movement:<from>:<to>
       if (parts.length >= 3) {
         const fromId = parts[1];
         const toId = parts[2];
@@ -401,10 +416,12 @@
       }
     }
 
+    // Floating notification (only in network view)
     if (currentView === 'network') {
       createNotification(char, event);
     }
 
+    // Log entry
     addLogEntry(char, event);
   }
 
@@ -430,9 +447,11 @@
     const typeColor = TYPE_COLORS[event.type] || '#6090c0';
     el.innerHTML = `<span style="color:${char.color}">${char.name}</span> <span style="color:${typeColor}">${event.type}</span>: ${snippet}`;
 
+    // Position near the character node
     const rect = nodeMap.getBoundingClientRect();
     const cx = (char.x / 100) * rect.width;
     const cy = (char.y / 100) * rect.height;
+    // Offset randomly so they don't stack
     const ox = (Math.random() - 0.5) * 120;
     const oy = -30 + Math.random() * -20;
     el.style.left = Math.max(10, Math.min(rect.width - 200, cx + ox)) + 'px';
@@ -483,6 +502,7 @@
     const char = CHARACTERS.find((c) => c.id === charId);
     if (!char) return;
 
+    // Update node selection UI
     document.querySelectorAll('.char-node').forEach((n) => n.classList.remove('selected'));
     const node = document.querySelector(`.char-node[data-id="${charId}"]`);
     if (node) node.classList.add('selected');
@@ -584,8 +604,7 @@
   }
 
   function escapeHtml(str) {
-    const value = String(str || '');
-    return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
   // ===== Time controls =====
@@ -621,17 +640,20 @@
     const char = CHARACTERS.find((c) => c.id === charId);
     if (!char) return;
 
+    // Also select character in activity panel
     selectCharacter(charId);
 
     chatModalTitle.textContent = char.name;
     chatModalTitle.style.color = char.color;
     chatModal.style.display = 'flex';
 
+    // Restore session from localStorage
     const storedSession = localStorage.getItem('stranger-session-' + charId);
     if (storedSession) {
       chatSessions[charId] = storedSession;
     }
 
+    // Render existing in-memory history
     chatModalMessages.innerHTML = '';
     const history = chatHistories[charId];
     if (history && history.length > 0) {
@@ -698,25 +720,30 @@
     const char = CHARACTERS.find((c) => c.id === charId);
     if (!char) return;
 
+    // Init history
     if (!chatHistories[charId]) chatHistories[charId] = [];
     chatHistories[charId].push({ role: 'stranger', text });
 
+    // Render user message
     addChatMessage('stranger', text, char.color);
 
+    // Disable input while streaming
     const submitBtn = chatModalForm.querySelector('button');
     chatModalInput.disabled = true;
     submitBtn.disabled = true;
 
+    // Create streaming bubble
     const { el: bubble, msgText } = createStreamingBubble(char.color);
     let fullText = '';
 
+    // Abort previous if any
     if (chatAbortController) chatAbortController.abort();
     chatAbortController = new AbortController();
 
     try {
-      const priorSessionId = chatSessions[charId] || null;
+      const sessionId = chatSessions[charId] || null;
       const payload = { message: text, stranger: true };
-      if (priorSessionId) payload.sessionId = priorSessionId;
+      if (sessionId) payload.sessionId = sessionId;
 
       const resp = await fetch(char.chatPath, {
         method: 'POST',
@@ -753,23 +780,25 @@
               fullText += event.content;
               msgText.textContent = fullText;
               chatModalMessages.scrollTop = chatModalMessages.scrollHeight;
+            } else if (event.type === 'done') {
+              // streaming complete
             } else if (event.type === 'error') {
               fullText += '\n[error: ' + (event.message || 'unknown') + ']';
               msgText.textContent = fullText;
             }
           } catch {
-            // Ignore parse errors.
+            // ignore parse errors
           }
         }
       }
     } catch (err) {
-      const errorName = err && typeof err === 'object' && 'name' in err ? err.name : '';
-      if (errorName !== 'AbortError') {
+      if (err.name !== 'AbortError') {
         fullText = fullText || '[connection error]';
         msgText.textContent = fullText;
       }
     }
 
+    // Finalize
     bubble.classList.remove('streaming');
     if (fullText && charId === chatCharId) {
       chatHistories[charId].push({ role: 'character', text: fullText });

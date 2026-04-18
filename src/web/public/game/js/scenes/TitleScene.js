@@ -33,7 +33,7 @@ class TitleScene extends Phaser.Scene {
     }
 
     // Title
-    this.add.text(cx, 140, '\u2720 newtown \u2720', {
+    this.add.text(cx, 140, '\u2720 laintown \u2720', {
       fontSize: '64px',
       fontFamily: "'M PLUS Rounded 1c', sans-serif",
       color: '#c87898',
@@ -41,7 +41,7 @@ class TitleScene extends Phaser.Scene {
       fontStyle: 'bold',
     }).setOrigin(0.5);
 
-    this.add.text(cx, 230, 'a town with no outside wire', {
+    this.add.text(cx, 230, 'a place in the wired', {
       fontSize: '24px',
       fontFamily: "'M PLUS Rounded 1c', sans-serif",
       color: '#685868',
@@ -111,11 +111,6 @@ class TitleScene extends Phaser.Scene {
       this.tokenText = stored;
       this._updateDisplay();
       this._tryAuth();
-    } else {
-      // Default token for local Newtown runs. Users can override via POSSESSION_TOKEN.
-      this.tokenText = 'newtown';
-      this._updateDisplay();
-      this._tryAuth();
     }
 
     this._keyHandler = (e) => this._handleKey(e);
@@ -154,7 +149,7 @@ class TitleScene extends Phaser.Scene {
         this.statusText.setText('entering the wired...');
         this.statusText.setColor('#78b898');
         document.removeEventListener('keydown', this._keyHandler);
-        this.scene.start('BootScene', { isPossessed: status.isPossessed, location: status.location || DEFAULT_LOCATIONS[PLAYER_ID] || 'square' });
+        this.scene.start('BootScene', { isPossessed: status.isPossessed, location: status.location || DEFAULT_LOCATIONS[PLAYER_ID] || 'market' });
       } else {
         this.statusText.setText('invalid token');
         this.statusText.setColor('#d07878');

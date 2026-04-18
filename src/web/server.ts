@@ -308,7 +308,7 @@ function generateNavBar(pathname: string): string {
 #laintown-nav a.ltn-active{color:#4a9eff}
 </style>
 <style>${isGamePage ? 'body{padding-top:0!important}#laintown-nav{background:rgba(10,10,15,0.6);border-bottom-color:rgba(26,26,46,0.4)}' : 'body{padding-top:32px!important}'}</style>
-<div id="laintown-nav"><a class="ltn-title" href="/">NEWTOWN</a>${links}</div>
+<div id="laintown-nav"><a class="ltn-title" href="/">LAINTOWN</a>${links}</div>
 <script>(function(){var k=new URLSearchParams(location.search).get('key');if(k){var as=document.querySelectorAll('#laintown-nav a');for(var i=0;i<as.length;i++){var a=as[i],h=a.getAttribute('href');if(h){var hi=h.indexOf('#'),base=hi>-1?h.slice(0,hi):h,frag=hi>-1?h.slice(hi):'';if(base.indexOf('?')===-1){a.setAttribute('href',base+'?key='+encodeURIComponent(k)+frag)}else{a.setAttribute('href',base+'&key='+encodeURIComponent(k)+frag)}}}}})();</script>`;
 }
 

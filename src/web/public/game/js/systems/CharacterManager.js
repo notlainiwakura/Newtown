@@ -51,7 +51,7 @@ class CharacterManager {
     const byBuilding = {};
     for (const [charId, charData] of Object.entries(CHARACTERS)) {
       if (charId === excludeId) continue;
-      const building = this.locations[charId] || DEFAULT_LOCATIONS[charId] || 'square';
+      const building = this.locations[charId] || DEFAULT_LOCATIONS[charId] || 'market';
       this.locations[charId] = building;
       if (!byBuilding[building]) byBuilding[building] = [];
       byBuilding[building].push(charId);

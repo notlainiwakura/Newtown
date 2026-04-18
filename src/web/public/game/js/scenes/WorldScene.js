@@ -11,7 +11,7 @@ class WorldScene extends Phaser.Scene {
     this.cameras.main.setBackgroundColor('#1a1520');
     this._buildTilemap();
 
-    const startBuilding = this.authData.location || DEFAULT_LOCATIONS[PLAYER_ID] || 'square';
+    const startBuilding = this.authData.location || DEFAULT_LOCATIONS[PLAYER_ID] || 'market';
     const spawn = getBuildingSpawn(startBuilding);
     this.playerTileX = spawn.x;
     this.playerTileY = spawn.y;

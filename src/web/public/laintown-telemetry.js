@@ -4,7 +4,6 @@
 
   // ===== Character endpoints =====
   var ENDPOINTS = [
-    { id: 'guide', name: 'Guide', color: '#f2d48f', path: '/api/activity' },
     { id: 'neo', name: 'Neo', color: '#80c0ff', path: '/neo/api/activity' },
     { id: 'plato', name: 'Plato', color: '#e0c870', path: '/plato/api/activity' },
     { id: 'joe', name: 'Joe', color: '#78b898', path: '/joe/api/activity' },

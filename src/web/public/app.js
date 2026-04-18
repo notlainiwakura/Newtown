@@ -12,35 +12,10 @@ const imagePreview = document.getElementById('image-preview');
 const previewImg = document.getElementById('preview-img');
 const removeImageBtn = document.getElementById('remove-image');
 
-const basePath = window.location.pathname.replace(/\/+$/, '');
-const sessionStorageKey = `lain-session:${basePath || 'root'}`;
-let sessionId = localStorage.getItem(sessionStorageKey) || null;
+let sessionId = localStorage.getItem('lain-session') || null;
 let pendingImage = null; // { base64: string, mimeType: string }
 const apiKey = document.querySelector('meta[name="lain-api-key"]')?.content || null;
-let identity = { id: basePath.replace(/^\/+/, '') || 'newtown', name: 'Newtown' };
-
-function getIdentityLabel() {
-  return (identity.name || 'Newtown').toUpperCase();
-}
-
-function updateIdentityLabels() {
-  document.querySelectorAll('[data-identity-label]').forEach((el) => {
-    el.textContent = getIdentityLabel();
-  });
-}
-
-async function loadIdentity() {
-  try {
-    const response = await fetch((basePath || '') + '/api/meta/identity');
-    if (response.ok) {
-      identity = await response.json();
-    }
-  } catch {
-    // Keep fallback identity.
-  }
-
-  updateIdentityLabels();
-}
+const basePath = window.location.pathname.replace(/\/+$/, '');
 
 // Scroll to bottom of messages
 function scrollToBottom() {
@@ -64,7 +39,7 @@ function createMessage(type, content, _sender = null) {
     `;
   } else if (type === 'lain') {
     div.innerHTML = `
-      <span class="sender">${escapeHtml(getIdentityLabel())}</span>
+      <span class="sender">LAIN</span>
       <span class="text">${formatLainResponse(content)}</span>
     `;
   } else if (type === 'error') {
@@ -102,7 +77,7 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-// Format response (preserve line breaks, handle special formatting)
+// Format Lain's response (preserve line breaks, handle special formatting)
 function formatLainResponse(text) {
   const imagePattern = /\[IMAGE:\s*([^\]]*)\]\(([^)]+)\)/g;
   const images = [];
@@ -226,7 +201,7 @@ function createStreamingMessage() {
   const div = document.createElement('div');
   div.className = 'lain-message';
   div.innerHTML = `
-    <span class="sender">${escapeHtml(getIdentityLabel())}</span>
+    <span class="sender">LAIN</span>
     <span class="text" id="streaming-text"></span>
   `;
   return div;
@@ -282,7 +257,7 @@ async function sendMessageStream(message, image, onChunk, onDone, onError) {
 
             if (data.type === 'session' && data.sessionId) {
               sessionId = data.sessionId;
-              localStorage.setItem(sessionStorageKey, sessionId);
+              localStorage.setItem('lain-session', sessionId);
             } else if (data.type === 'chunk') {
               onChunk(data.content);
             } else if (data.type === 'done') {
@@ -326,7 +301,7 @@ async function sendMessage(message) {
 
     if (data.sessionId) {
       sessionId = data.sessionId;
-      localStorage.setItem(sessionStorageKey, sessionId);
+      localStorage.setItem('lain-session', sessionId);
     }
 
     return data.response;
@@ -379,7 +354,7 @@ chatForm.addEventListener('submit', async (e) => {
     },
     () => {
       if (!fullText) {
-        textSpan.innerHTML = formatLainResponse('...connection to the town failed. try again.');
+        textSpan.innerHTML = formatLainResponse('...connection to the wired failed. try again.');
       }
     }
   );
@@ -393,7 +368,6 @@ messageInput.addEventListener('keydown', (e) => {
 });
 
 messageInput.focus();
-void loadIdentity();
 
 function addGlitchEffect() {
   const logo = document.querySelector('.logo-title');
@@ -421,7 +395,6 @@ function addAmbientMessage() {
   if (Math.random() > 0.7) {
     const msg = ambientMessages[Math.floor(Math.random() * ambientMessages.length)];
     const statusText = document.querySelector('.status-text');
-    if (!statusText) return;
     statusText.textContent = msg.toUpperCase();
     setTimeout(() => {
       statusText.textContent = 'LAYER 07';
@@ -433,15 +406,15 @@ setInterval(addAmbientMessage, 10000);
 
 console.log(`
 %c
-  +-------------------------------------------+
-  |           COPLAND OS ENTERPRISE           |
-  |     TACHIBANA GENERAL LABORATORIES        |
-  +-------------------------------------------+
-  |                                           |
-  |   no matter where you go,                 |
-  |   everyone's connected.                   |
-  |                                           |
-  |   PROTOCOL 7 // LAYER 07                  |
-  |                                           |
-  +-------------------------------------------+
+  ╔═══════════════════════════════════════════╗
+  ║           COPLAND OS ENTERPRISE           ║
+  ║     TACHIBANA GENERAL LABORATORIES        ║
+  ╠═══════════════════════════════════════════╣
+  ║                                           ║
+  ║   no matter where you go,                 ║
+  ║   everyone's connected.                   ║
+  ║                                           ║
+  ║   PROTOCOL 7 // LAYER 07                  ║
+  ║                                           ║
+  ╚═══════════════════════════════════════════╝
 `, 'color: #4080ff; font-family: monospace;');

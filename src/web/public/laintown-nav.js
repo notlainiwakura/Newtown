@@ -46,7 +46,7 @@
     var title = document.createElement('a');
     title.className = 'ltn-title';
     title.href = '/';
-    title.textContent = 'NEWTOWN';
+    title.textContent = 'LAINTOWN';
     nav.appendChild(title);
 
     var key = new URLSearchParams(location.search).get('key');

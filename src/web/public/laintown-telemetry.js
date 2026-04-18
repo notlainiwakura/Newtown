@@ -4,12 +4,10 @@
 
   // ===== Character endpoints =====
   var ENDPOINTS = [
-    { id: 'wired-lain', name: 'Wired Lain', color: '#4080ff', path: '/api/activity' },
-    { id: 'lain', name: 'Lain', color: '#80c0ff', path: '/local/api/activity' },
-    { id: 'pkd', name: 'PKD', color: '#c060ff', path: '/pkd/api/activity' },
-    { id: 'mckenna', name: 'McKenna', color: '#40e080', path: '/mckenna/api/activity' },
-    { id: 'john', name: 'John', color: '#ffb040', path: '/john/api/activity' },
-    { id: 'hiru', name: 'Hiru', color: '#60d0a0', path: '/hiru/api/activity' },
+    { id: 'guide', name: 'Guide', color: '#f2d48f', path: '/api/activity' },
+    { id: 'neo', name: 'Neo', color: '#80c0ff', path: '/neo/api/activity' },
+    { id: 'plato', name: 'Plato', color: '#e0c870', path: '/plato/api/activity' },
+    { id: 'joe', name: 'Joe', color: '#78b898', path: '/joe/api/activity' },
   ];
 
   var TYPE_COLORS = {

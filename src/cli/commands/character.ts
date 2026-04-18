@@ -33,6 +33,8 @@ function buildCharacterConfig(
     port,
     publicDir: join(SRC_DIR, 'src', 'web', 'public-character'),
     peers: parsePeerConfig(),
+    // The game dashboard expects a possessable resident as the player avatar.
+    possessable: id === 'joe',
   };
 }
 

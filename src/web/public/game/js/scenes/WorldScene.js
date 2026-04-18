@@ -11,17 +11,18 @@ class WorldScene extends Phaser.Scene {
     this.cameras.main.setBackgroundColor('#1a1520');
     this._buildTilemap();
 
-    const startBuilding = this.authData.location || 'market';
+    const startBuilding = this.authData.location || DEFAULT_LOCATIONS[PLAYER_ID] || 'square';
     const spawn = getBuildingSpawn(startBuilding);
     this.playerTileX = spawn.x;
     this.playerTileY = spawn.y;
 
-    this.player = this.add.sprite(this.playerTileX * T + T / 2, this.playerTileY * T + T / 2, 'char_hiru');
+    this.player = this.add.sprite(this.playerTileX * T + T / 2, this.playerTileY * T + T / 2, 'char_' + PLAYER_ID);
     this.player.setDepth(10);
     this.player.setOrigin(0.5, 0.75);
 
-    this.playerLabel = this.add.text(this.player.x, this.player.y - GAME_CONFIG.SPRITE_H + 8, 'Hiru', {
-      fontSize: '20px', fontFamily: "'M PLUS Rounded 1c', sans-serif", color: '#88b898', align: 'center', fontStyle: 'bold'
+    const playerData = CHARACTERS[PLAYER_ID] || { name: PLAYER_ID, colorHex: '#88b898' };
+    this.playerLabel = this.add.text(this.player.x, this.player.y - GAME_CONFIG.SPRITE_H + 8, playerData.name || PLAYER_ID, {
+      fontSize: '20px', fontFamily: "'M PLUS Rounded 1c', sans-serif", color: playerData.colorHex || '#88b898', align: 'center', fontStyle: 'bold'
     });
     this.playerLabel.setOrigin(0.5, 1);
     this.playerLabel.setDepth(11);
@@ -76,7 +77,7 @@ class WorldScene extends Phaser.Scene {
   async _initWorld() {
     try { await this.possessionManager.startPossession(); } catch (err) { console.error('Possession start error:', err); }
     try { const data = await apiClient.look(); if (data && data.allLocations) this.charManager.updateLocations(data.allLocations); } catch {}
-    this.charManager.createNPCs('hiru');
+    this.charManager.createNPCs(PLAYER_ID);
     this.charManager.startPolling();
     this.possessionManager.startPendingPoll();
     this.possessionManager.connectStream();

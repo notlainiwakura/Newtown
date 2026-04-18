@@ -156,6 +156,7 @@ $sharedEnv = @{
   OPENAI_BASE_URL   = if ($env:OPENAI_BASE_URL) { $env:OPENAI_BASE_URL } else { 'http://192.168.68.69:8080/v1' }
   OPENAI_MODEL      = if ($env:OPENAI_MODEL) { $env:OPENAI_MODEL } else { 'MiniMax-M2.7' }
   OPENAI_API_KEY    = if ($env:OPENAI_API_KEY) { $env:OPENAI_API_KEY } else { 'not-needed' }
+  POSSESSION_TOKEN  = if ($env:POSSESSION_TOKEN) { $env:POSSESSION_TOKEN } else { 'newtown' }
   CHARACTER_BASE_URL = if ($env:CHARACTER_BASE_URL) { $env:CHARACTER_BASE_URL } else { (if ($env:OPENAI_BASE_URL) { $env:OPENAI_BASE_URL } else { 'http://192.168.68.69:8080/v1' }) }
   CHARACTER_MODEL    = if ($env:CHARACTER_MODEL) { $env:CHARACTER_MODEL } else { (if ($env:OPENAI_MODEL) { $env:OPENAI_MODEL } else { 'MiniMax-M2.7' }) }
   CHARACTER_PROVIDER = if ($env:CHARACTER_PROVIDER) { $env:CHARACTER_PROVIDER } else { 'openai' }

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>NEWTOWN MAP</title>
+  <title>COMMUNE MAP // NEWTOWN</title>
   <link rel="stylesheet" href="commune-map.css?v=10">
 </head>
 <body>
@@ -11,29 +11,73 @@
 
   <div class="map-container">
     <div class="map-header">
-      <h1>NEWTOWN MAP</h1>
+      <h1>COMMUNE MAP</h1>
       <div class="view-toggle">
         <button class="view-btn active" data-view="town">TOWN</button>
+        <button class="view-btn" data-view="network">NETWORK</button>
       </div>
       <div class="status-bar">
         <span class="status-dot"></span>
-        <span id="connection-status">local town online</span>
-        <span class="event-counter">buildings: <span id="event-count">9</span></span>
+        <span id="connection-status">connecting...</span>
+        <span class="event-counter">events: <span id="event-count">0</span></span>
       </div>
     </div>
 
     <div class="map-body">
-      <div class="town-grid" id="town-grid"></div>
+      <div class="town-grid" id="town-grid">
+        <!-- 3x3 building grid injected by JS -->
+      </div>
+
+      <div class="node-map" id="node-map" style="display:none">
+        <svg class="connection-lines" id="connection-lines"></svg>
+        <div class="notifications" id="notifications"></div>
+        <!-- Character nodes injected by JS -->
+      </div>
 
       <div class="activity-panel" id="activity-panel">
         <div class="panel-header">
-          <h2 id="panel-title">residents</h2>
+          <h2 id="panel-title">select a node</h2>
+          <div class="time-controls" id="time-controls" style="display:none">
+            <button class="time-btn" data-range="3600000">1h</button>
+            <button class="time-btn" data-range="86400000">24h</button>
+            <button class="time-btn active" data-range="604800000">7d</button>
+          </div>
         </div>
-        <div class="panel-body" id="panel-body"></div>
+        <div class="panel-body" id="panel-body">
+          <div class="panel-placeholder">click a character node to view activity</div>
+        </div>
       </div>
+    </div>
+
+    <div id="chat-modal" class="chat-modal" style="display:none">
+      <div class="chat-modal-titlebar">
+        <span id="chat-modal-title">...</span>
+        <button id="chat-modal-close">x</button>
+      </div>
+      <div id="chat-modal-messages" class="chat-modal-messages"></div>
+      <form id="chat-modal-form" class="chat-modal-input">
+        <input type="text" id="chat-modal-input" placeholder="speak..." autocomplete="off" />
+        <button type="submit">TRANSMIT</button>
+      </form>
+    </div>
+
+    <div class="event-log" id="event-log">
+      <div class="log-header" id="log-toggle">EVENT LOG</div>
+      <div class="log-body" id="log-body"></div>
     </div>
   </div>
 
+  <script>
+    // Inject API key into URL if not present (read from server-injected meta tag)
+    (function() {
+      var key = document.querySelector('meta[name="lain-api-key"]');
+      if (key && !new URLSearchParams(window.location.search).get('key')) {
+        var url = new URL(window.location);
+        url.searchParams.set('key', key.content);
+        window.history.replaceState({}, '', url);
+      }
+    })();
+  </script>
   <script src="commune-map.js?v=10"></script>
 </body>
 </html>

@@ -7,7 +7,7 @@
 class APIClient {
   constructor() {
     this.token = '';
-    this.base = '/hiru'; // nginx prefix for hiru's server
+    this.base = '/' + (typeof PLAYER_ID === 'string' ? PLAYER_ID : 'joe'); // web proxy prefix for possessed resident
   }
 
   setToken(token) {
@@ -152,21 +152,8 @@ class APIClient {
 
   // Get a specific character's location (non-hiru characters)
   async getCharacterLocation(charId) {
-    // Character API paths (matches commune-map.js)
-    const pathMap = {
-      'wired-lain': '/api/location',
-      'lain':       '/local/api/location',
-      'pkd':        '/pkd/api/location',
-      'mckenna':    '/mckenna/api/location',
-      'john':       '/john/api/location',
-      'dr-claude':  '/dr-claude/api/location',
-      'hiru':       '/hiru/api/location',
-    };
-    const path = pathMap[charId];
-    if (!path) return null;
-
     try {
-      const resp = await fetch(path);
+      const resp = await fetch('/' + charId + '/api/location');
       if (!resp.ok) return null;
       const data = await resp.json();
       return data.location || null;

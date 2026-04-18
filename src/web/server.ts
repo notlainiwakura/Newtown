@@ -207,7 +207,8 @@ async function proxyResidentRequest(
   req: IncomingMessage,
   res: ServerResponse,
   resident: typeof RESIDENTS[number],
-  remainderPath: string
+  remainderPath: string,
+  publicPathname: string
 ): Promise<void> {
   const targetPath = remainderPath || '/';
   const targetUrl = new URL(`http://127.0.0.1:${resident.port}${targetPath}`);
@@ -225,6 +226,22 @@ async function proxyResidentRequest(
 
   await new Promise<void>((resolvePromise) => {
     const proxy = httpRequest(options, (proxyRes) => {
+      const contentType = String(proxyRes.headers['content-type'] || '');
+      if (contentType.includes('text/html')) {
+        const chunks: Buffer[] = [];
+        proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
+        proxyRes.on('end', () => {
+          let html = Buffer.concat(chunks).toString();
+          html = injectNavBar(html, publicPathname);
+          const headers = { ...proxyRes.headers };
+          delete headers['content-length'];
+          res.writeHead(proxyRes.statusCode || 200, headers);
+          res.end(html);
+          resolvePromise();
+        });
+        return;
+      }
+
       res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
       proxyRes.pipe(res);
       proxyRes.on('end', () => resolvePromise());
@@ -243,29 +260,62 @@ async function proxyResidentRequest(
 }
 
 const NAV_LINKS: Array<{ label: string; href: string }> = [
-  { label: 'CHAT', href: '/' },
   { label: 'MAP', href: '/commune-map.html' },
+  { label: 'NETWORK', href: '/commune-map.html#network' },
+  { label: 'WALK', href: '/game/' },
+  { label: 'NEWS', href: '/commune-newspaper.html' },
   { label: 'NEO', href: '/neo/' },
   { label: 'PLATO', href: '/plato/' },
   { label: 'JOE', href: '/joe/' },
 ];
 
-function injectNavBar(html: string, pathname: string): string {
+function injectHeadTags(html: string): string {
+  const injected: string[] = [];
+  const apiKey = process.env['LAIN_WEB_API_KEY'];
+
+  if (apiKey && !html.includes('meta name="lain-api-key"')) {
+    injected.push(`  <meta name="lain-api-key" content="${apiKey}">`);
+  }
+  if (!html.includes('/laintown-telemetry.js')) {
+    injected.push('  <script src="/laintown-telemetry.js" defer></script>');
+  }
+
+  if (injected.length === 0) return html;
+  return html.replace('</head>', `${injected.join('\n')}\n</head>`);
+}
+
+function generateNavBar(pathname: string): string {
+  const isGamePage = pathname === '/game/' || pathname === '/game/index.html';
+
   const links = NAV_LINKS.map(({ label, href }) => {
-    const active = pathname === href || pathname.startsWith(`${href.replace(/\/$/, '')}/`);
+    let active = false;
+    if (href === '/commune-map.html#network') {
+      active = false;
+    } else if (href === '/commune-map.html') {
+      active = pathname === '/commune-map.html';
+    } else {
+      active = pathname.startsWith(href);
+    }
+
     return `<a href="${href}"${active ? ' class="ltn-active"' : ''}>${label}</a>`;
   }).join('');
 
-  const nav = `<style>
-#laintown-nav{position:fixed;top:0;left:0;right:0;height:34px;background:#11131a;border-bottom:1px solid #2a3142;display:flex;align-items:center;z-index:99999;font-family:'Share Tech Mono',monospace;padding:0 12px}
-#laintown-nav .ltn-title{color:#f2d48f;font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-right:16px;text-decoration:none}
-#laintown-nav a{color:#75809a;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;text-decoration:none;padding:0 10px;line-height:34px;transition:color .2s}
-#laintown-nav a:hover{color:#f0efe8}
-#laintown-nav a.ltn-active{color:#f2d48f}
-body{padding-top:34px!important}
+  return `<style>
+#laintown-nav{position:fixed;top:0;left:0;right:0;height:32px;background:#0a0a0f;border-bottom:1px solid #1a1a2e;display:flex;align-items:center;z-index:99999;font-family:'Share Tech Mono',monospace;padding:0 12px;gap:0}
+#laintown-nav .ltn-title{color:#4a9eff;font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-right:16px;text-decoration:none}
+#laintown-nav a{color:#556;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;text-decoration:none;padding:0 10px;line-height:32px;transition:color .2s}
+#laintown-nav a:hover{color:#8ab4f8}
+#laintown-nav a.ltn-active{color:#4a9eff}
 </style>
-<div id="laintown-nav"><a class="ltn-title" href="/">NEWTOWN</a>${links}</div>`;
+<style>${isGamePage ? 'body{padding-top:0!important}#laintown-nav{background:rgba(10,10,15,0.6);border-bottom-color:rgba(26,26,46,0.4)}' : 'body{padding-top:32px!important}'}</style>
+<div id="laintown-nav"><a class="ltn-title" href="/">NEWTOWN</a>${links}</div>
+<script>(function(){var k=new URLSearchParams(location.search).get('key');if(k){var as=document.querySelectorAll('#laintown-nav a');for(var i=0;i<as.length;i++){var a=as[i],h=a.getAttribute('href');if(h){var hi=h.indexOf('#'),base=hi>-1?h.slice(0,hi):h,frag=hi>-1?h.slice(hi):'';if(base.indexOf('?')===-1){a.setAttribute('href',base+'?key='+encodeURIComponent(k)+frag)}else{a.setAttribute('href',base+'&key='+encodeURIComponent(k)+frag)}}}}})();</script>`;
+}
 
+function injectNavBar(html: string, pathname: string): string {
+  html = injectHeadTags(html);
+
+  const nav = generateNavBar(pathname);
   const bodyMatch = html.match(/<body[^>]*>/i);
   if (!bodyMatch) return html;
 
@@ -314,7 +364,19 @@ export async function startWebServer(port = 3000): Promise<void> {
     const resident = RESIDENTS.find(({ path }) => url.pathname === path || url.pathname.startsWith(`${path}/`));
     if (resident) {
       const remainderPath = url.pathname.slice(resident.path.length) || '/';
-      await proxyResidentRequest(req, res, resident, `${remainderPath}${url.search}`);
+      await proxyResidentRequest(req, res, resident, `${remainderPath}${url.search}`, url.pathname);
+      return;
+    }
+
+    if ((url.pathname === '/dashboard' || url.pathname === '/dashboard/') && req.method === 'GET') {
+      res.writeHead(302, { Location: '/game/' });
+      res.end();
+      return;
+    }
+
+    if (url.pathname === '/api/meta/identity' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'newtown', name: 'Newtown' }));
       return;
     }
 
@@ -386,12 +448,7 @@ export async function startWebServer(port = 3000): Promise<void> {
     const file = await serveStatic(url.pathname);
     if (file) {
       if (file.type === 'text/html') {
-        let html = file.content.toString();
-        const apiKey = process.env['LAIN_WEB_API_KEY'];
-        if (apiKey) {
-          html = html.replace('</head>', `  <meta name="lain-api-key" content="${apiKey}">\n</head>`);
-        }
-        html = injectNavBar(html, url.pathname);
+        const html = injectNavBar(file.content.toString(), url.pathname);
         res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-cache' });
         res.end(html);
         return;
@@ -409,12 +466,7 @@ export async function startWebServer(port = 3000): Promise<void> {
       return;
     }
 
-    let html = index.content.toString();
-    const apiKey = process.env['LAIN_WEB_API_KEY'];
-    if (apiKey) {
-      html = html.replace('</head>', `  <meta name="lain-api-key" content="${apiKey}">\n</head>`);
-    }
-    html = injectNavBar(html, url.pathname);
+    const html = injectNavBar(index.content.toString(), url.pathname);
     res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-cache' });
     res.end(html);
   });

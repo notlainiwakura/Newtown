@@ -16,16 +16,19 @@ const GAME_CONFIG = {
   CAMERA_LERP: 0.1,
 };
 
+// Player avatar is a possessed resident.
+const PLAYER_ID = 'joe';
+
 const BUILDINGS = [
-  { id: 'library',    name: 'Library',    row: 0, col: 0 },
-  { id: 'bar',        name: 'Bar',        row: 0, col: 1 },
-  { id: 'field',      name: 'Field',      row: 0, col: 2 },
-  { id: 'windmill',   name: 'Windmill',   row: 1, col: 0 },
-  { id: 'lighthouse', name: 'Lighthouse', row: 1, col: 1 },
-  { id: 'school',     name: 'School',     row: 1, col: 2 },
-  { id: 'market',     name: 'Market',     row: 2, col: 0 },
-  { id: 'locksmith',  name: 'Locksmith',  row: 2, col: 1 },
-  { id: 'mall',       name: 'Mall',       row: 2, col: 2 },
+  { id: 'pub',             name: 'Pub',             row: 0, col: 0 },
+  { id: 'station',         name: 'Station',         row: 0, col: 1 },
+  { id: 'abandoned-house', name: 'Abandoned House', row: 0, col: 2 },
+  { id: 'field',           name: 'Field',           row: 1, col: 0 },
+  { id: 'windmill',        name: 'Windmill',        row: 1, col: 1 },
+  { id: 'locksmith',       name: 'Locksmith',       row: 1, col: 2 },
+  { id: 'mystery-tower',   name: 'Mystery Tower',   row: 2, col: 0 },
+  { id: 'theater',         name: 'Theater',         row: 2, col: 1 },
+  { id: 'square',          name: 'Square',          row: 2, col: 2 },
 ];
 
 const BUILDING_MAP = {};
@@ -33,23 +36,15 @@ for (const b of BUILDINGS) BUILDING_MAP[b.id] = b;
 
 // Muted pastel palette — sweet but faded
 const CHARACTERS = {
-  'lain':       { name: 'Lain',        color: 0x88b0d0, colorHex: '#88b0d0', initial: 'L'  },
-  'wired-lain': { name: 'Wired Lain',  color: 0x6898c8, colorHex: '#6898c8', initial: 'W'  },
-  'pkd':        { name: 'PKD',         color: 0xa878c8, colorHex: '#a878c8', initial: 'P'  },
-  'mckenna':    { name: 'McKenna',     color: 0x78b898, colorHex: '#78b898', initial: 'M'  },
-  'john':       { name: 'John',        color: 0xd0a868, colorHex: '#d0a868', initial: 'J'  },
-  'dr-claude':  { name: 'Dr. Claude',  color: 0xd07878, colorHex: '#d07878', initial: 'D'  },
-  'hiru':       { name: 'Hiru',        color: 0x88b898, colorHex: '#88b898', initial: 'H'  },
+  'neo':   { name: 'Neo',   color: 0x60e0a0, colorHex: '#60e0a0', initial: 'N' },
+  'plato': { name: 'Plato', color: 0xe0c870, colorHex: '#e0c870', initial: 'P' },
+  'joe':   { name: 'Joe',   color: 0x88b0d0, colorHex: '#88b0d0', initial: 'J' },
 };
 
 const DEFAULT_LOCATIONS = {
-  'wired-lain': 'lighthouse',
-  'lain':       'library',
-  'dr-claude':  'school',
-  'pkd':        'locksmith',
-  'mckenna':    'field',
-  'john':       'bar',
-  'hiru':       'market',
+  'neo':   'station',
+  'plato': 'mystery-tower',
+  'joe':   'square',
 };
 
 const ZONE_SIZE_X = 12;

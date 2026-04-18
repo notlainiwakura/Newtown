@@ -547,6 +547,99 @@ class BootScene extends Phaser.Scene {
           ctx.strokeRect(22, BODY_TOP + 22, 20, 10);
         },
       },
+      'neo': {
+        hairColor: '#1b1c20', hairLight: '#2b2c30',
+        outfit: '#1b1c22', outfitAccent: '#2a2a34',
+        drawHair: (ctx) => {
+          // Short, sharp hair
+          ctx.fillStyle = '#1b1c20';
+          ctx.beginPath();
+          ctx.ellipse(HEAD_CX, HEAD_CY - 10, 20, 14, 0, Math.PI, 0);
+          ctx.fill();
+          ctx.fillRect(12, HEAD_CY - 8, 5, 10);
+          ctx.fillRect(47, HEAD_CY - 8, 5, 10);
+          ctx.fillStyle = '#2b2c30';
+          ctx.fillRect(16, HEAD_CY - 12, 32, 5);
+        },
+        drawOutfit: (ctx) => {
+          // Long coat
+          ctx.fillStyle = '#1b1c22';
+          ctx.fillRect(16, BODY_TOP + 2, 32, BODY_BOT - BODY_TOP - 4);
+          // Coat opening seam
+          ctx.strokeStyle = 'rgba(224, 200, 112, 0.15)';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(HEAD_CX, BODY_TOP + 2);
+          ctx.lineTo(HEAD_CX, BODY_BOT - 6);
+          ctx.stroke();
+          // Lapels
+          ctx.strokeStyle = '#2a2a34';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.moveTo(HEAD_CX - 1, BODY_TOP + 4); ctx.lineTo(HEAD_CX - 8, BODY_TOP + 16); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(HEAD_CX + 1, BODY_TOP + 4); ctx.lineTo(HEAD_CX + 8, BODY_TOP + 16); ctx.stroke();
+        },
+      },
+      'plato': {
+        hairColor: '#c8c0b8', hairLight: '#d8d0c8',
+        skinOverride: '#d8c8b8',
+        outfit: '#c8b898', outfitAccent: '#b8a888',
+        drawHair: (ctx) => {
+          // Pale hair + beard
+          ctx.fillStyle = '#c8c0b8';
+          ctx.beginPath();
+          ctx.ellipse(HEAD_CX, HEAD_CY - 10, 21, 15, 0, Math.PI, 0);
+          ctx.fill();
+          ctx.fillRect(11, HEAD_CY - 8, 6, 12);
+          ctx.fillRect(47, HEAD_CY - 8, 6, 12);
+
+          // Beard (soft arc)
+          ctx.fillStyle = '#c0b8b0';
+          ctx.beginPath();
+          ctx.ellipse(HEAD_CX, HEAD_CY + 14, 14, 10, 0, 0, Math.PI);
+          ctx.fill();
+        },
+        drawOutfit: (ctx) => {
+          // Toga/robe
+          ctx.fillStyle = '#c8b898';
+          ctx.fillRect(16, BODY_TOP + 2, 32, BODY_BOT - BODY_TOP - 4);
+          // Sash
+          ctx.fillStyle = 'rgba(216, 208, 200, 0.35)';
+          ctx.beginPath();
+          ctx.moveTo(18, BODY_TOP + 6);
+          ctx.lineTo(HEAD_CX + 2, BODY_BOT - 6);
+          ctx.lineTo(HEAD_CX + 10, BODY_BOT - 6);
+          ctx.lineTo(26, BODY_TOP + 6);
+          ctx.closePath();
+          ctx.fill();
+        },
+      },
+      'joe': {
+        hairColor: '#3a2e20', hairLight: '#4a3e30',
+        outfit: '#404858', outfitAccent: '#586078',
+        drawHair: (ctx) => {
+          // Short, clean, no-nonsense
+          ctx.fillStyle = '#3a2e20';
+          ctx.beginPath();
+          ctx.ellipse(HEAD_CX, HEAD_CY - 10, 19, 14, 0, Math.PI, 0);
+          ctx.fill();
+          ctx.fillRect(12, HEAD_CY - 8, 5, 10);
+          ctx.fillRect(47, HEAD_CY - 8, 5, 10);
+          // Simple fringe
+          ctx.fillStyle = '#4a3e30';
+          ctx.fillRect(16, HEAD_CY - 12, 32, 5);
+        },
+        drawOutfit: (ctx) => {
+          // Plain t-shirt
+          ctx.fillStyle = '#404858';
+          ctx.fillRect(18, BODY_TOP + 2, 28, BODY_BOT - BODY_TOP - 6);
+          // Crew neck
+          ctx.strokeStyle = '#586078';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(HEAD_CX, BODY_TOP + 4, 8, 0, Math.PI);
+          ctx.stroke();
+        },
+      },
     };
 
     for (const [charId, charData] of Object.entries(CHARACTERS)) {

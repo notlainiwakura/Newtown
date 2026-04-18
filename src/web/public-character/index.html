@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Resident</title>
+  <link rel="stylesheet" href="character.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <p class="eyebrow">Newtown Resident Link</p>
+      <h1 id="resident-name">Resident</h1>
+      <p id="resident-tagline" class="tagline">A local voice in a town with no outside wire.</p>
+    </header>
+
+    <section class="panel">
+      <div class="panel-header">
+        <span id="status-dot" class="status-dot"></span>
+        <span id="resident-location">locating...</span>
+      </div>
+      <div id="messages" class="messages">
+        <article class="message resident">
+          <h2>Resident</h2>
+          <p>the town is listening.</p>
+        </article>
+      </div>
+      <form id="chat-form" class="composer">
+        <input id="message-input" type="text" placeholder="say something..." autocomplete="off" />
+        <button type="submit">Send</button>
+      </form>
+    </section>
+  </main>
+  <script src="character.js"></script>
+</body>
+</html>

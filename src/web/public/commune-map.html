@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NEWTOWN MAP</title>
+  <link rel="stylesheet" href="commune-map.css?v=10">
+</head>
+<body>
+  <div class="bg-grid"></div>
+
+  <div class="map-container">
+    <div class="map-header">
+      <h1>NEWTOWN MAP</h1>
+      <div class="view-toggle">
+        <button class="view-btn active" data-view="town">TOWN</button>
+      </div>
+      <div class="status-bar">
+        <span class="status-dot"></span>
+        <span id="connection-status">local town online</span>
+        <span class="event-counter">buildings: <span id="event-count">9</span></span>
+      </div>
+    </div>
+
+    <div class="map-body">
+      <div class="town-grid" id="town-grid"></div>
+
+      <div class="activity-panel" id="activity-panel">
+        <div class="panel-header">
+          <h2 id="panel-title">residents</h2>
+        </div>
+        <div class="panel-body" id="panel-body"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="commune-map.js?v=10"></script>
+</body>
+</html>

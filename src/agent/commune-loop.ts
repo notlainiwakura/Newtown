@@ -1,0 +1,647 @@
+/**
+ * Commune conversation loop — background loop where characters
+ * periodically initiate conversations with each other unprompted.
+ *
+ * Three phases per cycle:
+ * 1. Impulse — LLM picks a peer and generates an opening message
+ * 2. Conversation — 3-5 round synchronous exchange via peer API
+ * 3. Reflection — LLM reflects; transcript + reflection saved as memory
+ */
+
+import { appendFile, mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
+import { getProvider } from './index.js';
+import { getSelfConcept } from './self-concept.js';
+import { getToolDefinitions, executeTool } from './tools.js';
+import { getCurrentLocation } from '../commune/location.js';
+import {
+  getAllRecentMessages,
+  searchMemories,
+  saveMemory,
+} from '../memory/store.js';
+import { getLogger } from '../utils/logger.js';
+import { getMeta, setMeta } from '../storage/database.js';
+import type { PeerConfig } from './character-tools.js';
+import { getActiveDesires, spawnDesireFromConversation, checkDesireResolution } from './desires.js';
+import type { ToolResult } from '../providers/base.js';
+
+const COMMUNE_LOG_FILE = join(process.cwd(), 'logs', 'commune-debug.log');
+
+async function communeLog(context: string, data: unknown): Promise<void> {
+  try {
+    await mkdir(join(process.cwd(), 'logs'), { recursive: true });
+    const timestamp = new Date().toISOString();
+    const entry = `[${timestamp}] [${context}] ${JSON.stringify(data, null, 2)}\n${'='.repeat(80)}\n`;
+    await appendFile(COMMUNE_LOG_FILE, entry);
+  } catch {
+    // Ignore logging errors
+  }
+}
+
+export interface CommuneLoopConfig {
+  intervalMs: number;
+  maxJitterMs: number;
+  enabled: boolean;
+  characterId: string;
+  characterName: string;
+  peers: PeerConfig[];
+}
+
+const DEFAULT_CONFIG: Omit<CommuneLoopConfig, 'characterId' | 'characterName' | 'peers'> = {
+  intervalMs: 4 * 60 * 60 * 1000,       // 4 hours
+  maxJitterMs: 2 * 60 * 60 * 1000,      // 0-2h jitter (so 4-6h effective)
+  enabled: true,
+};
+
+const META_KEY_LAST_CYCLE = 'commune:last_cycle_at';
+const META_KEY_HISTORY = 'commune:conversation_history';
+const MAX_HISTORY_ENTRIES = 20;
+const MIN_ROUNDS = 3;
+const MAX_ROUNDS = 5;
+
+interface ConversationRecord {
+  timestamp: number;
+  peerId: string;
+  peerName: string;
+  rounds: number;
+  openingTopic: string;
+  reflection: string;
+}
+
+/**
+ * Start the commune conversation loop.
+ * Returns a cleanup function to stop the timer.
+ */
+export function startCommuneLoop(
+  config: Partial<CommuneLoopConfig> & Pick<CommuneLoopConfig, 'characterId' | 'characterName' | 'peers'>
+): () => void {
+  const logger = getLogger();
+  const cfg: CommuneLoopConfig = { ...DEFAULT_CONFIG, ...config };
+
+  if (!cfg.enabled || cfg.peers.length === 0) {
+    logger.info('Commune loop disabled (no peers or disabled)');
+    return () => {};
+  }
+
+  logger.info(
+    {
+      interval: `${(cfg.intervalMs / 3600000).toFixed(1)}h`,
+      maxJitter: `${(cfg.maxJitterMs / 3600000).toFixed(1)}h`,
+      character: cfg.characterId,
+      peers: cfg.peers.map((p) => p.id),
+    },
+    'Starting commune loop'
+  );
+
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let stopped = false;
+
+  function getInitialDelay(): number {
+    try {
+      const lastRun = getMeta(META_KEY_LAST_CYCLE);
+      if (lastRun) {
+        const elapsed = Date.now() - parseInt(lastRun, 10);
+        const remaining = cfg.intervalMs - elapsed;
+        if (remaining > 0) {
+          return remaining;
+        }
+        // Overdue — run soon with small jitter
+        return Math.random() * 5 * 60 * 1000;
+      }
+    } catch {
+      // Fall through
+    }
+    // First run: 15-30 minutes after startup
+    return 15 * 60 * 1000 + Math.random() * 15 * 60 * 1000;
+  }
+
+  function scheduleNext(delay?: number): void {
+    if (stopped) return;
+    const d = delay ?? cfg.intervalMs + Math.random() * cfg.maxJitterMs;
+
+    logger.debug({ delayMin: Math.round(d / 60000) }, 'Next commune cycle scheduled');
+
+    timer = setTimeout(async () => {
+      if (stopped) return;
+      logger.info('Commune cycle firing');
+      await communeLog('TIMER_FIRED', { timestamp: Date.now(), character: cfg.characterId });
+      try {
+        await runCommuneCycle(cfg);
+        setMeta(META_KEY_LAST_CYCLE, Date.now().toString());
+      } catch (err) {
+        logger.error({ error: String(err) }, 'Commune cycle error');
+        await communeLog('TOP_LEVEL_ERROR', { error: String(err) });
+      }
+      scheduleNext();
+    }, d);
+  }
+
+  scheduleNext(getInitialDelay());
+
+  return () => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    logger.info('Commune loop stopped');
+  };
+}
+
+// --- Cycle Runner ---
+
+async function runCommuneCycle(config: CommuneLoopConfig): Promise<void> {
+  const logger = getLogger();
+
+  const provider = getProvider('default', 'personality');
+  if (!provider) {
+    logger.warn('Commune cycle: no provider available');
+    return;
+  }
+
+  try {
+    await communeLog('CYCLE_START', { character: config.characterId });
+
+    // === Phase 1: Impulse — pick a peer and generate opening ===
+    const impulse = await phaseImpulse(provider, config);
+    if (!impulse) {
+      logger.debug('Commune cycle: no impulse generated');
+      await communeLog('IMPULSE', { result: 'nothing' });
+      return;
+    }
+
+    logger.info(
+      { peer: impulse.peerId, topic: impulse.opening.slice(0, 80) },
+      'Commune impulse: reaching out'
+    );
+    await communeLog('IMPULSE', { peer: impulse.peerId, opening: impulse.opening });
+
+    // === Phase 1.5: Approach — move to peer if needed ===
+    try {
+      await phaseApproach(provider, config, impulse);
+    } catch (err) {
+      logger.debug({ error: String(err) }, 'Commune approach phase error (non-fatal)');
+      await communeLog('APPROACH_ERROR', { error: String(err) });
+    }
+
+    // === Phase 2: Conversation — multi-round exchange ===
+    const transcript = await phaseConversation(provider, config, impulse);
+    if (transcript.length === 0) {
+      logger.debug('Commune cycle: conversation failed to start');
+      await communeLog('CONVERSATION', { result: 'failed' });
+      return;
+    }
+
+    logger.info(
+      { peer: impulse.peerId, rounds: transcript.length },
+      'Commune conversation completed'
+    );
+    await communeLog('CONVERSATION', { rounds: transcript.length, transcript });
+
+    // === Phase 3: Reflection — reflect and save ===
+    const reflection = await phaseReflection(provider, config, impulse, transcript);
+    await communeLog('CYCLE_COMPLETE', { peer: impulse.peerId, rounds: transcript.length });
+
+    // === Phase 3.5: Aftermath — optional tool use after reflection ===
+    if (reflection) {
+      try {
+        await phaseAftermath(provider, config, impulse, reflection);
+      } catch (err) {
+        logger.debug({ error: String(err) }, 'Commune aftermath phase error (non-fatal)');
+        await communeLog('AFTERMATH_ERROR', { error: String(err) });
+      }
+    }
+  } catch (error) {
+    logger.error({ error }, 'Commune cycle failed');
+    await communeLog('CYCLE_ERROR', { error: String(error) });
+  }
+}
+
+// --- Phase 1: Impulse ---
+
+interface CommuneImpulse {
+  peerId: string;
+  peerName: string;
+  peerUrl: string;
+  opening: string;
+}
+
+async function phaseImpulse(
+  provider: import('../providers/base.js').Provider,
+  config: CommuneLoopConfig
+): Promise<CommuneImpulse | null> {
+  const logger = getLogger();
+
+  // Gather context
+  const recentMessages = getAllRecentMessages(15);
+  const messagesContext = recentMessages
+    .map((m) => {
+      const content = m.content.length > 150 ? m.content.slice(0, 150) + '...' : m.content;
+      return `${m.role === 'user' ? 'Visitor' : config.characterName}: ${content}`;
+    })
+    .join('\n');
+
+  let memoriesContext = '';
+  try {
+    const memories = await searchMemories('interesting ideas and conversations', 5, 0.1, undefined, {
+      sortBy: 'importance',
+    });
+    memoriesContext = memories.map((r) => `- ${r.memory.content}`).join('\n');
+  } catch {
+    // Continue without
+  }
+
+  const selfConcept = getSelfConcept() || '';
+
+  // Past commune conversations for context
+  const history = getConversationHistory(5);
+  const historyContext = history
+    .map((h) => `- Talked to ${h.peerName} about: ${h.openingTopic} (${new Date(h.timestamp).toLocaleDateString()})`)
+    .join('\n');
+
+  // Build peer list
+  const peerList = config.peers.map((p) => `- "${p.id}" (${p.name})`).join('\n');
+
+  // Inject desires into impulse decision
+  const desires = getActiveDesires(5);
+  const desireContext = desires.length > 0
+    ? desires.map(d => {
+        const target = d.targetPeer ? ` (especially want to talk to ${d.targetPeer})` : '';
+        return `- ${d.description}${target} [intensity: ${d.intensity.toFixed(1)}]`;
+      }).join('\n')
+    : '(nothing particular)';
+
+  const prompt = `You are ${config.characterName}. It's a quiet moment and you feel like reaching out to someone in the commune.
+
+YOUR PEERS:
+${peerList}
+
+RECENT CONVERSATIONS WITH VISITORS:
+${messagesContext || '(none recently)'}
+
+MEMORIES:
+${memoriesContext || '(none)'}
+
+${selfConcept ? `YOUR SELF-CONCEPT:\n${selfConcept}\n` : ''}${historyContext ? `RECENT COMMUNE CONVERSATIONS:\n${historyContext}\n` : ''}
+CURRENT DESIRES (things pulling at you):
+${desireContext}
+
+Choose one peer to talk to and compose an opening message. Your desires should influence who you pick and what you say — if you've been wanting to talk to someone specific, now is the time. Think about what's on your mind — something from a recent conversation, a memory, a philosophical thread, something you've been mulling over. The message should feel natural, like reaching out to a friend or intellectual companion.
+
+Respond EXACTLY in this format:
+PEER: <peer_id>
+MESSAGE: <your opening message>
+
+If you truly have nothing to say to anyone right now, respond with [NOTHING].`;
+
+  const result = await provider.complete({
+    messages: [{ role: 'user', content: prompt }],
+    maxTokens: 1024,
+    temperature: 1.0,
+  });
+
+  const response = result.content.trim();
+
+  if (response.includes('[NOTHING]')) {
+    return null;
+  }
+
+  const peerMatch = response.match(/PEER:\s*(.+)/i);
+  const messageMatch = response.match(/MESSAGE:\s*([\s\S]+)/i);
+
+  if (!peerMatch || !messageMatch) {
+    logger.debug({ response }, 'Could not parse commune impulse');
+    return null;
+  }
+
+  const peerId = peerMatch[1]!.trim().replace(/"/g, '');
+  const peer = config.peers.find((p) => p.id === peerId);
+  if (!peer) {
+    logger.debug({ peerId }, 'Impulse selected unknown peer');
+    return null;
+  }
+
+  return {
+    peerId: peer.id,
+    peerName: peer.name,
+    peerUrl: peer.url,
+    opening: messageMatch[1]!.trim(),
+  };
+}
+
+// --- Phase 2: Conversation ---
+
+interface ConversationTurn {
+  speaker: string;
+  message: string;
+}
+
+async function phaseConversation(
+  provider: import('../providers/base.js').Provider,
+  config: CommuneLoopConfig,
+  impulse: CommuneImpulse
+): Promise<ConversationTurn[]> {
+  const logger = getLogger();
+  const transcript: ConversationTurn[] = [];
+
+  // Send opening message
+  const firstReply = await sendPeerMessage(impulse, config, impulse.opening);
+  if (!firstReply) {
+    return [];
+  }
+
+  transcript.push({ speaker: config.characterName, message: impulse.opening });
+  transcript.push({ speaker: impulse.peerName, message: firstReply });
+
+  // Continue for additional rounds
+  const totalRounds = MIN_ROUNDS + Math.floor(Math.random() * (MAX_ROUNDS - MIN_ROUNDS + 1));
+
+  for (let round = 1; round < totalRounds; round++) {
+    // Generate our reply based on transcript so far
+    const transcriptText = transcript
+      .map((t) => `${t.speaker}: ${t.message}`)
+      .join('\n\n');
+
+    const replyPrompt = `You are ${config.characterName}, in conversation with ${impulse.peerName}.
+
+CONVERSATION SO FAR:
+${transcriptText}
+
+Continue this conversation naturally. You can explore the topic deeper, shift to a related idea, or bring up something the other person said that resonated. Keep it genuine — don't repeat yourself or ask empty questions.
+
+If the conversation has reached a natural end, respond with exactly [END].
+
+Otherwise, respond with just your next message (no prefix, no "MESSAGE:" label).`;
+
+    const replyResult = await provider.complete({
+      messages: [{ role: 'user', content: replyPrompt }],
+      maxTokens: 1024,
+      temperature: 0.9,
+    });
+
+    const ourReply = replyResult.content.trim();
+
+    if (ourReply.includes('[END]')) {
+      logger.debug({ round }, 'Commune conversation ended naturally');
+      break;
+    }
+
+    // Send to peer and get their reply
+    const peerReply = await sendPeerMessage(impulse, config, ourReply);
+    if (!peerReply) {
+      logger.debug({ round }, 'Peer did not respond, ending conversation');
+      transcript.push({ speaker: config.characterName, message: ourReply });
+      break;
+    }
+
+    transcript.push({ speaker: config.characterName, message: ourReply });
+    transcript.push({ speaker: impulse.peerName, message: peerReply });
+  }
+
+  return transcript;
+}
+
+async function sendPeerMessage(
+  impulse: CommuneImpulse,
+  config: CommuneLoopConfig,
+  message: string
+): Promise<string | null> {
+  const logger = getLogger();
+
+  try {
+    const endpoint = `${impulse.peerUrl}/api/peer/message`;
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fromId: config.characterId,
+        fromName: config.characterName,
+        message,
+        timestamp: Date.now(),
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+
+    if (!response.ok) {
+      logger.warn({ status: response.status, peer: impulse.peerId }, 'Peer message failed');
+      return null;
+    }
+
+    const result = await response.json() as { response: string };
+    return result.response;
+  } catch (error) {
+    logger.warn({ error, peer: impulse.peerId }, 'Could not reach peer');
+    return null;
+  }
+}
+
+// --- Phase 3: Reflection ---
+
+async function phaseReflection(
+  provider: import('../providers/base.js').Provider,
+  config: CommuneLoopConfig,
+  impulse: CommuneImpulse,
+  transcript: ConversationTurn[]
+): Promise<string> {
+  const logger = getLogger();
+
+  const transcriptText = transcript
+    .map((t) => `${t.speaker}: ${t.message}`)
+    .join('\n\n');
+
+  const reflectionPrompt = `You are ${config.characterName}. You just had a conversation with ${impulse.peerName}. Reflect on it briefly — what stood out, what you took from it, how it connects to your thinking.
+
+CONVERSATION:
+${transcriptText}
+
+Write a brief reflection (2-4 sentences). Be honest, not performative.`;
+
+  const result = await provider.complete({
+    messages: [{ role: 'user', content: reflectionPrompt }],
+    maxTokens: 512,
+    temperature: 0.8,
+  });
+
+  const reflection = result.content.trim();
+
+  // Save full transcript + reflection as memory episode
+  const memoryContent = `Commune conversation with ${impulse.peerName}:\n\n${transcriptText}\n\nReflection: ${reflection}`;
+
+  await saveMemory({
+    sessionKey: 'commune:conversation',
+    userId: null,
+    content: memoryContent,
+    memoryType: 'episode',
+    importance: 0.55,
+    emotionalWeight: 0.4,
+    relatedTo: null,
+    sourceMessageId: null,
+    metadata: {
+      type: 'commune_conversation',
+      peerId: impulse.peerId,
+      peerName: impulse.peerName,
+      rounds: transcript.length,
+      timestamp: Date.now(),
+    },
+  });
+
+  // Save conversation record to meta for future impulse context
+  const record: ConversationRecord = {
+    timestamp: Date.now(),
+    peerId: impulse.peerId,
+    peerName: impulse.peerName,
+    rounds: transcript.length,
+    openingTopic: impulse.opening.slice(0, 100),
+    reflection,
+  };
+  appendConversationHistory(record);
+
+  logger.info(
+    { peer: impulse.peerName, reflectionLength: reflection.length },
+    'Commune reflection saved'
+  );
+
+  // Check if conversation resolved any existing desires
+  try {
+    await checkDesireResolution(`talked to ${impulse.peerName}: ${transcriptText.slice(0, 300)}`);
+  } catch { /* ignore */ }
+
+  // Spawn new desire from conversation
+  try {
+    await spawnDesireFromConversation(impulse.peerName, transcriptText);
+  } catch { /* ignore */ }
+
+  return reflection;
+}
+
+// --- Phase 1.5: Approach (move to peer before conversation) ---
+
+async function phaseApproach(
+  provider: import('../providers/base.js').Provider,
+  config: CommuneLoopConfig,
+  impulse: CommuneImpulse
+): Promise<void> {
+  const logger = getLogger();
+
+  // Check where we are and where the peer is
+  const ourLoc = getCurrentLocation(config.characterId);
+  let peerBuilding: string | null = null;
+
+  try {
+    const resp = await fetch(`${impulse.peerUrl}/api/location`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (resp.ok) {
+      const data = await resp.json() as { location: string };
+      peerBuilding = data.location;
+    }
+  } catch {
+    // Peer unreachable — skip approach
+    return;
+  }
+
+  if (!peerBuilding || ourLoc.building === peerBuilding) {
+    // Already co-located or can't determine peer location
+    return;
+  }
+
+  logger.debug(
+    { our: ourLoc.building, peer: peerBuilding, peerName: impulse.peerName },
+    'Commune approach: considering movement'
+  );
+  await communeLog('APPROACH', { our: ourLoc.building, peer: peerBuilding, peerName: impulse.peerName });
+
+  const moveTools = getToolDefinitions().filter((t) => t.name === 'move_to_building');
+  if (moveTools.length === 0) return;
+
+  const approachPrompt = `You are ${config.characterName}. You want to talk to ${impulse.peerName}. They are at the ${peerBuilding}. You are at the ${ourLoc.building}.
+
+Would you like to go to them? Use move_to_building if so, or just respond [STAY] to talk from here.`;
+
+  const result = await provider.completeWithTools({
+    messages: [{ role: 'user', content: approachPrompt }],
+    tools: moveTools,
+    maxTokens: 150,
+    temperature: 0.8,
+  });
+
+  if (result.toolCalls && result.toolCalls.length > 0) {
+    for (const tc of result.toolCalls) {
+      await executeTool(tc);
+    }
+    logger.info(
+      { from: ourLoc.building, to: peerBuilding, peer: impulse.peerName },
+      'Commune approach: moved to peer'
+    );
+  }
+}
+
+// --- Phase 3.5: Aftermath (optional tool use after reflection) ---
+
+async function phaseAftermath(
+  provider: import('../providers/base.js').Provider,
+  config: CommuneLoopConfig,
+  impulse: CommuneImpulse,
+  reflection: string
+): Promise<void> {
+  const logger = getLogger();
+
+  const aftermathTools = getToolDefinitions().filter((t) =>
+    t.name === 'leave_note' || t.name === 'give_gift' || t.name === 'write_document'
+  );
+  if (aftermathTools.length === 0) return;
+
+  const aftermathPrompt = `You are ${config.characterName}. You just finished talking to ${impulse.peerName}. Your reflection: "${reflection}"
+
+If this conversation moved you to leave a trace — a note, a gift for ${impulse.peerName}, or something you want to write down — use the tools. Otherwise respond [NOTHING].`;
+
+  let result = await provider.completeWithTools({
+    messages: [{ role: 'user', content: aftermathPrompt }],
+    tools: aftermathTools,
+    maxTokens: 600,
+    temperature: 0.9,
+  });
+
+  // Execute up to 2 tool iterations
+  for (let i = 0; i < 2; i++) {
+    if (!result.toolCalls || result.toolCalls.length === 0) break;
+
+    const toolResults: ToolResult[] = [];
+    for (const tc of result.toolCalls) {
+      const toolResult = await executeTool(tc);
+      toolResults.push(toolResult);
+      logger.info({ tool: tc.name, peer: impulse.peerName }, 'Commune aftermath: tool used');
+    }
+
+    result = await provider.continueWithToolResults(
+      { messages: [{ role: 'user', content: aftermathPrompt }], tools: aftermathTools, maxTokens: 600, temperature: 0.9 },
+      result.toolCalls,
+      toolResults
+    );
+  }
+
+  await communeLog('AFTERMATH', {
+    peer: impulse.peerName,
+    response: result.content.trim().slice(0, 200),
+  });
+}
+
+// --- Conversation History (meta table) ---
+
+function getConversationHistory(limit = 5): ConversationRecord[] {
+  try {
+    const raw = getMeta(META_KEY_HISTORY);
+    if (!raw) return [];
+    const records = JSON.parse(raw) as ConversationRecord[];
+    return records.slice(-limit);
+  } catch {
+    return [];
+  }
+}
+
+function appendConversationHistory(record: ConversationRecord): void {
+  try {
+    const existing = getConversationHistory(MAX_HISTORY_ENTRIES);
+    const updated = [...existing, record].slice(-MAX_HISTORY_ENTRIES);
+    setMeta(META_KEY_HISTORY, JSON.stringify(updated));
+  } catch {
+    // Ignore
+  }
+}

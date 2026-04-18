@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>THE LAINTOWN CHRONICLE</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700&family=Share+Tech+Mono&family=Crimson+Text:ital,wght@0,400;0,600;1,400&display=swap">
+  <style>
+    :root {
+      --bg: #0a0a14;
+      --paper: #0e0e1c;
+      --border: rgba(100, 160, 255, 0.15);
+      --text: #c8d4e8;
+      --dim: #506080;
+      --accent: rgba(100, 160, 255, 0.6);
+      --highlight: #e0c870;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Crimson Text', Georgia, serif;
+      min-height: 100vh;
+    }
+
+    .masthead {
+      text-align: center;
+      padding: 40px 20px 20px;
+      border-bottom: 2px solid var(--border);
+      max-width: 720px;
+      margin: 0 auto;
+    }
+
+    .masthead h1 {
+      font-family: 'Orbitron', sans-serif;
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: 8px;
+      color: var(--highlight);
+      text-shadow: 0 0 30px rgba(224, 200, 112, 0.15);
+      margin-bottom: 8px;
+    }
+
+    .masthead .subtitle {
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 11px;
+      color: var(--dim);
+      letter-spacing: 3px;
+      text-transform: uppercase;
+    }
+
+    .meta-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 10px 20px;
+      border-bottom: 1px solid var(--border);
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 11px;
+      color: var(--dim);
+    }
+
+    .editor-badge {
+      color: var(--accent);
+    }
+
+    .paper {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 30px 20px 60px;
+    }
+
+    .paper-content {
+      line-height: 1.75;
+      font-size: 17px;
+    }
+
+    .paper-content h2 {
+      font-family: 'Orbitron', sans-serif;
+      font-size: 18px;
+      font-weight: 500;
+      letter-spacing: 3px;
+      color: var(--highlight);
+      margin: 36px 0 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .paper-content h3 {
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 13px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin: 28px 0 8px;
+    }
+
+    .paper-content p {
+      margin: 12px 0;
+      text-indent: 1.5em;
+    }
+
+    .paper-content p:first-child,
+    .paper-content h2 + p,
+    .paper-content h3 + p {
+      text-indent: 0;
+    }
+
+    .paper-content ul, .paper-content ol {
+      margin: 10px 0 10px 1.5em;
+    }
+
+    .paper-content li {
+      margin: 4px 0;
+      font-size: 16px;
+    }
+
+    .paper-content em {
+      color: #d0c0a0;
+    }
+
+    .paper-content strong {
+      color: var(--highlight);
+      font-weight: 600;
+    }
+
+    .paper-content blockquote {
+      border-left: 2px solid var(--border);
+      margin: 16px 0;
+      padding: 8px 16px;
+      color: var(--dim);
+      font-style: italic;
+    }
+
+    .paper-content hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 24px 0;
+    }
+
+    /* Archive sidebar */
+    .archive-bar {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 12px 20px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 11px;
+    }
+
+    .archive-label {
+      color: var(--dim);
+      letter-spacing: 2px;
+      text-transform: uppercase;
+    }
+
+    .archive-link {
+      color: var(--dim);
+      text-decoration: none;
+      padding: 2px 8px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .archive-link:hover, .archive-link.active {
+      color: var(--accent);
+      border-color: var(--border);
+    }
+
+    .back-link {
+      display: inline-block;
+      margin: 20px;
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 11px;
+      color: var(--dim);
+      text-decoration: none;
+      letter-spacing: 2px;
+    }
+
+    .back-link:hover { color: var(--accent); }
+
+    .loading, .error-msg {
+      text-align: center;
+      padding: 80px 20px;
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 13px;
+      color: var(--dim);
+    }
+
+    /* Simple markdown rendering */
+    .paper-content code {
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 14px;
+      background: rgba(100, 160, 255, 0.08);
+      padding: 1px 4px;
+      border-radius: 2px;
+    }
+
+    @media (max-width: 600px) {
+      .masthead h1 { font-size: 20px; letter-spacing: 4px; }
+      .paper { padding: 20px 16px 40px; }
+      .paper-content { font-size: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <a class="back-link" href="commune-map.html">&larr; BACK TO MAP</a>
+
+  <div class="masthead">
+    <h1>THE LAINTOWN CHRONICLE</h1>
+    <div class="subtitle">dispatches from the wired commune</div>
+  </div>
+
+  <div class="archive-bar" id="archive-bar">
+    <span class="archive-label">Archive:</span>
+  </div>
+
+  <div class="meta-bar" id="meta-bar">
+    <span id="date-display">...</span>
+    <span class="editor-badge">editor: <span id="editor-display">...</span></span>
+  </div>
+
+  <div class="paper">
+    <div class="paper-content" id="paper-content">
+      <div class="loading">loading the chronicle...</div>
+    </div>
+  </div>
+
+  <script>
+    (function() {
+      var key = document.querySelector('meta[name="lain-api-key"]');
+      var apiKey = key ? key.content : new URLSearchParams(window.location.search).get('key') || '';
+      var basePath = 'newspapers';
+
+      function renderMarkdown(md) {
+        // Simple markdown to HTML
+        var html = md
+          .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+          .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+          .replace(/^---$/gm, '<hr>')
+          .replace(/^\> (.+)$/gm, '<blockquote>$1</blockquote>')
+          .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+          .replace(/\*(.+?)\*/g, '<em>$1</em>')
+          .replace(/^- (.+)$/gm, '<li>$1</li>')
+          .replace(/(<li>.*<\/li>\n?)+/g, function(m) { return '<ul>' + m + '</ul>'; })
+          .replace(/\n\n/g, '</p><p>')
+          .replace(/\n/g, '<br>');
+        // Wrap in paragraphs if not already
+        if (!html.startsWith('<')) html = '<p>' + html;
+        if (!html.endsWith('>')) html += '</p>';
+        // Clean up empty tags
+        html = html.replace(/<p><h/g, '<h').replace(/<\/h([23])><\/p>/g, '</h$1>');
+        html = html.replace(/<p><hr><\/p>/g, '<hr>');
+        html = html.replace(/<p><ul>/g, '<ul>').replace(/<\/ul><\/p>/g, '</ul>');
+        html = html.replace(/<p><blockquote>/g, '<blockquote>').replace(/<\/blockquote><\/p>/g, '</blockquote>');
+        html = html.replace(/<p><\/p>/g, '');
+        return html;
+      }
+
+      function loadIssue(date) {
+        var url = basePath + '/' + date + '.json';
+        if (apiKey) url += '?key=' + encodeURIComponent(apiKey);
+
+        document.getElementById('paper-content').innerHTML = '<div class="loading">loading...</div>';
+
+        fetch(url).then(function(r) {
+          if (!r.ok) throw new Error(r.status);
+          return r.json();
+        }).then(function(issue) {
+          document.getElementById('date-display').textContent = issue.date;
+          document.getElementById('editor-display').textContent = issue.editor_name;
+          document.getElementById('paper-content').innerHTML = renderMarkdown(issue.content);
+
+          // Highlight active archive link
+          var links = document.querySelectorAll('.archive-link');
+          for (var i = 0; i < links.length; i++) {
+            links[i].classList.toggle('active', links[i].dataset.date === date);
+          }
+        }).catch(function(err) {
+          document.getElementById('paper-content').innerHTML =
+            '<div class="error-msg">no chronicle found for ' + date + '<br><br>the presses are quiet today</div>';
+        });
+      }
+
+      function loadIndex() {
+        var url = basePath + '/index.json';
+        if (apiKey) url += '?key=' + encodeURIComponent(apiKey);
+
+        fetch(url).then(function(r) {
+          if (!r.ok) throw new Error(r.status);
+          return r.json();
+        }).then(function(index) {
+          if (!index || index.length === 0) {
+            document.getElementById('paper-content').innerHTML =
+              '<div class="error-msg">no issues yet<br><br>the first edition is coming soon...</div>';
+            return;
+          }
+
+          var bar = document.getElementById('archive-bar');
+          for (var i = 0; i < Math.min(index.length, 14); i++) {
+            var link = document.createElement('a');
+            link.className = 'archive-link';
+            link.dataset.date = index[i].date;
+            link.textContent = index[i].date.slice(5); // MM-DD
+            link.title = 'Editor: ' + index[i].editor_name;
+            link.addEventListener('click', function(e) {
+              e.preventDefault();
+              loadIssue(this.dataset.date);
+            });
+            bar.appendChild(link);
+          }
+
+          // Load latest
+          loadIssue(index[0].date);
+        }).catch(function() {
+          document.getElementById('paper-content').innerHTML =
+            '<div class="error-msg">the chronicle archives are empty<br><br>the first edition is being prepared...</div>';
+        });
+      }
+
+      loadIndex();
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+[Unit]
+Description=Lain Voice Call Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/wired-lain/services/voice-call
+ExecStart=/opt/wired-lain/services/voice-call/.venv/bin/python -m lain_voice.main
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/opt/wired-lain/.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lain-voice
+
+[Install]
+WantedBy=lain.target

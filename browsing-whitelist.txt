@@ -1,0 +1,10 @@
+# Lain's browsing domains
+# * = unrestricted (can browse anywhere)
+*
+aeon.co
+wikipedia.org
+arxiv.org
+plato.stanford.edu
+quantamagazine.org
+themarginalian.org
+nature.com

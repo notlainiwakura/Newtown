@@ -1,0 +1,12 @@
+# Logrotate config for Lain debug log files
+# Journal-based logs are managed by journald — this is for file-based debug logs only
+
+/root/.lain/logs/*.log /opt/wired-lain/logs/*.log {
+    weekly
+    rotate 52
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

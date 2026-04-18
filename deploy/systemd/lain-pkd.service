@@ -1,0 +1,20 @@
+[Unit]
+Description=Lain Philip K. Dick Character Server
+After=network.target lain-web.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/wired-lain
+ExecStart=/usr/bin/node dist/index.js pkd --port 3003
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=LAIN_HOME=/root/.lain-pkd
+EnvironmentFile=/opt/wired-lain/.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lain-pkd
+
+[Install]
+WantedBy=lain.target

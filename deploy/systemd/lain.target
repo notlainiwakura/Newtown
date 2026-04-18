@@ -1,0 +1,6 @@
+[Unit]
+Description=Lain All Services
+Wants=lain-web.service lain-telegram.service lain-gateway.service lain-voice.service lain-dr-claude.service lain-pkd.service lain-mckenna.service lain-john.service
+
+[Install]
+WantedBy=multi-user.target

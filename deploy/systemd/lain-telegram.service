@@ -1,0 +1,19 @@
+[Unit]
+Description=Lain Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/wired-lain
+ExecStart=/usr/bin/node dist/index.js telegram
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/wired-lain/.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lain-telegram
+
+[Install]
+WantedBy=lain.target

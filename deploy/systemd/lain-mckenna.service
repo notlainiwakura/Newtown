@@ -1,0 +1,20 @@
+[Unit]
+Description=Lain Terence McKenna Character Server
+After=network.target lain-web.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/wired-lain
+ExecStart=/usr/bin/node dist/index.js mckenna --port 3004
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=LAIN_HOME=/root/.lain-mckenna
+EnvironmentFile=/opt/wired-lain/.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lain-mckenna
+
+[Install]
+WantedBy=lain.target

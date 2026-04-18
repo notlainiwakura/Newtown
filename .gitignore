@@ -1,0 +1,67 @@
+# Dependencies
+node_modules/
+node_modules.*/
+.tools/
+
+# Build output
+dist/
+
+# Test coverage
+coverage/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Runtime data
+pids/
+*.pid
+*.seed
+~/
+
+# Debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Lock files (except pnpm-lock.yaml)
+package-lock.json
+yarn.lock
+
+# Lain runtime files (these should be in ~/.lain)
+*.sock
+*.db
+*.db-journal
+.newtown/
+
+# Misc
+SIGNAL.pdf
+lain-psychological-report.md
+
+# Offerings (books/PDFs dropped for bibliomancy)
+workspace/offerings/*
+!workspace/offerings/.gitkeep
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.session
+*.session-journal
+sessions/

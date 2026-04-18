@@ -1,0 +1,20 @@
+[Unit]
+Description=Lain John Character Server
+After=network.target lain-web.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/wired-lain
+ExecStart=/usr/bin/node dist/index.js john --port 3005
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=LAIN_HOME=/root/.lain-john
+EnvironmentFile=/opt/wired-lain/.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lain-john
+
+[Install]
+WantedBy=lain.target

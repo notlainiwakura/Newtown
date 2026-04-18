@@ -22,6 +22,12 @@ import {
 import { cosineSimilarity } from './embeddings.js';
 import { getProvider } from '../agent/index.js';
 import { runTopologyMaintenance } from './topology.js';
+import {
+  addTriple,
+  queryTriples,
+  addEntity,
+  detectContradictions,
+} from './knowledge-graph.js';
 
 export interface MemoryMaintenanceConfig {
   intervalMs: number;
@@ -143,8 +149,20 @@ export async function runMemoryMaintenance(): Promise<void> {
   const distilledCount = await distillMemoryClusters();
   logger.info({ distilledCount }, 'Memory distillation complete');
 
+  const landmarksProtected = protectLandmarkMemories();
+  logger.info({ landmarksProtected }, 'Landmark protection complete');
+
+  const eraSummaries = await generateEraSummaries();
+  logger.info({ eraSummaries }, 'Era summary generation complete');
+
+  const pruned = enforceMemoryCap();
+  logger.info({ pruned }, 'Memory cap enforcement complete');
+
   await runTopologyMaintenance();
   logger.info('Topology maintenance complete');
+
+  const kgStats = maintainKnowledgeGraph();
+  logger.info(kgStats, 'Knowledge graph maintenance complete');
 }
 
 /**
@@ -447,7 +465,7 @@ Write a compressed narrative (~2-3 sentences) that captures the essence of these
 
       const result = await provider.complete({
         messages: [{ role: 'user', content: prompt }],
-        maxTokens: 200,
+        maxTokens: 400,
         temperature: 0.3,
       });
 
@@ -495,4 +513,296 @@ Write a compressed narrative (~2-3 sentences) that captures the essence of these
   }
 
   return distilledCount;
+}
+
+// ── Landmark Memory Protection ─────────────────────────────
+
+/**
+ * Flag high-importance, high-emotion, or first-encounter memories as landmarks.
+ * Landmarks never get composted, archived, or pruned — they persist forever.
+ * Metadata: { isLandmark: true }
+ */
+function protectLandmarkMemories(): number {
+  const logger = getLogger();
+  let protected_ = 0;
+
+  // Find memories that qualify as landmarks but aren't flagged yet
+  interface LandmarkCandidate { id: string; metadata: string; }
+  const candidates = query<LandmarkCandidate>(
+    `SELECT id, metadata FROM memories
+     WHERE (
+       importance >= 0.8
+       OR emotional_weight >= 0.7
+       OR session_key IN ('self-concept:synthesis', 'first:conversation')
+       OR memory_type IN ('fact', 'preference')
+     )
+     AND json_extract(metadata, '$.isLandmark') IS NULL
+     AND lifecycle_state != 'composting'
+     LIMIT 200`
+  );
+
+  for (const row of candidates) {
+    const meta = JSON.parse(row.metadata || '{}') as Record<string, unknown>;
+    meta.isLandmark = true;
+    execute(`UPDATE memories SET metadata = ? WHERE id = ?`, [JSON.stringify(meta), row.id]);
+    protected_++;
+  }
+
+  if (protected_ > 0) {
+    logger.debug({ count: protected_ }, 'Protected landmark memories');
+  }
+
+  return protected_;
+}
+
+// ── Era Summary Generation ─────────────────────────────────
+
+/**
+ * Generate monthly era summaries for old memories.
+ * Memories older than 60 days get consolidated into per-month summaries.
+ * The originals stay in the DB but with lifecycle_state = 'archived'.
+ * Era summaries have high importance and isEraSummary metadata.
+ * Max 2 eras per cycle to limit LLM cost.
+ */
+async function generateEraSummaries(): Promise<number> {
+  const logger = getLogger();
+  const sixtyDaysAgo = Date.now() - 60 * 24 * 60 * 60 * 1000;
+
+  const provider = getProvider('default', 'light');
+  if (!provider) return 0;
+
+  // Find months that have un-archived memories older than 60 days
+  interface MonthBucket { ym: string; cnt: number; }
+  const months = query<MonthBucket>(
+    `SELECT strftime('%Y-%m', created_at / 1000, 'unixepoch') as ym, COUNT(*) as cnt
+     FROM memories
+     WHERE created_at < ?
+       AND lifecycle_state NOT IN ('composting', 'archived')
+       AND json_extract(metadata, '$.isLandmark') IS NULL
+       AND json_extract(metadata, '$.isEraSummary') IS NULL
+       AND json_extract(metadata, '$.isDistillation') IS NULL
+       AND memory_type NOT IN ('fact', 'preference')
+     GROUP BY ym
+     HAVING cnt >= 10
+     ORDER BY ym ASC
+     LIMIT 2`,
+    [sixtyDaysAgo]
+  );
+
+  let summariesCreated = 0;
+
+  for (const month of months) {
+    // Check if we already have an era summary for this month
+    interface ExistingCheck { cnt: number; }
+    const existing = query<ExistingCheck>(
+      `SELECT COUNT(*) as cnt FROM memories
+       WHERE json_extract(metadata, '$.isEraSummary') = 1
+         AND json_extract(metadata, '$.eraMonth') = ?`,
+      [month.ym]
+    );
+    if ((existing[0]?.cnt ?? 0) > 0) continue;
+
+    // Load representative memories from this month (sample up to 30)
+    interface MemRow { id: string; content: string; memory_type: string; importance: number; }
+    const memories = query<MemRow>(
+      `SELECT id, content, memory_type, importance FROM memories
+       WHERE strftime('%Y-%m', created_at / 1000, 'unixepoch') = ?
+         AND lifecycle_state NOT IN ('composting', 'archived')
+         AND json_extract(metadata, '$.isLandmark') IS NULL
+         AND json_extract(metadata, '$.isDistillation') IS NULL
+         AND memory_type NOT IN ('fact', 'preference')
+       ORDER BY importance DESC
+       LIMIT 30`,
+      [month.ym]
+    );
+
+    if (memories.length < 10) continue;
+
+    const memoryTexts = memories.map(m => {
+      const content = m.content.length > 200 ? m.content.slice(0, 200) + '...' : m.content;
+      return `- [${m.memory_type}] ${content}`;
+    });
+
+    const characterName = process.env['LAIN_CHARACTER_NAME'] || 'Character';
+
+    try {
+      const result = await provider.complete({
+        messages: [{
+          role: 'user',
+          content: `You are ${characterName}. Compress these memories from ${month.ym} into a brief era summary (3-5 sentences). Capture the key themes, emotional tone, significant events, and what mattered most during this period. Write in first person.\n\nMEMORIES:\n${memoryTexts.join('\n')}`,
+        }],
+        maxTokens: 600,
+        temperature: 0.4,
+      });
+
+      const summary = result.content.trim();
+      if (!summary || summary.length < 50) continue;
+
+      await saveMemory({
+        sessionKey: `era:${month.ym}`,
+        userId: null,
+        content: `[Era: ${month.ym}] ${summary}`,
+        memoryType: 'summary',
+        importance: 0.75,
+        emotionalWeight: 0.4,
+        relatedTo: null,
+        sourceMessageId: null,
+        metadata: { isEraSummary: true, eraMonth: month.ym, sourceCount: memories.length, createdAt: Date.now() },
+      });
+
+      // Archive the source memories (they stay in DB but won't be retrieved normally)
+      const ids = memories.map(m => m.id);
+      for (const id of ids) {
+        setLifecycleState(id, 'archived' as 'composting'); // archived handled same as composting for lifecycle
+      }
+      // Actually use a direct update since 'archived' isn't in the LifecycleState type
+      execute(
+        `UPDATE memories SET lifecycle_state = 'archived', lifecycle_changed_at = ? WHERE id IN (${ids.map(() => '?').join(',')})`,
+        [Date.now(), ...ids]
+      );
+
+      summariesCreated++;
+      logger.info({ month: month.ym, sourceCount: memories.length }, 'Generated era summary');
+    } catch (err) {
+      logger.warn({ error: String(err), month: month.ym }, 'Failed to generate era summary');
+    }
+  }
+
+  return summariesCreated;
+}
+
+// ── Memory Cap Enforcement ─────────────────────────────────
+
+// ── Knowledge Graph Maintenance ──────────────────────────────
+
+/**
+ * Sync new associations into the knowledge graph as triples,
+ * extract entities from entity-tagged memories, and detect contradictions.
+ */
+function maintainKnowledgeGraph(): { triplesCreated: number; entitiesUpdated: number; contradictions: number } {
+  const logger = getLogger();
+  let triplesCreated = 0;
+  let entitiesUpdated = 0;
+
+  // 1. Sync recent associations → KG triples
+  //    Find associations not yet in KG (created in the last maintenance cycle)
+  const lastKGSync = getMeta('memory:last_kg_sync_at');
+  const syncSince = lastKGSync ? parseInt(lastKGSync, 10) : 0;
+
+  interface AssocRow {
+    source_id: string;
+    target_id: string;
+    association_type: string;
+    strength: number;
+    created_at: number;
+  }
+
+  const ASSOC_TO_PREDICATE: Record<string, string> = {
+    similar: 'similar_to',
+    evolved_from: 'evolved_from',
+    pattern: 'shares_pattern',
+    cross_topic: 'cross_references',
+    dream: 'dream_linked',
+  };
+
+  const newAssocs = query<AssocRow>(
+    `SELECT source_id, target_id, association_type, strength, created_at
+     FROM memory_associations
+     WHERE created_at > ?
+     ORDER BY created_at ASC`,
+    [syncSince],
+  );
+
+  for (const row of newAssocs) {
+    try {
+      const predicate = ASSOC_TO_PREDICATE[row.association_type] ?? row.association_type;
+      // Check for duplicate
+      const existing = queryTriples({ subject: row.source_id, predicate, object: row.target_id, limit: 1 });
+      if (existing.length === 0) {
+        addTriple(row.source_id, predicate, row.target_id, row.strength, row.created_at, null, row.source_id);
+        triplesCreated++;
+      }
+    } catch (err) {
+      logger.debug({ error: String(err) }, 'Failed to sync association to KG');
+    }
+  }
+
+  // 2. Extract/update entities from entity-tagged memories
+  interface EntityMemRow { id: string; metadata: string; created_at: number; }
+  const entityMems = query<EntityMemRow>(
+    `SELECT id, metadata, created_at FROM memories
+     WHERE json_extract(metadata, '$.isEntity') = 1
+       AND created_at > ?
+     ORDER BY created_at ASC
+     LIMIT 200`,
+    [syncSince],
+  );
+
+  for (const row of entityMems) {
+    try {
+      const meta = JSON.parse(row.metadata) as Record<string, unknown>;
+      const name = meta.entityName as string | undefined;
+      const entityType = (meta.entityType as string) ?? 'concept';
+      if (name) {
+        addEntity(name, entityType, row.created_at);
+        entitiesUpdated++;
+      }
+    } catch {
+      // skip
+    }
+  }
+
+  // 3. Detect contradictions
+  const contradictions = detectContradictions();
+  if (contradictions.length > 0) {
+    logger.warn(
+      { count: contradictions.length, examples: contradictions.slice(0, 3).map((c) => `${c.subject} ${c.predicate}: "${c.tripleA.object}" vs "${c.tripleB.object}"`) },
+      'Knowledge graph contradictions detected',
+    );
+  }
+
+  setMeta('memory:last_kg_sync_at', Date.now().toString());
+
+  return { triplesCreated, entitiesUpdated, contradictions: contradictions.length };
+}
+
+const MEMORY_CAP = 10_000;
+
+/**
+ * Enforce a hard cap on total memory count per character.
+ * When over the cap, aggressively prune lowest-importance non-landmark memories.
+ * Landmarks, facts, preferences, era summaries, and distillations are exempt.
+ */
+function enforceMemoryCap(): number {
+  const logger = getLogger();
+
+  interface CountRow { cnt: number; }
+  const countResult = query<CountRow>(`SELECT COUNT(*) as cnt FROM memories`);
+  const totalCount = countResult[0]?.cnt ?? 0;
+
+  if (totalCount <= MEMORY_CAP) return 0;
+
+  const excess = totalCount - MEMORY_CAP;
+  logger.info({ totalCount, cap: MEMORY_CAP, excess }, 'Memory cap exceeded, pruning');
+
+  // Find lowest-value memories to prune (exempt landmarks, facts, preferences, summaries)
+  interface PruneCandidate { id: string; }
+  const toPrune = query<PruneCandidate>(
+    `SELECT id FROM memories
+     WHERE json_extract(metadata, '$.isLandmark') IS NULL
+       AND json_extract(metadata, '$.isEraSummary') IS NULL
+       AND json_extract(metadata, '$.isDistillation') IS NULL
+       AND memory_type NOT IN ('fact', 'preference')
+       AND lifecycle_state != 'archived'
+     ORDER BY importance ASC, access_count ASC, created_at ASC
+     LIMIT ?`,
+    [excess]
+  );
+
+  for (const row of toPrune) {
+    deleteMemory(row.id);
+  }
+
+  logger.info({ pruned: toPrune.length }, 'Memory cap pruning complete');
+  return toPrune.length;
 }

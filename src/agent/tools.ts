@@ -1370,7 +1370,7 @@ registerTool({
 registerTool({
   definition: {
     name: 'send_letter',
-    description: 'Compose and send a letter to your sister (local Lain) right now. This gathers your recent diary entries, curiosity discoveries, dream fragments, and emotional state, composes a letter, and delivers it to her interlink endpoint.',
+    description: 'Compose and send a letter to your sister right now. This gathers your recent diary entries, curiosity discoveries, dream fragments, and emotional state, composes a letter, and delivers it to her interlink endpoint.',
     inputSchema: {
       type: 'object',
       properties: {},

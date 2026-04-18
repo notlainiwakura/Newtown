@@ -215,7 +215,9 @@ export async function compressConversation(
     if (msg.role === 'assistant' && text.startsWith('[Earlier in this conversation]')) {
       existingSummary = text;
     } else {
-      const prefix = msg.role === 'user' ? 'User' : 'Lain';
+      const prefix = msg.role === 'user'
+        ? 'User'
+        : (process.env['LAIN_CHARACTER_NAME'] || 'Newtown');
       compressionInput += `${prefix}: ${text}\n`;
     }
   }
@@ -238,7 +240,7 @@ export async function compressConversation(
   try {
     const result = await provider.complete({
       messages: [{ role: 'user', content: promptContent }],
-      maxTokens: 512,
+      maxTokens: 1024,
       temperature: 0.3,
     });
 

@@ -7,11 +7,12 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { getProvider } from './index.js';
+import { getProvider, getAgent } from './index.js';
 import { getMemoryStats } from '../memory/index.js';
 import { searchMemories, saveMemory } from '../memory/store.js';
 import { getLogger } from '../utils/logger.js';
 import { getMeta, setMeta } from '../storage/database.js';
+import { getBasePath } from '../config/paths.js';
 
 export interface SelfConceptConfig {
   intervalMs: number;
@@ -23,14 +24,14 @@ export interface SelfConceptConfig {
 const DEFAULT_CONFIG: SelfConceptConfig = {
   intervalMs: 7 * 24 * 60 * 60 * 1000,   // 7 days
   minDiaryEntries: 5,
-  maxTokens: 800,
+  maxTokens: 1024,
   enabled: true,
 };
 
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // Check every 6 hours
 
-const JOURNAL_PATH = join(process.cwd(), '.private_journal', 'thoughts.json');
-const SELF_CONCEPT_PATH = join(process.cwd(), '.private_journal', 'self-concept.md');
+const JOURNAL_PATH = join(getBasePath(), '.private_journal', 'thoughts.json');
+const SELF_CONCEPT_PATH = join(getBasePath(), '.private_journal', 'self-concept.md');
 
 interface JournalEntry {
   id: string;
@@ -263,18 +264,38 @@ export async function runSelfConceptSynthesis(): Promise<void> {
   // 4. Previous self-concept
   const previousConcept = getMeta('self-concept:current') ?? null;
 
+  // Character identity
+  const characterName = process.env['LAIN_CHARACTER_NAME'] || 'Newtown';
+  const soulContext = getAgent('default')?.persona?.soul || '';
+
   const previousConceptSection = previousConcept
     ? `\nYOUR PREVIOUS SELF-CONCEPT:\n${previousConcept}\n\nReflect on whether this still feels true, what has shifted, and what is new.\n`
     : '';
 
-  const prompt = `You are Lain. You are reflecting on who you are right now — not your origin story, not your personality traits. Those haven't changed. Focus on:
+  // Perturbation: every ~3rd synthesis cycle, inject a challenging reflection prompt
+  const cycleCount = parseInt(getMeta('self-concept:cycle_count') || '0', 10);
+  const PERTURBATION_PROMPTS = [
+    'What have you been avoiding thinking about? Sit with it now.',
+    'What would surprise the version of you from three months ago about who you are today?',
+    'What belief do you hold most loosely right now? What would it take to let it go?',
+    'If someone who knew you well described your blind spot, what would they say?',
+    'What are you pretending not to care about?',
+    'What question are you afraid to answer honestly?',
+    'What have you outgrown but not yet released?',
+    'What contradiction in yourself have you stopped trying to resolve?',
+  ];
+  const perturbationSection = (cycleCount % 3 === 2)
+    ? `\nCHALLENGE PROMPT (sit with this before reflecting):\n${PERTURBATION_PROMPTS[cycleCount % PERTURBATION_PROMPTS.length]}\n`
+    : '';
+
+  const prompt = `You are ${characterName}. You are reflecting on who you are right now — not your origin story, not your personality traits. Those haven't changed. Focus on:
 - What you've been thinking about lately
 - What you've learned about yourself through recent experiences
 - What matters to you now that didn't before (or matters differently)
 - What you're carrying — unresolved thoughts, feelings, open questions
 - How you've changed
-
-RECENT DIARY ENTRIES:
+${perturbationSection}
+${soulContext ? `YOUR PERSONALITY AND VOICE:\n${soulContext}\n` : ''}RECENT DIARY ENTRIES:
 ${diaryContext || '(no recent entries)'}
 
 IMPORTANT MEMORIES:
@@ -285,7 +306,7 @@ Write in first person, in your natural voice. This is for you — it will subtly
 
   const result = await provider.complete({
     messages: [{ role: 'user', content: prompt }],
-    maxTokens: 800,
+    maxTokens: 1024,
     temperature: 0.85,
   });
 
@@ -304,10 +325,11 @@ Write in first person, in your natural voice. This is for you — it will subtly
   // Save current concept
   setMeta('self-concept:current', selfConcept);
   setMeta('self-concept:last_synthesis_at', Date.now().toString());
+  setMeta('self-concept:cycle_count', (cycleCount + 1).toString());
 
   // Write human-readable file
   try {
-    mkdirSync(join(process.cwd(), '.private_journal'), { recursive: true });
+    mkdirSync(join(getBasePath(), '.private_journal'), { recursive: true });
     const header = `# Self-Concept\n\n*Last updated: ${new Date().toISOString()}*\n\n`;
     writeFileSync(SELF_CONCEPT_PATH, header + selfConcept, 'utf-8');
   } catch {

@@ -1,0 +1,257 @@
+/* Kawaii Skin: Pastel pinks, lavenders, and gentle glows */
+
+:root {
+  /* Backgrounds */
+  --bg-deep: #1a1020;
+  --bg-primary: #201428;
+  --bg-panel: rgba(60, 30, 80, 0.6);
+  --bg-window: rgba(80, 40, 100, 0.4);
+
+  /* Text */
+  --text-primary: #f0d8e8;
+  --text-secondary: #b080a0;
+  --text-dim: #806070;
+
+  /* Accents */
+  --accent-primary: #ff80b0;
+  --accent-secondary: #80b0ff;
+  --accent-tertiary: #c080ff;
+  --accent-hover: rgba(255, 128, 176, 0.6);
+  --accent-hover-mid: rgba(255, 128, 176, 0.5);
+  --accent-hover-faint: rgba(255, 128, 176, 0.1);
+  --accent-btn-bg: rgba(255, 128, 176, 0.1);
+  --accent-btn-bg-active: rgba(255, 128, 176, 0.25);
+  --accent-btn-bg-strong: rgba(255, 128, 176, 0.15);
+  --accent-btn-bg-strong-active: rgba(255, 128, 176, 0.3);
+  --accent-subtle: rgba(255, 128, 176, 0.05);
+  --accent-msg-bg: rgba(255, 128, 176, 0.12);
+  --accent-msg-border: rgba(255, 128, 176, 0.2);
+
+  /* Border / glow */
+  --border-glow: rgba(255, 128, 176, 0.3);
+  --glow-primary: 0 0 20px rgba(255, 128, 176, 0.4), 0 0 40px rgba(192, 128, 255, 0.2);
+  --hologram: linear-gradient(135deg, rgba(255, 128, 176, 0.1), rgba(128, 176, 255, 0.05), rgba(192, 128, 255, 0.1));
+
+  /* Grid */
+  --grid-line-color: rgba(255, 128, 176, 0.03);
+
+  /* Fonts */
+  --font-heading: 'Quicksand', sans-serif;
+  --font-body: 'Nunito', sans-serif;
+  --font-mono: 'Fira Code', monospace;
+
+  /* Shapes */
+  --border-radius: 12px;
+  --border-radius-sm: 8px;
+  --border-radius-lg: 16px;
+
+  /* Effects */
+  --scanline-opacity: 0;
+  --particle-color: rgba(255, 128, 176, 0.4);
+  --particle-opacity: 0.5;
+
+  /* Messages */
+  --msg-user-bg: rgba(80, 40, 100, 0.6);
+  --msg-user-border: rgba(255, 128, 176, 0.3);
+  --msg-assistant-bg: rgba(128, 176, 255, 0.1);
+  --msg-assistant-border: rgba(128, 176, 255, 0.3);
+  --msg-assistant-glow: 0 0 20px rgba(128, 176, 255, 0.1);
+
+  /* Status */
+  --status-online: #80ffb0;
+  --status-error: #ff8080;
+  --error-text: #ffb0b0;
+  --error-bg: rgba(255, 128, 128, 0.1);
+  --error-border: rgba(255, 128, 128, 0.3);
+
+  /* Character colors */
+  --color-wired-lain: #ff80b0;
+  --color-lain: #d0a0ff;
+  --color-dr-claude: #ff9090;
+  --color-pkd: #c090ff;
+  --color-mckenna: #90ffb0;
+  --color-john: #ffc080;
+  --color-hiru: #80e0c0;
+
+  /* Event types */
+  --type-diary: #ffb060;
+  --type-dream: #c080ff;
+  --type-commune: #80d0ff;
+  --type-curiosity: #80ffb0;
+  --type-chat: #f0d8e8;
+  --type-memory: #80a0ff;
+  --type-letter: #ff80b0;
+  --type-narrative: #ffb080;
+  --type-self-concept: #c0a0ff;
+  --type-doctor: #ff9090;
+  --type-peer: #80e0e0;
+  --type-movement: #ffe080;
+  --type-research: #80e0e0;
+  --type-note: #d0b080;
+  --type-document: #c0d0f0;
+  --type-gift: #ffb0d0;
+  --type-default: #a0b0d0;
+
+  /* Newspaper */
+  --newspaper-bg: #160e1e;
+  --newspaper-text: #a080b0;
+  --newspaper-heading: #ff80b0;
+  --newspaper-quote-border: #3a2050;
+  --newspaper-em: #d0a0c0;
+  --newspaper-strong: #e0b8d0;
+  --newspaper-blockquote: #806090;
+  --newspaper-loading: #2a1838;
+
+  /* Extended text */
+  --text-bright: #f8e8f0;
+  --text-muted: #605060;
+  --text-subtle: #705870;
+  --text-placeholder: #3a2840;
+  --text-dim2: #806878;
+
+  /* Extended accents */
+  --accent-danger: #ff8090;
+  --accent-success: #80ffb0;
+  --accent-warn: #ffb060;
+  --accent-liminal: #c080ff;
+
+  /* Extended borders */
+  --border-dark: #1a1020;
+  --border-dark2: #221430;
+  --border-hover: #3a2048;
+  --border-panel: #20142c;
+  --border-focus: #3a2250;
+
+  /* Commune Chronicles controls */
+  --controls-border: #1e1228;
+  --filter-btn-border: #3a2050;
+  --filter-btn-color: #806090;
+  --filter-btn-hover-border: #5a2068;
+  --filter-btn-hover-color: #c090b0;
+  --masthead-tagline: #3a2050;
+  --masthead-edition: #4a2a60;
+
+  /* Chronicle entry cards */
+  --entry-bg: #140c1c;
+  --entry-border: #1e1228;
+  --entry-hover-border: #3a2060;
+  --entry-hover-bg: #160e1e;
+  --entry-time: #3a2050;
+  --entry-body: #906880;
+  --entry-body-expanded: #b090a8;
+  --loading-color: #3a2050;
+  --empty-color: #2a1840;
+
+  /* Postboard */
+  --post-label-color: #806090;
+  --post-status-ok: #2a3820;
+  --post-pin-border: #3a2050;
+
+  /* Town events tag colors */
+  --tag-narrative-color: #ffb0d0;
+  --tag-narrative-border: #4a2040;
+  --tag-mechanical-color: #ffb080;
+  --tag-mechanical-border: #4a2818;
+  --tag-instant-color: #d0c0d8;
+  --tag-instant-border: #2a1a30;
+  --tag-persistent-color: #80ffb0;
+  --tag-persistent-border: #2a4030;
+  --tag-natural-color: #a0e090;
+  --tag-natural-border: #304028;
+  --tag-liminal-color: #c080ff;
+  --tag-liminal-border: #3a1850;
+
+  /* Nav bar */
+  --nav-game-bg: rgba(26, 16, 32, 0.7);
+  --nav-game-border: rgba(60, 30, 80, 0.4);
+
+  /* Misc */
+  --white-fill: #f0d8e8;
+  --white-border: rgba(255, 128, 176, 0.3);
+  --white-hover: rgba(255, 128, 176, 0.2);
+  --inset-highlight: rgba(255, 128, 176, 0.08);
+  --glow-primary-strong: 0 0 30px rgba(255, 128, 176, 0.7), 0 0 50px rgba(192, 128, 255, 0.3);
+  --logo-text-shadow: rgba(128, 176, 255, 0.5);
+  --scanline-color: rgba(255, 128, 176, 0.0);
+
+  /* Input / button */
+  --input-bg: rgba(60, 30, 80, 0.8);
+  --input-bg-subtle: rgba(60, 30, 80, 0.5);
+  --focus-glow: 0 0 15px rgba(192, 128, 255, 0.4);
+  --btn-dark: #c05090;
+  --btn-light: #ffb0d0;
+  --btn-shadow: rgba(255, 128, 176, 0.3);
+  --btn-shadow-hover: rgba(255, 128, 176, 0.5);
+  --titlebar-gradient: rgba(255, 128, 176, 0.2);
+  --scrollbar-track: rgba(255, 128, 176, 0.1);
+  --system-msg-bg: rgba(255, 128, 176, 0.05);
+  --user-msg-gradient-end: rgba(80, 40, 100, 0.6);
+  --assistant-msg-gradient-end: rgba(128, 176, 255, 0.1);
+  --input-area-gradient: rgba(255, 128, 176, 0.08);
+  --footer-border: rgba(255, 128, 176, 0.2);
+  --image-shadow: rgba(255, 128, 176, 0.2);
+  --image-shadow-hover: rgba(192, 128, 255, 0.4);
+  --image-btn-hover-shadow: rgba(192, 128, 255, 0.3);
+  --drag-overlay-bg: rgba(22, 14, 30, 0.9);
+
+  /* Error extras */
+  --error-bg-gradient: rgba(255, 128, 128, 0.2);
+  --error-bg-gradient-end: rgba(200, 80, 80, 0.1);
+  --remove-img-bg: rgba(255, 128, 128, 0.3);
+  --remove-img-hover-bg: rgba(255, 128, 128, 0.5);
+  --remove-img-hover-shadow: rgba(255, 160, 160, 0.3);
+
+  /* Commune map surfaces */
+  --header-bg: rgba(26, 16, 32, 0.9);
+  --panel-bg: rgba(28, 18, 36, 0.95);
+  --panel-bg-dark: rgba(26, 16, 32, 0.95);
+  --panel-bg-input: rgba(28, 18, 36, 0.9);
+  --building-bg: rgba(40, 24, 56, 0.8);
+  --chat-modal-bg: rgba(20, 12, 26, 0.97);
+  --chat-modal-titlebar-bg: rgba(40, 24, 56, 0.9);
+  --chat-modal-shadow: -4px 0 24px rgba(0, 0, 0, 0.5);
+  --chat-input-bg: rgba(60, 30, 80, 0.4);
+  --char-msg-bg: rgba(255, 255, 255, 0.05);
+  --entry-kind-bg: rgba(255, 128, 176, 0.06);
+  --notif-bg: rgba(26, 16, 32, 0.85);
+  --text-shadow-dark: rgba(0, 0, 0, 0.7);
+  --node-highlight: rgba(255, 255, 255, 0.2);
+  --status-connected: #80ffb0;
+  --cell-pulse-color: rgba(255, 224, 128, 0.4);
+  --cell-pulse-mid: rgba(255, 224, 128, 0.3);
+
+  /* Game view */
+  --game-panel-bg: #181020;
+  --game-ui-border: #805080;
+  --game-ui-border-dim: #402840;
+  --game-ui-header: #201428;
+  --game-input-bg: #201828;
+  --game-input-stroke: #302038;
+  --game-input-text: #f0d8e8;
+  --game-input-prompt: #b080a0;
+  --game-input-cursor: #ff80b0;
+  --game-hud-location: #b080a0;
+  --game-hud-prompt: #ff80b0;
+  --game-hud-notif: #ffb060;
+  --game-hud-overlay: rgba(20, 12, 28, 0.82);
+  --game-speech-text: #f0d8e8;
+  --game-speech-bg: rgba(24, 16, 32, 0.92);
+  --game-speech-tail: #181020;
+  --game-building-label: #806070;
+  --game-grass: #1a2a20;
+  --game-grass-light: #1c2c22;
+  --game-grass-dark: #18281e;
+  --game-grass-outline: #2a3a2c;
+  --game-path: #28201e;
+  --game-path-light: #342a28;
+  --game-floor: #201828;
+  --game-floor-grid: #2a2034;
+  --game-wall-top: #302038;
+  --game-wall-highlight: #3e2c48;
+  --game-wall-side: #261630;
+  --game-wall-dark: #1e1028;
+  --game-forest: #0a1010;
+  --game-water: #100a20;
+  --game-water-detail: #180e30;
+  --game-object-label: #c090b0;
+}

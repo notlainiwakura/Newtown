@@ -4,7 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>COMMUNE MAP // WIRED</title>
-  <link rel="stylesheet" href="commune-map.css?v=9">
+  <link rel="stylesheet" href="commune-map.css?v=10">
+  <script src="/skins/early-load.js"></script>
 </head>
 <body>
   <div class="bg-grid"></div>
@@ -67,17 +68,8 @@
     </div>
   </div>
 
-  <script>
-    // Inject API key into URL if not present (read from server-injected meta tag)
-    (function() {
-      var key = document.querySelector('meta[name="lain-api-key"]');
-      if (key && !new URLSearchParams(window.location.search).get('key')) {
-        var url = new URL(window.location);
-        url.searchParams.set('key', key.content);
-        window.history.replaceState({}, '', url);
-      }
-    })();
-  </script>
-  <script src="commune-map.js?v=9"></script>
+  <script src="commune-map.js?v=12"></script>
+  <script src="/skins/loader.js"></script>
+  <script src="/skins/picker.js"></script>
 </body>
 </html>

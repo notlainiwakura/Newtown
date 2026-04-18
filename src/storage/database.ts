@@ -4,6 +4,7 @@
 
 import Database from 'better-sqlite3';
 import type { Database as DatabaseType } from 'better-sqlite3';
+import * as sqliteVec from 'sqlite-vec';
 import { mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { StorageError } from '../utils/errors.js';
@@ -14,7 +15,7 @@ import { getPaths } from '../config/paths.js';
 
 let db: DatabaseType | null = null;
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 11;
 
 const MIGRATIONS = [
   // Version 1: Initial schema
@@ -135,29 +136,138 @@ const MIGRATIONS = [
 
   ALTER TABLE memory_associations ADD COLUMN causal_type TEXT;
   `,
-  // Version 6: Reserved to repair historical schema-version mismatch
+  // Version 6: Postboard — direct line from the administrator to all inhabitants
   `
-  SELECT 1;
-  `,
-  // Version 7: Persistent desires
-  `
-  CREATE TABLE IF NOT EXISTS desires (
+  CREATE TABLE IF NOT EXISTS postboard_messages (
     id TEXT PRIMARY KEY,
-    type TEXT NOT NULL,
-    description TEXT NOT NULL,
-    intensity REAL NOT NULL DEFAULT 0.5,
-    source TEXT NOT NULL,
-    source_detail TEXT,
-    target_peer TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    resolved_at INTEGER,
-    resolution TEXT,
-    decay_rate REAL NOT NULL DEFAULT 0.04
+    author TEXT NOT NULL DEFAULT 'admin',
+    content TEXT NOT NULL,
+    pinned INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL
   );
 
-  CREATE INDEX IF NOT EXISTS idx_desires_active ON desires(resolved_at) WHERE resolved_at IS NULL;
-  CREATE INDEX IF NOT EXISTS idx_desires_type ON desires(type);
+  CREATE INDEX IF NOT EXISTS idx_postboard_created ON postboard_messages(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_postboard_pinned ON postboard_messages(pinned);
+  `,
+  // Version 7: Persistent objects / inventory system
+  `
+  CREATE TABLE IF NOT EXISTS objects (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    creator_id TEXT NOT NULL,
+    creator_name TEXT NOT NULL,
+    owner_id TEXT,
+    owner_name TEXT,
+    location TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    metadata TEXT DEFAULT '{}'
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_objects_owner ON objects(owner_id);
+  CREATE INDEX IF NOT EXISTS idx_objects_location ON objects(location);
+  `,
+  // Version 8: Town events — admin-triggered events that affect all inhabitants
+  `
+  CREATE TABLE IF NOT EXISTS town_events (
+    id TEXT PRIMARY KEY,
+    description TEXT NOT NULL,
+    narrative INTEGER DEFAULT 0,
+    mechanical INTEGER DEFAULT 0,
+    instant INTEGER DEFAULT 0,
+    persistent INTEGER DEFAULT 0,
+    natural_event INTEGER DEFAULT 0,
+    liminal INTEGER DEFAULT 0,
+    effects TEXT DEFAULT '{}',
+    status TEXT DEFAULT 'active',
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    ended_at INTEGER
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_town_events_status ON town_events(status);
+  CREATE INDEX IF NOT EXISTS idx_town_events_created ON town_events(created_at DESC);
+  `,
+  // Version 9: Building memory — spatial residue from conversations, arrivals, objects
+  `
+  CREATE TABLE IF NOT EXISTS building_events (
+    id TEXT PRIMARY KEY,
+    building TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    emotional_tone REAL DEFAULT 0,
+    actors TEXT DEFAULT '[]',
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_building_events_building ON building_events(building, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_building_events_created ON building_events(created_at DESC);
+  `,
+  // Version 10: Palace wings/rooms + knowledge graph tables
+  `
+  CREATE TABLE IF NOT EXISTS palace_wings (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    created_at INTEGER NOT NULL,
+    memory_count INTEGER DEFAULT 0
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_palace_wings_name ON palace_wings(name);
+
+  CREATE TABLE IF NOT EXISTS palace_rooms (
+    id TEXT PRIMARY KEY,
+    wing_id TEXT NOT NULL REFERENCES palace_wings(id),
+    name TEXT NOT NULL,
+    description TEXT,
+    created_at INTEGER NOT NULL,
+    memory_count INTEGER DEFAULT 0
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_palace_rooms_wing ON palace_rooms(wing_id);
+  CREATE INDEX IF NOT EXISTS idx_palace_rooms_name ON palace_rooms(name);
+
+  CREATE TABLE IF NOT EXISTS kg_triples (
+    id TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    object TEXT NOT NULL,
+    strength REAL DEFAULT 1.0,
+    valid_from INTEGER NOT NULL,
+    ended INTEGER,
+    source_memory_id TEXT,
+    metadata TEXT DEFAULT '{}'
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_kg_subject ON kg_triples(subject);
+  CREATE INDEX IF NOT EXISTS idx_kg_object ON kg_triples(object);
+  CREATE INDEX IF NOT EXISTS idx_kg_predicate ON kg_triples(predicate);
+  CREATE INDEX IF NOT EXISTS idx_kg_valid ON kg_triples(valid_from, ended);
+
+  CREATE TABLE IF NOT EXISTS kg_entities (
+    name TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL,
+    first_seen INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    metadata TEXT DEFAULT '{}'
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_kg_entities_type ON kg_entities(entity_type);
+  `,
+  // Version 11: Palace columns on memories + vec0 virtual table for embeddings
+  `
+  ALTER TABLE memories ADD COLUMN wing_id TEXT;
+  ALTER TABLE memories ADD COLUMN room_id TEXT;
+  ALTER TABLE memories ADD COLUMN hall TEXT;
+  ALTER TABLE memories ADD COLUMN aaak_content TEXT;
+  ALTER TABLE memories ADD COLUMN aaak_compressed_at INTEGER;
+
+  CREATE INDEX IF NOT EXISTS idx_memories_wing ON memories(wing_id);
+  CREATE INDEX IF NOT EXISTS idx_memories_room ON memories(room_id);
+  CREATE INDEX IF NOT EXISTS idx_memories_hall ON memories(hall);
+
+  CREATE VIRTUAL TABLE IF NOT EXISTS memory_embeddings USING vec0(embedding float[384] distance_metric=cosine, +memory_id text);
   `,
 ];
 
@@ -199,6 +309,9 @@ export async function initDatabase(
 
     // Open database
     db = new Database(path);
+
+    // Load sqlite-vec extension for vector similarity search
+    sqliteVec.load(db);
 
     // Configure SQLCipher (Note: better-sqlite3 needs to be compiled with SQLCipher)
     // For standard better-sqlite3, we skip encryption but keep the API consistent

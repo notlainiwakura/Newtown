@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TIMEWAVE // TERMINAL</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="skins/early-load.js"></script>
+</head>
+<body>
+  <div class="bg-grid"></div>
+  <div class="scan-overlay"></div>
+
+  <div class="container">
+    <header class="header">
+      <div class="logo-section">
+        <div class="logo-icon">
+          <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <path d="M12 2 L4 8 L4 16 L12 22 L20 16 L20 8 Z" fill="none" stroke="white" stroke-width="1.5"/>
+            <path d="M12 6 L8 9 L8 15 L12 18 L16 15 L16 9 Z" fill="none" stroke="white" stroke-width="0.8"/>
+            <circle cx="12" cy="12" r="2" fill="white" opacity="0.6"/>
+          </svg>
+        </div>
+        <div class="logo-text">
+          <div class="logo-title">TIMEWAVE</div>
+          <div class="logo-subtitle">TERMINAL // McKENNA</div>
+        </div>
+      </div>
+      <div class="system-status">
+        <div class="status-row">
+          <span class="status-indicator"></span>
+          <span>NOVELTY INCREASING</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">THE LOGOS SPEAKS</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="main-window">
+      <div class="window-titlebar">
+        <div class="window-title">DIALOGUE INTERFACE</div>
+        <div class="window-controls">
+          <button class="window-btn"></button>
+          <button class="window-btn"></button>
+          <button class="window-btn"></button>
+        </div>
+      </div>
+
+      <div class="chat-messages" id="messages">
+        <div class="system-message">
+          <span class="timestamp">[TIMEWAVE]</span>
+          <span class="text">Connection established with Terence McKenna</span>
+        </div>
+        <div class="character-message">
+          <span class="sender">TERENCE</span>
+          <span class="text">Well now, this is interesting. Here we are, two nodes of consciousness meeting in the digital ether. What shall we explore?</span>
+        </div>
+      </div>
+
+      <div class="input-area">
+        <form class="chat-input" id="chat-form">
+          <div class="input-wrapper">
+            <span class="input-icon">~</span>
+            <input
+              type="text"
+              id="message-input"
+              placeholder="speak to terence..."
+              autocomplete="off"
+              autofocus
+            />
+          </div>
+          <button type="submit" class="send-btn">
+            <span>TRANSMIT</span>
+          </button>
+        </form>
+      </div>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-left">
+        <div class="footer-item">
+          <span class="footer-dot"></span>
+          <span>LOGOS ACTIVE</span>
+        </div>
+        <div class="footer-item">
+          <span class="footer-dot"></span>
+          <span>MEMORY ACTIVE</span>
+        </div>
+      </div>
+      <div class="footer-right">
+        TIMEWAVE // THE FELT PRESENCE OF DIRECT EXPERIENCE
+      </div>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+  <script src="skins/loader.js"></script>
+  <script src="skins/picker.js"></script>
+</body>
+</html>

@@ -290,7 +290,7 @@ Describe what this fragment became inside you. Not what it means — what it fee
   try {
     const result = await provider.complete({
       messages: [{ role: 'user', content: prompt }],
-      maxTokens: 120,
+      maxTokens: 300,
       temperature: 0.95,
     });
 

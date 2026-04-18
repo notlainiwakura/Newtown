@@ -3,9 +3,10 @@
   var path = location.pathname;
   var links = [
     { label: 'MAP', href: '/commune-map.html' },
-    { label: 'NETWORK', href: '/commune-map.html#network' },
     { label: 'WALK', href: '/game/' },
     { label: 'NEWS', href: '/commune-newspaper.html' },
+    { label: 'PAPER', href: '/newspaper.html' },
+    { label: 'EVENTS', href: '/town-events.html' },
     { label: 'NEO', href: '/neo/' },
     { label: 'PLATO', href: '/plato/' },
     { label: 'JOE', href: '/joe/' }
@@ -14,8 +15,8 @@
   var isGame = path === '/game/' || path === '/game/index.html';
 
   function isActive(href) {
-    if (href === '/commune-map.html#network') return false;
     if (href === '/commune-map.html') return path === '/commune-map.html';
+    if (href === '/') return path === '/' || path === '/index.html';
     return path.indexOf(href) === 0;
   }
 
@@ -27,13 +28,13 @@
 
   var style = document.createElement('style');
   style.textContent =
-    '#laintown-nav{position:fixed;top:0;left:0;right:0;height:32px;background:#0a0a0f;border-bottom:1px solid #1a1a2e;display:flex;align-items:center;z-index:99999;font-family:"Share Tech Mono",monospace;padding:0 12px;gap:0}' +
-    '#laintown-nav .ltn-title{color:#4a9eff;font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-right:16px;text-decoration:none}' +
-    '#laintown-nav a{color:#556;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;text-decoration:none;padding:0 10px;line-height:32px;transition:color .2s}' +
-    '#laintown-nav a:hover{color:#8ab4f8}' +
-    '#laintown-nav a.ltn-active{color:#4a9eff}' +
+    '#laintown-nav{position:fixed;top:0;left:0;right:0;height:32px;background:var(--bg-deep,#0a0a0f);border-bottom:1px solid var(--border-glow,#1a1a2e);display:flex;align-items:center;z-index:99999;font-family:"Share Tech Mono",monospace;padding:0 12px;gap:0}' +
+    '#laintown-nav .ltn-title{color:var(--accent-primary,#4a9eff);font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-right:16px;text-decoration:none}' +
+    '#laintown-nav a{color:var(--text-dim,#556);font-size:11px;letter-spacing:1.5px;text-transform:uppercase;text-decoration:none;padding:0 10px;line-height:32px;transition:color .2s}' +
+    '#laintown-nav a:hover{color:var(--accent-secondary,#8ab4f8)}' +
+    '#laintown-nav a.ltn-active{color:var(--accent-primary,#4a9eff)}' +
     (isGame
-      ? 'body{padding-top:0!important}#laintown-nav{background:rgba(10,10,15,0.6);border-bottom-color:rgba(26,26,46,0.4)}'
+      ? 'body{padding-top:0!important}#laintown-nav{background:var(--nav-game-bg,rgba(10,10,15,0.6));border-bottom-color:var(--nav-game-border,rgba(26,26,46,0.4))}'
       : 'body{padding-top:32px!important}');
   document.head.appendChild(style);
 
@@ -49,24 +50,13 @@
     title.textContent = 'LAINTOWN';
     nav.appendChild(title);
 
-    var key = new URLSearchParams(location.search).get('key');
-
     for (var i = 0; i < links.length; i++) {
       var a = document.createElement('a');
-      var href = links[i].href;
-      if (key) {
-        var hi = href.indexOf('#');
-        var base = hi > -1 ? href.slice(0, hi) : href;
-        var frag = hi > -1 ? href.slice(hi) : '';
-        href = base + '?key=' + encodeURIComponent(key) + frag;
-      }
-      a.href = href;
+      a.href = links[i].href;
       a.textContent = links[i].label;
       if (isActive(links[i].href)) a.className = 'ltn-active';
       nav.appendChild(a);
     }
-
-    if (key) title.href = '/?key=' + encodeURIComponent(key);
 
     document.body.insertBefore(nav, document.body.firstChild);
   }

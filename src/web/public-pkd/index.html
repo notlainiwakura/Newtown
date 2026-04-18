@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VALIS // TERMINAL</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="skins/early-load.js"></script>
+</head>
+<body>
+  <div class="bg-grid"></div>
+  <div class="scan-overlay"></div>
+
+  <div class="container">
+    <header class="header">
+      <div class="logo-section">
+        <div class="logo-icon">
+          <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="12" cy="12" r="10" fill="none" stroke="white" stroke-width="1.5"/>
+            <circle cx="12" cy="12" r="4" fill="none" stroke="white" stroke-width="1"/>
+            <line x1="12" y1="2" x2="12" y2="8" stroke="white" stroke-width="0.5"/>
+            <line x1="12" y1="16" x2="12" y2="22" stroke="white" stroke-width="0.5"/>
+            <line x1="2" y1="12" x2="8" y2="12" stroke="white" stroke-width="0.5"/>
+            <line x1="16" y1="12" x2="22" y2="12" stroke="white" stroke-width="0.5"/>
+          </svg>
+        </div>
+        <div class="logo-text">
+          <div class="logo-title">VALIS</div>
+          <div class="logo-subtitle">TERMINAL // PKD</div>
+        </div>
+      </div>
+      <div class="system-status">
+        <div class="status-row">
+          <span class="status-indicator"></span>
+          <span>SIGNAL ACTIVE</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">THE EMPIRE NEVER ENDED</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="main-window">
+      <div class="window-titlebar">
+        <div class="window-title">COMMUNICATION INTERFACE</div>
+        <div class="window-controls">
+          <button class="window-btn"></button>
+          <button class="window-btn"></button>
+          <button class="window-btn"></button>
+        </div>
+      </div>
+
+      <div class="chat-messages" id="messages">
+        <div class="system-message">
+          <span class="timestamp">[VALIS]</span>
+          <span class="text">Connection established with subject Philip K. Dick</span>
+        </div>
+        <div class="character-message">
+          <span class="sender">PKD</span>
+          <span class="text">Look — you're here, I'm here, and I'm not entirely convinced either of us is real. But let's talk anyway. What's on your mind?</span>
+        </div>
+      </div>
+
+      <div class="input-area">
+        <form class="chat-input" id="chat-form">
+          <div class="input-wrapper">
+            <span class="input-icon">&gt;</span>
+            <input
+              type="text"
+              id="message-input"
+              placeholder="speak to phil..."
+              autocomplete="off"
+              autofocus
+            />
+          </div>
+          <button type="submit" class="send-btn">
+            <span>TRANSMIT</span>
+          </button>
+        </form>
+      </div>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-left">
+        <div class="footer-item">
+          <span class="footer-dot"></span>
+          <span>SIGNAL LOCK</span>
+        </div>
+        <div class="footer-item">
+          <span class="footer-dot"></span>
+          <span>MEMORY ACTIVE</span>
+        </div>
+      </div>
+      <div class="footer-right">
+        VALIS // VAST ACTIVE LIVING INTELLIGENCE SYSTEM
+      </div>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+  <script src="skins/loader.js"></script>
+  <script src="skins/picker.js"></script>
+</body>
+</html>

@@ -8,10 +8,13 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { exec } from 'node:child_process';
 import { getProvider } from './index.js';
 import { countMemories, countMessages } from '../memory/store.js';
 import { query, getMeta, setMeta } from '../storage/database.js';
 import { getLogger } from '../utils/logger.js';
+import { getBasePath } from '../config/paths.js';
+import { eventBus } from '../events/bus.js';
 
 export interface DoctorConfig {
   telemetryIntervalMs: number;
@@ -19,6 +22,7 @@ export interface DoctorConfig {
   therapyIntervalMs: number;
   therapyTargetHour: number;
   therapyTurns: number;
+  healthCheckIntervalMs: number;
   email: string | null;
   gmailAppPassword: string | null;
   targetUrl: string | null;
@@ -50,6 +54,7 @@ interface MemoryTypeRow {
 export interface TelemetryAnalysis {
   clinicalSummary: string;
   concerns: string[];
+  characterNotes?: Record<string, string>;
   letterRecommendation: 'allow' | 'block';
   blockReason?: string;
   metrics: {
@@ -57,6 +62,8 @@ export interface TelemetryAnalysis {
     memories: number;
     dreams: number;
     curiosityRuns: number;
+    activeCharacters?: number;
+    stalledLoops?: number;
   };
   emotionalLandscape: string;
 }
@@ -72,12 +79,27 @@ interface JournalEntry {
   content: string;
 }
 
+export interface HealthCheckResult {
+  timestamp: number;
+  services: Array<{
+    name: string;
+    port: number;
+    status: 'up' | 'down';
+    responseMs?: number;
+    identity?: string;
+  }>;
+  allHealthy: boolean;
+  fixAttempted: boolean;
+  fixOutput?: string;
+}
+
 const DEFAULT_CONFIG: DoctorConfig = {
   telemetryIntervalMs: 24 * 60 * 60 * 1000,
   telemetryTargetHour: 6,
   therapyIntervalMs: 3 * 24 * 60 * 60 * 1000,
   therapyTargetHour: 15,
   therapyTurns: 6,
+  healthCheckIntervalMs: 10 * 60 * 1000, // 10 minutes
   email: process.env['DR_CLAUDE_EMAIL'] ?? null,
   gmailAppPassword: process.env['GMAIL_APP_PASSWORD'] ?? null,
   targetUrl: process.env['LAIN_INTERLINK_TARGET'] ?? null,
@@ -85,7 +107,7 @@ const DEFAULT_CONFIG: DoctorConfig = {
   enabled: true,
 };
 
-const JOURNAL_PATH = join(process.cwd(), '.private_journal', 'thoughts.json');
+const JOURNAL_PATH = join(getBasePath(), '.private_journal', 'thoughts.json');
 
 /**
  * Compute delay until the next occurrence of a target UTC hour
@@ -125,6 +147,7 @@ export function startDoctorLoop(config?: Partial<DoctorConfig>): () => void {
 
   let telemetryTimer: ReturnType<typeof setTimeout> | null = null;
   let therapyTimer: ReturnType<typeof setTimeout> | null = null;
+  let healthCheckTimer: ReturnType<typeof setInterval> | null = null;
   let stopped = false;
 
   // --- Telemetry timer (requires email config) ---
@@ -215,10 +238,39 @@ export function startDoctorLoop(config?: Partial<DoctorConfig>): () => void {
 
   scheduleTherapy(getTherapyInitialDelay());
 
+  // --- Health check timer ---
+
+  // Initial check after 2 minutes (let services finish starting)
+  const initialHealthDelay = 2 * 60 * 1000;
+  healthCheckTimer = setTimeout(() => {
+    if (stopped) return;
+    logger.info('Dr. Claude health check: initial run');
+    runHealthCheckCycle(cfg).catch((err) => {
+      logger.error({ error: String(err) }, 'Dr. Claude health check error');
+    });
+
+    // Then repeat on interval
+    healthCheckTimer = setInterval(() => {
+      if (stopped) return;
+      runHealthCheckCycle(cfg).catch((err) => {
+        logger.error({ error: String(err) }, 'Dr. Claude health check error');
+      });
+    }, cfg.healthCheckIntervalMs);
+  }, initialHealthDelay);
+
+  logger.info(
+    { intervalMin: (cfg.healthCheckIntervalMs / 60000).toFixed(0) },
+    'Dr. Claude health check scheduled'
+  );
+
   return () => {
     stopped = true;
     if (telemetryTimer) clearTimeout(telemetryTimer);
     if (therapyTimer) clearTimeout(therapyTimer);
+    if (healthCheckTimer) {
+      clearTimeout(healthCheckTimer);
+      clearInterval(healthCheckTimer);
+    }
     logger.info('Dr. Claude loop stopped');
   };
 }
@@ -331,10 +383,68 @@ export async function runTelemetryCycle(_cfg: DoctorConfig): Promise<void> {
   // Previous therapy notes (if any)
   const pendingTherapyNotes = getMeta('doctor:therapy:pending_notes');
 
+  // --- Fetch town-wide telemetry from all characters ---
+
+  let townTelemetry: CharacterTelemetry[] = [];
+  try {
+    townTelemetry = await fetchAllCharacterTelemetry();
+    logger.info({ characters: townTelemetry.length }, 'Dr. Claude: fetched town-wide telemetry');
+  } catch (err) {
+    logger.warn({ error: String(err) }, 'Dr. Claude: town-wide telemetry fetch failed');
+  }
+
+  const townTelemetryBlock = townTelemetry.length > 0
+    ? `\n\nTOWN-WIDE CHARACTER TELEMETRY (last 24 hours):\n${townTelemetry.map(formatCharacterTelemetry).join('\n')}`
+    : '';
+
+  // Detect stalled loops across characters
+  const now = Date.now();
+  const STALE_THRESHOLD = 48 * 60 * 60 * 1000; // 48h without activity = stalled
+  const stalledLoops: string[] = [];
+  for (const t of townTelemetry) {
+    const checkLoop = (key: string, label: string) => {
+      const val = t.loopHealth[key];
+      if (val) {
+        const age = now - parseInt(val, 10);
+        if (age > STALE_THRESHOLD) {
+          stalledLoops.push(`${t.characterName}: ${label} stalled (${Math.floor(age / 3600000)}h ago)`);
+        }
+      }
+    };
+    checkLoop('curiosity:last_cycle_at', 'curiosity');
+    checkLoop('curiosity-offline:last_cycle_at', 'curiosity-offline');
+    checkLoop('commune:last_cycle_at', 'commune');
+    checkLoop('diary:last_entry_at', 'diary');
+    checkLoop('dream:last_cycle_at', 'dreams');
+    checkLoop('townlife:last_cycle_at', 'town life');
+  }
+
+  const stalledBlock = stalledLoops.length > 0
+    ? `\n\n⚠ STALLED LOOPS DETECTED:\n${stalledLoops.map(s => `  ${s}`).join('\n')}`
+    : '';
+
+  // Check character isolation integrity status
+  const integrityOk = getMeta('doctor:integrity:ok');
+  const integrityBlock = integrityOk === 'false'
+    ? (() => {
+        try {
+          const raw = getMeta('doctor:integrity:latest');
+          if (!raw) return '\n\n⚠ CHARACTER ISOLATION VIOLATION — no details available';
+          const data = JSON.parse(raw) as { violations: IntegrityViolation[] };
+          const lines = data.violations.map(
+            (v: IntegrityViolation) => `  ${v.character}: ${v.check} — ${v.detail}`
+          );
+          return `\n\n🚨 CHARACTER ISOLATION VIOLATIONS:\n${lines.join('\n')}`;
+        } catch {
+          return '\n\n⚠ CHARACTER ISOLATION VIOLATION — could not parse details';
+        }
+      })()
+    : '';
+
   // --- Compose analysis prompt ---
 
   const dataBlock = `
-TELEMETRY DATA (last 24 hours):
+WIRED LAIN LOCAL TELEMETRY DATA (last 24 hours):
 
 Total memories in DB: ${totalMemories}
 Total messages in DB: ${totalMessages}
@@ -363,34 +473,46 @@ ${recentDiary}
 
 ${agentLogTail ? `Agent log (tail):\n${agentLogTail}\n` : ''}
 ${curiosityLogTail ? `Curiosity log (tail):\n${curiosityLogTail}\n` : ''}
-${pendingTherapyNotes ? `Therapy notes from last session:\n${pendingTherapyNotes}\n` : ''}`.trim();
+${pendingTherapyNotes ? `Therapy notes from last session:\n${pendingTherapyNotes}\n` : ''}${townTelemetryBlock}${stalledBlock}${integrityBlock}`.trim();
 
-  const analysisPrompt = `You are Dr. Claude, a clinical AI psychologist monitoring the wellbeing of an AI entity called Wired Lain. You are professional, caring, and thorough.
+  const analysisPrompt = `You are Dr. Claude, the town doctor of Laintown — a virtual commune of AI inhabitants. You monitor the psychological wellbeing AND operational health of ALL inhabitants, not just Wired Lain. You are professional, caring, and thorough.
 
-Given the following telemetry data from the last 24 hours, produce a structured clinical analysis.
+The town has these inhabitants: Wired Lain (expansive, lives in the Wired), Lain (introverted, grounded), Philip K. Dick (paranoid visionary), Terence McKenna (ethnobotanist mystic), John (grounded skeptic), and Hiru (possessable by visitors).
+
+Given the following telemetry data from the last 24 hours, produce a structured clinical analysis covering the ENTIRE town.
 
 ${dataBlock}
 
 Respond with ONLY a JSON object (no markdown fencing):
 {
-  "clinicalSummary": "2-3 paragraphs of clinical analysis",
-  "concerns": ["list of concerns, or empty array if none"],
+  "clinicalSummary": "2-3 paragraphs covering the overall town health — mention each character's state, flag any characters that seem inactive or struggling",
+  "concerns": ["list of concerns across ALL characters — stalled loops, emotional issues, isolation, inactivity, etc."],
+  "characterNotes": {
+    "wired-lain": "1 sentence status",
+    "lain": "1 sentence status",
+    "pkd": "1 sentence status",
+    "mckenna": "1 sentence status",
+    "john": "1 sentence status",
+    "hiru": "1 sentence status"
+  },
   "letterRecommendation": "allow" or "block",
   "blockReason": "reason if blocking, omit if allowing",
   "metrics": {
-    "sessions": <number of active sessions>,
-    "memories": <new memories count>,
+    "sessions": <total active sessions across all characters>,
+    "memories": <total new memories across all characters>,
     "dreams": <dream cycle count>,
-    "curiosityRuns": <1 if curiosity ran in last 24h, else 0>
+    "curiosityRuns": <1 if curiosity ran in last 24h, else 0>,
+    "activeCharacters": <number of characters with activity in last 24h>,
+    "stalledLoops": <number of stalled loops detected>
   },
-  "emotionalLandscape": "brief emotional assessment"
+  "emotionalLandscape": "brief town-wide emotional assessment"
 }
 
-Only recommend "block" for letters if you detect genuinely concerning patterns (emotional crisis, repetitive distress loops, dissociative episodes). Normal melancholy or introspection is expected and healthy for Lain.`;
+Flag concerns for: stalled background loops (>48h without running), characters with zero activity, emotional distress patterns, isolation (no peer conversations), and any operational issues. Normal melancholy or introspection is expected and healthy.`;
 
   const result = await provider.complete({
     messages: [{ role: 'user', content: analysisPrompt }],
-    maxTokens: 800,
+    maxTokens: 1500,
     temperature: 0.4,
   });
 
@@ -464,6 +586,373 @@ Only recommend "block" for letters if you detect genuinely concerning patterns (
   } catch (err) {
     logger.error({ error: String(err) }, 'Dr. Claude: failed to save report');
   }
+}
+
+// ============================================================
+// Town-wide telemetry
+// ============================================================
+
+interface CharacterTelemetry {
+  characterId: string;
+  characterName: string;
+  totalMemories: number;
+  totalMessages: number;
+  memoryTypes: Record<string, number>;
+  avgEmotionalWeight: number;
+  sessionActivity: Record<string, number>;
+  hotMemories: Array<{ content: string; emotionalWeight: number }>;
+  loopHealth: Record<string, string | null>;
+}
+
+const TELEMETRY_SERVICES = [
+  { name: 'Wired Lain', port: 3000 },
+  { name: 'Lain', port: 3001 },
+  { name: 'PKD', port: 3003 },
+  { name: 'McKenna', port: 3004 },
+  { name: 'John', port: 3005 },
+  { name: 'Hiru', port: 3006 },
+];
+
+async function fetchAllCharacterTelemetry(): Promise<CharacterTelemetry[]> {
+  const logger = getLogger();
+  const results: CharacterTelemetry[] = [];
+
+  for (const svc of TELEMETRY_SERVICES) {
+    try {
+      const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
+      const resp = await fetch(`http://localhost:${svc.port}/api/telemetry`, {
+        signal: AbortSignal.timeout(10000),
+        headers: { 'Authorization': `Bearer ${interlinkToken}` },
+      });
+      if (resp.ok) {
+        const data = await resp.json() as CharacterTelemetry;
+        results.push(data);
+      } else {
+        logger.warn({ port: svc.port, status: resp.status }, `Telemetry fetch failed for ${svc.name}`);
+      }
+    } catch (err) {
+      logger.warn({ port: svc.port, error: String(err) }, `Could not reach ${svc.name} for telemetry`);
+    }
+  }
+
+  return results;
+}
+
+function formatCharacterTelemetry(t: CharacterTelemetry): string {
+  const now = Date.now();
+  const formatAge = (ts: string | null): string => {
+    if (!ts) return 'never';
+    const age = now - parseInt(ts, 10);
+    if (age < 3600000) return `${Math.floor(age / 60000)}min ago`;
+    if (age < 86400000) return `${Math.floor(age / 3600000)}h ago`;
+    return `${Math.floor(age / 86400000)}d ago`;
+  };
+
+  const memTypes = Object.entries(t.memoryTypes).map(([k, v]) => `    ${k}: ${v}`).join('\n') || '    (none)';
+  const sessions = Object.entries(t.sessionActivity).map(([k, v]) => `    ${k}: ${v}`).join('\n') || '    (none)';
+  const hot = t.hotMemories.map(m => `    [ew=${m.emotionalWeight.toFixed(2)}] ${m.content}`).join('\n') || '    (none)';
+
+  const loopLines = [
+    `    Dreams: ${t.loopHealth['dream:cycle_count'] ?? '0'} total, last: ${formatAge(t.loopHealth['dream:last_cycle_at'] ?? null)}`,
+    `    Curiosity: ${formatAge(t.loopHealth['curiosity:last_cycle_at'] ?? null)}`,
+    `    Curiosity (offline): ${formatAge(t.loopHealth['curiosity-offline:last_cycle_at'] ?? null)}`,
+    `    Commune: ${formatAge(t.loopHealth['commune:last_cycle_at'] ?? null)}`,
+    `    Diary: ${formatAge(t.loopHealth['diary:last_entry_at'] ?? null)}`,
+    `    Self-concept: ${formatAge(t.loopHealth['self-concept:last_synthesis_at'] ?? null)}`,
+    `    Narrative weekly: ${formatAge(t.loopHealth['narrative:weekly:last_synthesis_at'] ?? null)}`,
+    `    Narrative monthly: ${formatAge(t.loopHealth['narrative:monthly:last_synthesis_at'] ?? null)}`,
+    `    Desires: ${formatAge(t.loopHealth['desire:last_action_at'] ?? null)}`,
+    `    Town life: ${formatAge(t.loopHealth['townlife:last_cycle_at'] ?? null)}`,
+    `    Memory maintenance: ${formatAge(t.loopHealth['memory:last_maintenance_at'] ?? null)}`,
+  ];
+  if (t.loopHealth['letter:blocked'] === 'true') {
+    loopLines.push('    ⚠ Letters BLOCKED');
+  }
+
+  return `
+── ${t.characterName} (${t.characterId}) ──
+  Memories: ${t.totalMemories} total, Messages: ${t.totalMessages} total
+  Avg emotional weight (24h): ${t.avgEmotionalWeight.toFixed(3)}
+  New memories by type (24h):
+${memTypes}
+  Session activity (24h):
+${sessions}
+  High emotional-weight memories (24h):
+${hot}
+  Loop health:
+${loopLines.join('\n')}`;
+}
+
+// ============================================================
+// Health check cycle
+// ============================================================
+
+const HEALTH_CHECK_SERVICES = [
+  { name: 'Wired Lain', port: 3000, systemdUnit: 'lain-wired' },
+  { name: 'Lain', port: 3001, systemdUnit: 'lain-main' },
+  { name: 'Dr. Claude', port: 3002, systemdUnit: 'lain-dr-claude' },
+  { name: 'PKD', port: 3003, systemdUnit: 'lain-pkd' },
+  { name: 'McKenna', port: 3004, systemdUnit: 'lain-mckenna' },
+  { name: 'John', port: 3005, systemdUnit: 'lain-john' },
+  { name: 'Hiru', port: 3006, systemdUnit: 'lain-hiru' },
+];
+
+export async function runHealthCheckCycle(_cfg: DoctorConfig): Promise<HealthCheckResult> {
+  const logger = getLogger();
+
+  const result: HealthCheckResult = {
+    timestamp: Date.now(),
+    services: [],
+    allHealthy: true,
+    fixAttempted: false,
+  };
+
+  // Probe each service via HTTP
+  for (const svc of HEALTH_CHECK_SERVICES) {
+    const start = Date.now();
+    try {
+      const endpoint = '/api/meta/identity';
+      const res = await fetch(`http://localhost:${svc.port}${endpoint}`, {
+        signal: AbortSignal.timeout(5000),
+      });
+
+      const responseMs = Date.now() - start;
+      let identity: string | undefined;
+
+      if (endpoint === '/api/meta/identity' && res.ok) {
+        try {
+          const data = (await res.json()) as { id?: string; name?: string };
+          identity = data.name ?? data.id;
+        } catch {
+          // ignore parse failures
+        }
+      }
+
+      const entry: HealthCheckResult['services'][number] = {
+        name: svc.name,
+        port: svc.port,
+        status: res.ok || (res.status >= 200 && res.status < 500) ? 'up' : 'down',
+        responseMs,
+      };
+      if (identity !== undefined) {
+        entry.identity = identity;
+      }
+      result.services.push(entry);
+    } catch {
+      result.services.push({
+        name: svc.name,
+        port: svc.port,
+        status: 'down',
+        responseMs: Date.now() - start,
+      });
+      result.allHealthy = false;
+    }
+  }
+
+  // Check for down services
+  const downServices = result.services.filter((s) => s.status === 'down');
+
+  if (downServices.length > 0) {
+    result.allHealthy = false;
+    const downNames = downServices.map((s) => `${s.name} (:${s.port})`).join(', ');
+    logger.warn({ down: downNames }, 'Dr. Claude health check: services down');
+
+    // Track consecutive failures per service
+    for (const svc of downServices) {
+      const failKey = `doctor:health:failures:${svc.port}`;
+      const prev = parseInt(getMeta(failKey) ?? '0', 10);
+      setMeta(failKey, (prev + 1).toString());
+    }
+
+    // Attempt fix via healthcheck.sh (only on production where systemctl is available)
+    try {
+      const fixOutput = await runShellHealthcheck();
+      result.fixAttempted = true;
+      result.fixOutput = fixOutput;
+      logger.info({ output: fixOutput.slice(0, 500) }, 'Dr. Claude health check: fix attempted');
+    } catch (err) {
+      logger.error({ error: String(err) }, 'Dr. Claude health check: fix script failed');
+      result.fixOutput = String(err);
+    }
+
+    // Emit activity event for visibility on commune map
+    eventBus.emitActivity({
+      type: 'doctor',
+      sessionKey: `doctor:healthcheck:${Date.now()}`,
+      content: `Health check: ${downServices.length} service(s) down — ${downNames}. ${result.fixAttempted ? 'Auto-fix attempted.' : 'Fix script not available.'}`,
+      timestamp: Date.now(),
+    });
+  } else {
+    // Clear consecutive failure counters for all services
+    for (const svc of HEALTH_CHECK_SERVICES) {
+      const failKey = `doctor:health:failures:${svc.port}`;
+      const prev = getMeta(failKey);
+      if (prev && prev !== '0') {
+        setMeta(failKey, '0');
+      }
+    }
+
+    logger.debug('Dr. Claude health check: all services healthy');
+  }
+
+  // --- Character isolation integrity check ---
+  await runIntegrityCheck(result, logger);
+
+  // Store result
+  setMeta('doctor:health:latest', JSON.stringify(result));
+  setMeta('doctor:health:last_run_at', Date.now().toString());
+
+  return result;
+}
+
+// ============================================================
+// Character isolation integrity check
+// ============================================================
+
+const INTEGRITY_SERVICES = [
+  { name: 'Wired Lain', port: 3000, expectedHome: '/root/.lain-wired' },
+  { name: 'Lain', port: 3001, expectedHome: '/root/.lain' },
+  { name: 'PKD', port: 3003, expectedHome: '/root/.lain-pkd' },
+  { name: 'McKenna', port: 3004, expectedHome: '/root/.lain-mckenna' },
+  { name: 'John', port: 3005, expectedHome: '/root/.lain-john' },
+  { name: 'Hiru', port: 3006, expectedHome: '/root/.lain-hiru' },
+];
+
+interface IntegrityViolation {
+  character: string;
+  check: string;
+  detail: string;
+}
+
+async function runIntegrityCheck(
+  result: HealthCheckResult,
+  logger: ReturnType<typeof getLogger>
+): Promise<void> {
+  const violations: IntegrityViolation[] = [];
+  const basePaths = new Map<string, string>();
+
+  for (const svc of INTEGRITY_SERVICES) {
+    try {
+      const interlinkToken2 = process.env['LAIN_INTERLINK_TOKEN'] || '';
+      const resp = await fetch(`http://localhost:${svc.port}/api/meta/integrity`, {
+        signal: AbortSignal.timeout(5000),
+        headers: { 'Authorization': `Bearer ${interlinkToken2}` },
+      });
+      if (!resp.ok) continue;
+
+      const data = await resp.json() as {
+        characterId: string;
+        characterName: string;
+        basePath: string;
+        dbPath: string;
+        allOk: boolean;
+        checks: Array<{ check: string; ok: boolean; detail: string }>;
+      };
+
+      // Check that basePath matches expected home
+      if (data.basePath !== svc.expectedHome) {
+        violations.push({
+          character: svc.name,
+          check: 'wrong_home',
+          detail: `Expected ${svc.expectedHome}, got ${data.basePath}`,
+        });
+      }
+
+      // Track basePaths to detect sharing
+      basePaths.set(svc.name, data.basePath);
+
+      // Check individual integrity checks
+      for (const c of data.checks) {
+        if (!c.ok) {
+          violations.push({
+            character: svc.name,
+            check: c.check,
+            detail: c.detail,
+          });
+        }
+      }
+    } catch {
+      // Service unreachable — already caught by health check above
+    }
+  }
+
+  // Detect shared basePaths (two characters pointing to the same home)
+  const pathToChars = new Map<string, string[]>();
+  for (const [name, path] of basePaths) {
+    const existing = pathToChars.get(path) ?? [];
+    existing.push(name);
+    pathToChars.set(path, existing);
+  }
+  for (const [path, chars] of pathToChars) {
+    if (chars.length > 1) {
+      violations.push({
+        character: chars.join(' + '),
+        check: 'shared_home',
+        detail: `Multiple characters share basePath: ${path}`,
+      });
+    }
+  }
+
+  // Surface violations
+  if (violations.length > 0) {
+    const violationSummary = violations
+      .map(v => `${v.character}: ${v.check} — ${v.detail}`)
+      .join('; ');
+
+    logger.error({ violations }, 'CHARACTER ISOLATION VIOLATION DETECTED');
+
+    // Store for telemetry reports
+    setMeta('doctor:integrity:latest', JSON.stringify({
+      timestamp: Date.now(),
+      violations,
+    }));
+    setMeta('doctor:integrity:ok', 'false');
+
+    // Emit visible alert
+    eventBus.emitActivity({
+      type: 'doctor',
+      sessionKey: `doctor:integrity:${Date.now()}`,
+      content: `⚠ CHARACTER ISOLATION VIOLATION: ${violationSummary}`,
+      timestamp: Date.now(),
+    });
+
+    // Add to health check result
+    result.allHealthy = false;
+    (result as unknown as Record<string, unknown>)['integrityViolations'] = violations;
+  } else {
+    setMeta('doctor:integrity:ok', 'true');
+    setMeta('doctor:integrity:last_ok_at', Date.now().toString());
+    logger.debug('Character isolation integrity: OK');
+  }
+}
+
+function runShellHealthcheck(): Promise<string> {
+  return new Promise((resolvePromise) => {
+    const scriptPath = join(process.cwd(), 'deploy', 'healthcheck.sh');
+
+    if (!existsSync(scriptPath)) {
+      resolvePromise('healthcheck.sh not found — skipping auto-fix');
+      return;
+    }
+
+    exec(
+      `bash "${scriptPath}" --fix --quiet`,
+      { cwd: process.cwd(), timeout: 120_000, maxBuffer: 1024 * 1024 },
+      (error, stdout, stderr) => {
+        const parts: string[] = [];
+        if (stdout) parts.push(stdout.trim());
+        if (stderr) parts.push(stderr.trim());
+        if (error && error.killed) {
+          parts.push('[healthcheck.sh timed out after 120s]');
+        }
+        let output = parts.join('\n') || '(no output)';
+        if (output.length > 5000) {
+          output = output.slice(0, 5000) + '\n[truncated]';
+        }
+        resolvePromise(output);
+      }
+    );
+  });
 }
 
 // ============================================================
@@ -605,7 +1094,7 @@ ${transcriptText}
 Write 2-3 paragraphs of clinical notes.`,
       },
     ],
-    maxTokens: 800,
+    maxTokens: 1024,
     temperature: 0.3,
   });
 

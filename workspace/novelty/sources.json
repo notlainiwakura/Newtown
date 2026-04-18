@@ -1,0 +1,18 @@
+{
+  "rss": [
+    { "url": "https://aeon.co/feed.rss", "name": "Aeon" },
+    { "url": "https://feeds.feedburner.com/brainpickings/rss", "name": "The Marginalian" },
+    { "url": "https://www.themarginalian.org/feed/", "name": "The Marginalian (alt)" },
+    { "url": "https://www.ribbonfarm.com/feed/", "name": "Ribbonfarm" },
+    { "url": "https://slatestarcodex.com/feed/", "name": "Slate Star Codex" },
+    { "url": "https://www.laphamsquarterly.org/roundtable/feed", "name": "Laphams Quarterly" },
+    { "url": "https://feeds.feedburner.com/PublicDomainReview", "name": "Public Domain Review" },
+    { "url": "https://nautil.us/feed/", "name": "Nautilus" },
+    { "url": "https://lithub.com/feed/", "name": "Literary Hub" },
+    { "url": "https://electricliterature.com/feed/", "name": "Electric Literature" }
+  ],
+  "wikipedia": {
+    "enabled": false,
+    "endpoint": "https://en.wikipedia.org/api/rest_v1/page/random/summary"
+  }
+}

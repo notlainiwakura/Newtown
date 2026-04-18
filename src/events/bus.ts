@@ -47,6 +47,11 @@ export function parseEventType(sessionKey: string | null): string {
     document: 'document',
     gift: 'gift',
     townlife: 'townlife',
+    object: 'object',
+    experiment: 'experiment',
+    'town-event': 'town-event',
+    state: 'state',
+    weather: 'weather',
   };
   return typeMap[prefix] ?? prefix;
 }
@@ -55,7 +60,7 @@ export function parseEventType(sessionKey: string | null): string {
 const BACKGROUND_TYPES = new Set([
   'commune', 'diary', 'dream', 'curiosity', 'self-concept', 'narrative',
   'letter', 'peer', 'doctor', 'movement', 'move', 'note', 'document', 'gift',
-  'townlife',
+  'townlife', 'object', 'experiment', 'town-event', 'state', 'weather',
 ]);
 
 /** Returns true if the event type is autonomous background activity */
@@ -64,7 +69,7 @@ export function isBackgroundEvent(event: SystemEvent): boolean {
 }
 
 class ActivityBus extends EventEmitter {
-  private _characterId = 'lain';
+  private _characterId = 'newtown';
 
   constructor() {
     super();

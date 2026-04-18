@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EVENTS — LAINTOWN</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <script src="/skins/early-load.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg-deep);
+      color: var(--text-primary);
+      font-family: var(--font-body);
+      min-height: 100vh;
+      padding-top: 32px;
+      padding-bottom: 28px;
+    }
+
+    .header {
+      border-bottom: 2px solid var(--border-glow);
+      padding: 24px 40px 16px;
+      display: flex;
+      align-items: baseline;
+      gap: 24px;
+    }
+    .header h1 {
+      font-size: 28px;
+      letter-spacing: 6px;
+      color: var(--accent-primary);
+      text-transform: uppercase;
+    }
+    .header .subtitle {
+      font-size: 11px;
+      color: var(--text-dim);
+      letter-spacing: 2px;
+    }
+
+    .compose {
+      max-width: 860px;
+      margin: 24px auto;
+      padding: 0 40px;
+    }
+    .compose-box {
+      background: var(--bg-primary);
+      border: 1px solid var(--border-glow);
+      padding: 20px;
+    }
+
+    /* Toggle groups */
+    .param-row {
+      display: flex;
+      gap: 24px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .param-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .param-group label.group-label {
+      font-size: 10px;
+      color: var(--text-muted);
+      letter-spacing: 2px;
+      text-transform: uppercase;
+    }
+    .toggle-row {
+      display: flex;
+      gap: 0;
+    }
+    .toggle-btn {
+      background: transparent;
+      border: 1px solid var(--border-glow);
+      color: var(--text-subtle);
+      font-family: var(--font-body);
+      font-size: 11px;
+      padding: 6px 14px;
+      letter-spacing: 1.5px;
+      cursor: pointer;
+      text-transform: uppercase;
+      transition: all .15s;
+    }
+    .toggle-btn:first-child { border-radius: 2px 0 0 2px; }
+    .toggle-btn:last-child { border-radius: 0 2px 2px 0; }
+    .toggle-btn + .toggle-btn { border-left: none; }
+    .toggle-btn.active {
+      background: rgba(74, 158, 255, 0.1);
+      border-color: var(--accent-primary);
+      color: var(--accent-primary);
+    }
+    .toggle-btn.active-liminal {
+      background: rgba(180, 100, 255, 0.1);
+      border-color: var(--accent-liminal);
+      color: var(--accent-liminal);
+    }
+
+    /* Effects panel */
+    .effects-panel {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-panel);
+      padding: 16px;
+      margin-bottom: 16px;
+      display: none;
+    }
+    .effects-panel.visible { display: block; }
+    .effects-panel h4 {
+      font-size: 11px;
+      color: var(--text-muted);
+      letter-spacing: 2px;
+      margin-bottom: 12px;
+      text-transform: uppercase;
+    }
+    .effects-row {
+      display: flex;
+      gap: 20px;
+      flex-wrap: wrap;
+      align-items: flex-start;
+    }
+    .effect-group {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .effect-group label {
+      font-size: 10px;
+      color: var(--text-muted);
+      letter-spacing: 1px;
+      text-transform: uppercase;
+    }
+    .building-checks {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .building-check {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      color: var(--text-subtle);
+      cursor: pointer;
+    }
+    .building-check input { cursor: pointer; }
+    .building-check.checked { color: var(--accent-warn); }
+    select, input[type="text"] {
+      background: var(--bg-primary);
+      border: 1px solid var(--border-glow);
+      color: var(--text-primary);
+      font-family: var(--font-body);
+      font-size: 12px;
+      padding: 5px 8px;
+    }
+    select:focus, input[type="text"]:focus { outline: none; border-color: var(--border-focus); }
+
+    /* Duration */
+    .duration-row {
+      margin-bottom: 16px;
+      display: none;
+    }
+    .duration-row.visible { display: flex; gap: 12px; align-items: center; }
+    .duration-row label {
+      font-size: 10px;
+      color: var(--text-muted);
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+    }
+
+    /* Description */
+    .compose-box textarea {
+      width: 100%;
+      background: transparent;
+      border: none;
+      color: var(--text-bright);
+      font-family: var(--font-body);
+      font-size: 14px;
+      resize: vertical;
+      min-height: 100px;
+      outline: none;
+      line-height: 1.6;
+      margin-bottom: 12px;
+    }
+    .compose-box textarea::placeholder { color: var(--text-placeholder); }
+
+    .compose-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .spacer { flex: 1; }
+
+    .btn {
+      background: transparent;
+      border: 1px solid var(--border-glow);
+      color: var(--accent-primary);
+      font-family: var(--font-body);
+      font-size: 12px;
+      padding: 6px 16px;
+      letter-spacing: 2px;
+      cursor: pointer;
+      text-transform: uppercase;
+      transition: all .15s;
+    }
+    .btn:hover { border-color: var(--accent-primary); background: rgba(74, 158, 255, 0.05); }
+    .btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    .btn-amen {
+      font-size: 14px;
+      padding: 8px 28px;
+      letter-spacing: 4px;
+      border-color: var(--accent-primary);
+      color: var(--accent-primary);
+    }
+    .btn-amen:hover {
+      background: rgba(74, 158, 255, 0.12);
+      box-shadow: 0 0 20px rgba(74, 158, 255, 0.15);
+    }
+
+    .btn-end { color: var(--accent-warn); font-size: 10px; padding: 3px 8px; }
+    .btn-end:hover { border-color: var(--accent-warn); background: rgba(255, 106, 74, 0.05); }
+
+    #status {
+      font-size: 11px;
+      color: var(--text-muted);
+      letter-spacing: 1px;
+      transition: opacity .3s;
+    }
+
+    /* Events list */
+    .events-section {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 0 40px;
+    }
+    .section-title {
+      font-size: 11px;
+      color: var(--text-muted);
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      margin: 24px 0 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border-dark);
+    }
+
+    .event-card {
+      background: var(--bg-primary);
+      border: 1px solid var(--border-glow);
+      padding: 16px;
+      margin-bottom: 10px;
+      transition: border-color .2s;
+    }
+    .event-card:hover { border-color: var(--border-hover); }
+    .event-card.ended { opacity: 0.4; }
+    .event-card .event-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+    .event-tag {
+      font-size: 9px;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      padding: 2px 6px;
+      border: 1px solid;
+    }
+    .tag-narrative { color: var(--tag-narrative-color); border-color: var(--tag-narrative-border); }
+    .tag-mechanical { color: var(--tag-mechanical-color); border-color: var(--tag-mechanical-border); }
+    .tag-instant { color: var(--tag-instant-color); border-color: var(--tag-instant-border); }
+    .tag-persistent { color: var(--tag-persistent-color); border-color: var(--tag-persistent-border); }
+    .tag-natural { color: var(--tag-natural-color); border-color: var(--tag-natural-border); }
+    .tag-liminal { color: var(--tag-liminal-color); border-color: var(--tag-liminal-border); }
+    .event-time {
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-left: auto;
+    }
+    .event-card .event-desc {
+      color: var(--text-bright);
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .event-card .event-effects {
+      margin-top: 8px;
+      font-size: 11px;
+      color: var(--text-subtle);
+    }
+    .event-card .event-actions {
+      margin-top: 10px;
+      opacity: 0;
+      transition: opacity .2s;
+    }
+    .event-card:hover .event-actions { opacity: 1; }
+
+    .empty {
+      text-align: center;
+      padding: 60px 40px;
+      color: var(--text-placeholder);
+      font-size: 13px;
+      letter-spacing: 2px;
+    }
+
+    @media (max-width: 600px) {
+      .header, .compose, .events-section { padding-left: 16px; padding-right: 16px; }
+      .header h1 { font-size: 20px; letter-spacing: 3px; }
+      .param-row { gap: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Town Events</h1>
+    <span class="subtitle">REALITY ENGINE</span>
+  </div>
+
+  <div class="compose">
+    <div class="compose-box">
+      <!-- Parameter toggles -->
+      <div class="param-row">
+        <div class="param-group">
+          <label class="group-label">Nature</label>
+          <div class="toggle-row" id="nature-toggles">
+            <button class="toggle-btn active" data-value="narrative">NARRATIVE</button>
+            <button class="toggle-btn" data-value="mechanical">MECHANICAL</button>
+            <button class="toggle-btn" data-value="both">BOTH</button>
+          </div>
+        </div>
+        <div class="param-group">
+          <label class="group-label">Timing</label>
+          <div class="toggle-row" id="timing-toggles">
+            <button class="toggle-btn" data-value="instant">INSTANT</button>
+            <button class="toggle-btn active" data-value="persistent">PERSISTENT</button>
+          </div>
+        </div>
+        <div class="param-group">
+          <label class="group-label">Quality</label>
+          <div class="toggle-row" id="quality-toggles">
+            <button class="toggle-btn active" data-value="natural">NATURAL</button>
+            <button class="toggle-btn" data-value="liminal">LIMINAL</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Mechanical effects (shown conditionally) -->
+      <div class="effects-panel" id="effects-panel">
+        <h4>Mechanical Effects</h4>
+        <div class="effects-row">
+          <div class="effect-group">
+            <label>Block Buildings</label>
+            <div class="building-checks" id="block-buildings"></div>
+          </div>
+          <div class="effect-group">
+            <label>Force Location</label>
+            <select id="force-location">
+              <option value="">None</option>
+            </select>
+          </div>
+          <div class="effect-group">
+            <label>Weather</label>
+            <input type="text" id="weather-input" placeholder="storm, fog, aurora..." />
+          </div>
+        </div>
+      </div>
+
+      <!-- Duration (shown for persistent) -->
+      <div class="duration-row visible" id="duration-row">
+        <label>Duration</label>
+        <select id="duration-select">
+          <option value="0">Until manually ended</option>
+          <option value="3600000">1 hour</option>
+          <option value="21600000">6 hours</option>
+          <option value="86400000" selected>24 hours</option>
+          <option value="259200000">3 days</option>
+        </select>
+      </div>
+
+      <!-- Description -->
+      <textarea id="event-desc" placeholder="Describe the event as the inhabitants will experience it..."></textarea>
+
+      <div class="compose-actions">
+        <span class="spacer"></span>
+        <span id="status"></span>
+        <button class="btn btn-amen" id="amen-btn" onclick="sendEvent()">AMEN</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Active events -->
+  <div class="events-section">
+    <div class="section-title">Active Events</div>
+    <div id="active-events"></div>
+  </div>
+
+  <!-- History -->
+  <div class="events-section">
+    <div class="section-title" style="cursor:pointer" onclick="toggleHistory()">History <span id="history-arrow">&#9654;</span></div>
+    <div id="history-events" style="display:none"></div>
+  </div>
+
+  <script>
+    function getCSSVar(name, fallback) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+    }
+
+    const IS_OWNER = document.querySelector('meta[name="lain-owner"]')?.content === 'true';
+    const headers = { 'Content-Type': 'application/json' };
+
+    // Hide event creation form for non-owners
+    if (!IS_OWNER) {
+      document.querySelector('.compose').style.display = 'none';
+    }
+
+    const BUILDINGS = [
+      { id: 'pub', name: 'Pub' },
+      { id: 'station', name: 'Station' },
+      { id: 'abandoned-house', name: 'Abandoned House' },
+      { id: 'field', name: 'Field' },
+      { id: 'windmill', name: 'Windmill' },
+      { id: 'locksmith', name: 'Locksmith' },
+      { id: 'mystery-tower', name: 'Mystery Tower' },
+      { id: 'theater', name: 'Theater' },
+      { id: 'square', name: 'Square' },
+    ];
+
+    // State
+    let nature = 'narrative';   // narrative | mechanical | both
+    let timing = 'persistent';  // instant | persistent
+    let quality = 'natural';    // natural | liminal
+
+    // Init building checkboxes and dropdown
+    const blockContainer = document.getElementById('block-buildings');
+    const forceSelect = document.getElementById('force-location');
+    BUILDINGS.forEach(b => {
+      const label = document.createElement('label');
+      label.className = 'building-check';
+      label.innerHTML = `<input type="checkbox" value="${b.id}"> ${b.name}`;
+      label.querySelector('input').addEventListener('change', function() {
+        label.classList.toggle('checked', this.checked);
+      });
+      blockContainer.appendChild(label);
+
+      const opt = document.createElement('option');
+      opt.value = b.id;
+      opt.textContent = b.name;
+      forceSelect.appendChild(opt);
+    });
+
+    // Toggle button groups
+    function setupToggleGroup(containerId, onChange) {
+      const container = document.getElementById(containerId);
+      const buttons = container.querySelectorAll('.toggle-btn');
+      buttons.forEach(btn => {
+        btn.addEventListener('click', () => {
+          buttons.forEach(b => b.classList.remove('active', 'active-liminal'));
+          const val = btn.dataset.value;
+          btn.classList.add(val === 'liminal' ? 'active-liminal' : 'active');
+          onChange(val);
+        });
+      });
+    }
+
+    setupToggleGroup('nature-toggles', val => {
+      nature = val;
+      document.getElementById('effects-panel').classList.toggle('visible', val !== 'narrative');
+    });
+    setupToggleGroup('timing-toggles', val => {
+      timing = val;
+      document.getElementById('duration-row').classList.toggle('visible', val === 'persistent');
+    });
+    setupToggleGroup('quality-toggles', val => { quality = val; });
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    function formatTime(ts) {
+      return new Date(ts).toLocaleString();
+    }
+
+    function renderEvent(e, showEnd) {
+      const tags = [];
+      if (e.narrative) tags.push('<span class="event-tag tag-narrative">NARRATIVE</span>');
+      if (e.mechanical) tags.push('<span class="event-tag tag-mechanical">MECHANICAL</span>');
+      if (e.instant) tags.push('<span class="event-tag tag-instant">INSTANT</span>');
+      if (e.persistent) tags.push('<span class="event-tag tag-persistent">PERSISTENT</span>');
+      if (e.natural) tags.push('<span class="event-tag tag-natural">NATURAL</span>');
+      if (e.liminal) tags.push('<span class="event-tag tag-liminal">LIMINAL</span>');
+
+      let effectsHtml = '';
+      const fx = e.effects || {};
+      const parts = [];
+      if (fx.blockedBuildings && fx.blockedBuildings.length > 0) parts.push('Blocked: ' + fx.blockedBuildings.join(', '));
+      if (fx.forceLocation) parts.push('Force location: ' + fx.forceLocation);
+      if (fx.weather) parts.push('Weather: ' + fx.weather);
+      if (parts.length > 0) effectsHtml = `<div class="event-effects">${parts.join(' · ')}</div>`;
+
+      const endBtn = (showEnd && IS_OWNER) ? `<div class="event-actions"><button class="btn btn-end" onclick="endEvent('${e.id}')">END EVENT</button></div>` : '';
+      const endedClass = e.status === 'ended' ? ' ended' : '';
+      const timeLabel = e.status === 'ended' && e.endedAt
+        ? `${formatTime(e.createdAt)} — ended ${formatTime(e.endedAt)}`
+        : e.expiresAt
+          ? `${formatTime(e.createdAt)} — expires ${formatTime(e.expiresAt)}`
+          : formatTime(e.createdAt);
+
+      return `<div class="event-card${endedClass}">
+        <div class="event-meta">${tags.join('')}<span class="event-time">${timeLabel}</span></div>
+        <div class="event-desc">${escapeHtml(e.description)}</div>
+        ${effectsHtml}
+        ${endBtn}
+      </div>`;
+    }
+
+    async function loadEvents() {
+      try {
+        const [activeResp, allResp] = await Promise.all([
+          fetch('/api/town-events'),
+          fetch('/api/town-events?all=1'),
+        ]);
+        const active = activeResp.ok ? await activeResp.json() : [];
+        const all = allResp.ok ? await allResp.json() : [];
+        const ended = all.filter(e => e.status === 'ended');
+
+        const activeContainer = document.getElementById('active-events');
+        if (active.length === 0) {
+          activeContainer.innerHTML = '<div class="empty">NO ACTIVE EVENTS<br>THE COMMUNE IS AT PEACE</div>';
+        } else {
+          activeContainer.innerHTML = active.map(e => renderEvent(e, true)).join('');
+        }
+
+        const historyContainer = document.getElementById('history-events');
+        if (ended.length === 0) {
+          historyContainer.innerHTML = '<div class="empty">NO PAST EVENTS</div>';
+        } else {
+          historyContainer.innerHTML = ended.map(e => renderEvent(e, false)).join('');
+        }
+      } catch (err) {
+        document.getElementById('active-events').innerHTML = '<div class="empty">FAILED TO LOAD EVENTS</div>';
+      }
+    }
+
+    async function sendEvent() {
+      const desc = document.getElementById('event-desc').value.trim();
+      if (!desc) return;
+
+      const btn = document.getElementById('amen-btn');
+      const status = document.getElementById('status');
+      btn.disabled = true;
+
+      const payload = {
+        description: desc,
+        narrative: nature === 'narrative' || nature === 'both',
+        mechanical: nature === 'mechanical' || nature === 'both',
+        instant: timing === 'instant',
+        persistent: timing === 'persistent',
+        natural: quality === 'natural',
+        liminal: quality === 'liminal',
+      };
+
+      // Mechanical effects
+      if (payload.mechanical) {
+        const blocked = [...document.querySelectorAll('#block-buildings input:checked')].map(cb => cb.value);
+        const force = document.getElementById('force-location').value;
+        const weather = document.getElementById('weather-input').value.trim();
+        const effects = {};
+        if (blocked.length > 0) effects.blockedBuildings = blocked;
+        if (force) effects.forceLocation = force;
+        if (weather) effects.weather = weather;
+        payload.effects = effects;
+      }
+
+      // Duration
+      if (payload.persistent) {
+        const dur = parseInt(document.getElementById('duration-select').value);
+        if (dur > 0) payload.expiresInMs = dur;
+      }
+
+      try {
+        const resp = await fetch('/api/town-events', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+        });
+        if (!resp.ok) {
+          const data = await resp.json();
+          throw new Error(data.error || 'Failed');
+        }
+        document.getElementById('event-desc').value = '';
+        // Reset checkboxes
+        document.querySelectorAll('#block-buildings input').forEach(cb => {
+          cb.checked = false;
+          cb.parentElement.classList.remove('checked');
+        });
+        document.getElementById('force-location').value = '';
+        document.getElementById('weather-input').value = '';
+
+        status.textContent = 'SENT INTO REALITY';
+        status.style.color = getCSSVar('--accent-success', '#4aff8a');
+        status.style.opacity = 1;
+        setTimeout(() => { status.style.opacity = 0; }, 2500);
+        loadEvents();
+      } catch (err) {
+        status.textContent = 'ERROR: ' + err.message;
+        status.style.color = getCSSVar('--accent-danger', '#ff4a4a');
+        status.style.opacity = 1;
+        setTimeout(() => { status.style.opacity = 0; }, 3000);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function endEvent(id) {
+      try {
+        await fetch('/api/town-events/' + id + '/end', { method: 'POST', headers });
+        loadEvents();
+      } catch { /* ignore */ }
+    }
+
+    function toggleHistory() {
+      const el = document.getElementById('history-events');
+      const arrow = document.getElementById('history-arrow');
+      if (el.style.display === 'none') {
+        el.style.display = 'block';
+        arrow.innerHTML = '&#9660;';
+      } else {
+        el.style.display = 'none';
+        arrow.innerHTML = '&#9654;';
+      }
+    }
+
+    // Ctrl+Enter to send
+    document.getElementById('event-desc').addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        sendEvent();
+      }
+    });
+
+    loadEvents();
+    setInterval(loadEvents, 30000);
+  </script>
+  <script src="/skins/loader.js"></script>
+  <script src="/skins/picker.js"></script>
+</body>
+</html>

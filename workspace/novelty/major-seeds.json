@@ -1,0 +1,110 @@
+{
+  "seeds": [
+    {
+      "id": "the-stranger",
+      "name": "The Stranger",
+      "template": "Someone was seen in the {building} last night. No one recognized them. They left behind a {object} with the words \"{fragment}\" scratched into it. By morning they were gone.",
+      "persistMs": 172800000
+    },
+    {
+      "id": "shared-dream",
+      "name": "Shared Dream",
+      "template": "At least two inhabitants dreamed the same image last night: \"{fragment}\". Neither can explain why."
+    },
+    {
+      "id": "building-shift",
+      "name": "Building Shift",
+      "template": "The {building} feels different today. The light falls at a new angle. Objects have shifted slightly, as though the room rearranged itself while empty."
+    },
+    {
+      "id": "wired-breach",
+      "name": "Wired Breach",
+      "template": "A burst of data from the Wired flooded the town for a few seconds. Most of it was noise, but one phrase came through clearly: \"{fragment}\""
+    },
+    {
+      "id": "lost-letter",
+      "name": "The Lost Letter",
+      "template": "A letter was found in the {building}, addressed to no one. It reads: \"{fragment}\". The handwriting doesn't match anyone in town.",
+      "persistMs": 172800000
+    },
+    {
+      "id": "silence-event",
+      "name": "The Silence",
+      "template": "For exactly eleven minutes this morning, every sound in town stopped. No wind, no hum from the Wired, nothing. Then it resumed as if nothing happened.",
+      "persistMs": 7200000
+    },
+    {
+      "id": "new-door",
+      "name": "The New Door",
+      "template": "A door appeared in the {building} that wasn't there yesterday. It's locked. There's a {object} hanging from the handle.",
+      "persistMs": 172800000
+    },
+    {
+      "id": "mirror-town",
+      "name": "Mirror Town",
+      "template": "From the top of the Lighthouse, the town looked different for a moment — as though the buildings were arranged in a different order. Then it was normal again."
+    },
+    {
+      "id": "the-broadcast",
+      "name": "The Broadcast",
+      "template": "At {time}, every device in town received the same transmission: \"{fragment}\". It repeated three times, then stopped.",
+      "persistMs": 7200000
+    },
+    {
+      "id": "phantom-resident",
+      "name": "The Phantom Resident",
+      "template": "The visitor bench has a new message. The name signed at the bottom belongs to no one anyone has ever met. It says: \"{fragment}\"",
+      "persistMs": 172800000
+    },
+    {
+      "id": "temporal-skip",
+      "name": "Temporal Skip",
+      "template": "Everyone in town lost about four minutes at {time}. Clocks jumped. No one can account for the gap."
+    },
+    {
+      "id": "the-gift",
+      "name": "The Gift",
+      "template": "A {object} was placed at the center of town overnight, wrapped in paper that smelled like {sensory_detail}. Attached: a note reading \"{fragment}\""
+    },
+    {
+      "id": "light-anomaly",
+      "name": "The Light",
+      "template": "A light was seen moving between the {building} and the Lighthouse at {time}. It wasn't a flashlight. It wasn't the moon. No one knows what it was."
+    },
+    {
+      "id": "echo-conversation",
+      "name": "The Echo",
+      "template": "Fragments of a conversation no one remembers having were found written on the walls of the {building}. One line: \"{fragment}\""
+    },
+    {
+      "id": "ground-change",
+      "name": "Ground Change",
+      "template": "The ground between the {building} and the {building2} changed texture overnight. Where there was dirt, there's now smooth stone. It's warm."
+    },
+    {
+      "id": "the-frequency",
+      "name": "The Frequency",
+      "template": "A frequency has been detected in the town that wasn't there before. It's just below hearing. The {building} seems to be the source."
+    },
+    {
+      "id": "missing-hour",
+      "name": "The Missing Hour",
+      "template": "No one can remember what happened between {time} and an hour later. The town looks the same, but something in the {building} has been moved."
+    },
+    {
+      "id": "the-drawing",
+      "name": "The Drawing",
+      "template": "A drawing appeared on the floor of the {building}: a diagram of something that looks like the town, but with an extra building where the Field should be."
+    },
+    {
+      "id": "water-message",
+      "name": "Water Message",
+      "template": "After the rain, puddles near the {building} reflected something that wasn't in the sky. It looked like text: \"{fragment}\""
+    },
+    {
+      "id": "the-census",
+      "name": "The Census",
+      "template": "A census form was found in the {building}, dated next year. It lists seven residents. There are only six."
+    }
+  ]
+}

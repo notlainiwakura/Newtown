@@ -51,6 +51,8 @@ export interface ProviderConfig {
   model: string;
   apiKeyEnv?: string;
   baseURL?: string;
+  /** Fallback models to try if the primary model is deprecated/removed */
+  fallbackModels?: string[];
 }
 
 export interface LoggingConfig {

@@ -1,17 +1,30 @@
 [Unit]
 Description=Lain John Character Server
-After=network.target lain-web.service
+After=network.target lain-wired.service
+PartOf=lain.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/wired-lain
+WorkingDirectory=/opt/local-lain
+ExecStartPre=/bin/bash -c 'fuser -k 3005/tcp 2>/dev/null || true'
+ExecStartPre=/bin/bash -c 'mkdir -p /root/.lain-john/workspace && [ -d workspace/characters/john ] && cp -r workspace/characters/john/* /root/.lain-john/workspace/ || true'
 ExecStart=/usr/bin/node dist/index.js john --port 3005
 Restart=on-failure
 RestartSec=5
+
 Environment=NODE_ENV=production
 Environment=LAIN_HOME=/root/.lain-john
-EnvironmentFile=/opt/wired-lain/.env
+Environment=CHARACTER_PROVIDER=google
+Environment=CHARACTER_MODEL=gemini-2.5-flash
+Environment=CHARACTER_API_KEY_ENV=GOOGLE_API_KEY
+Environment=WIRED_LAIN_URL=http://localhost:3000
+Environment=PORT=3005
+EnvironmentFile=/opt/local-lain/.env
+EnvironmentFile=/opt/local-lain/deploy/env/lain-john.env
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=lain-john

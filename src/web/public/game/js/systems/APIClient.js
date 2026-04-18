@@ -7,7 +7,7 @@
 class APIClient {
   constructor() {
     this.token = '';
-    this.base = '/' + (typeof PLAYER_ID === 'string' ? PLAYER_ID : 'joe'); // web proxy prefix for possessed resident
+    this.base = '/' + (typeof PLAYER_ID === 'string' ? PLAYER_ID : 'joe');
   }
 
   setToken(token) {
@@ -150,7 +150,7 @@ class APIClient {
     return reader;
   }
 
-  // Get a specific character's location (non-hiru characters)
+  // Get a specific character's location
   async getCharacterLocation(charId) {
     try {
       const resp = await fetch('/' + charId + '/api/location');
@@ -160,6 +160,58 @@ class APIClient {
     } catch {
       return null;
     }
+  }
+
+  // Get objects at a location or all objects
+  async getObjects(location) {
+    const query = location ? `?location=${encodeURIComponent(location)}` : '';
+    try {
+      const resp = await fetch('/api/objects' + query);
+      if (!resp.ok) return [];
+      return await resp.json();
+    } catch {
+      return [];
+    }
+  }
+
+  // Connect to live conversation SSE stream
+  connectConversationStream(onEvent) {
+    const url = '/api/conversations/stream';
+    const connect = () => {
+      fetch(url).then(resp => {
+        if (!resp.ok) {
+          setTimeout(connect, 10000);
+          return;
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        const read = async () => {
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop() || '';
+              for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                try {
+                  const event = JSON.parse(line.slice(6));
+                  onEvent(event);
+                } catch { /* ignore */ }
+              }
+            }
+          } catch { /* reconnect */ }
+          setTimeout(connect, 5000);
+        };
+        read();
+      }).catch(() => {
+        setTimeout(connect, 10000);
+      });
+    };
+    connect();
   }
 }
 

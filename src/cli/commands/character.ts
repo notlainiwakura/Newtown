@@ -1,5 +1,5 @@
 /**
- * Character commands â€” start Newtown resident server instances
+ * Character commands â€” Start character server instances
  */
 
 import { join } from 'node:path';
@@ -31,16 +31,15 @@ function buildCharacterConfig(
     id,
     name,
     port,
-    publicDir: join(SRC_DIR, 'src', 'web', 'public-character'),
+    publicDir: join(SRC_DIR, 'src', 'web', 'public'),
     peers: parsePeerConfig(),
-    // The game dashboard expects a possessable resident as the player avatar.
-    possessable: id === 'joe',
   };
 }
 
 export async function startNeo(port: number = 3003): Promise<void> {
   try {
-    await startCharacterServer(buildCharacterConfig('neo', 'Neo', port));
+    const config = buildCharacterConfig('neo', 'Neo', port);
+    await startCharacterServer(config);
   } catch (error) {
     displayError(`Failed to start Neo server: ${error}`);
     process.exit(1);
@@ -49,7 +48,8 @@ export async function startNeo(port: number = 3003): Promise<void> {
 
 export async function startPlato(port: number = 3004): Promise<void> {
   try {
-    await startCharacterServer(buildCharacterConfig('plato', 'Plato', port));
+    const config = buildCharacterConfig('plato', 'Plato', port);
+    await startCharacterServer(config);
   } catch (error) {
     displayError(`Failed to start Plato server: ${error}`);
     process.exit(1);
@@ -58,7 +58,9 @@ export async function startPlato(port: number = 3004): Promise<void> {
 
 export async function startJoe(port: number = 3005): Promise<void> {
   try {
-    await startCharacterServer(buildCharacterConfig('joe', 'Joe', port));
+    const config = buildCharacterConfig('joe', 'Joe', port);
+    config.possessable = true;
+    await startCharacterServer(config);
   } catch (error) {
     displayError(`Failed to start Joe server: ${error}`);
     process.exit(1);

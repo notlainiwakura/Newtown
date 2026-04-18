@@ -1,0 +1,257 @@
+/* Vaporwave Skin: Magenta/cyan retrofuturism, 80s digital nostalgia */
+
+:root {
+  /* Backgrounds */
+  --bg-deep: #0a0020;
+  --bg-primary: #100030;
+  --bg-panel: rgba(40, 10, 80, 0.6);
+  --bg-window: rgba(80, 20, 120, 0.4);
+
+  /* Text */
+  --text-primary: #e0c0ff;
+  --text-secondary: #9060c0;
+  --text-dim: #604080;
+
+  /* Accents */
+  --accent-primary: #ff40ff;
+  --accent-secondary: #40ffff;
+  --accent-tertiary: #ff8040;
+  --accent-hover: rgba(255, 64, 255, 0.6);
+  --accent-hover-mid: rgba(255, 64, 255, 0.5);
+  --accent-hover-faint: rgba(255, 64, 255, 0.1);
+  --accent-btn-bg: rgba(255, 64, 255, 0.1);
+  --accent-btn-bg-active: rgba(255, 64, 255, 0.25);
+  --accent-btn-bg-strong: rgba(255, 64, 255, 0.15);
+  --accent-btn-bg-strong-active: rgba(255, 64, 255, 0.3);
+  --accent-subtle: rgba(255, 64, 255, 0.05);
+  --accent-msg-bg: rgba(255, 64, 255, 0.12);
+  --accent-msg-border: rgba(255, 64, 255, 0.2);
+
+  /* Border / glow */
+  --border-glow: rgba(255, 64, 255, 0.4);
+  --glow-primary: 0 0 20px rgba(255, 64, 255, 0.5), 0 0 40px rgba(64, 255, 255, 0.2);
+  --hologram: linear-gradient(135deg, rgba(255, 64, 255, 0.1), rgba(64, 255, 255, 0.05), rgba(255, 128, 64, 0.1));
+
+  /* Grid */
+  --grid-line-color: rgba(255, 64, 255, 0.04);
+
+  /* Fonts */
+  --font-heading: 'Audiowide', sans-serif;
+  --font-body: 'VT323', monospace;
+  --font-mono: 'VT323', monospace;
+
+  /* Shapes */
+  --border-radius: 4px;
+  --border-radius-sm: 2px;
+  --border-radius-lg: 8px;
+
+  /* Effects */
+  --scanline-opacity: 0.04;
+  --particle-color: rgba(255, 64, 255, 0.4);
+  --particle-opacity: 0.7;
+
+  /* Messages */
+  --msg-user-bg: rgba(80, 20, 120, 0.6);
+  --msg-user-border: rgba(255, 64, 255, 0.3);
+  --msg-assistant-bg: rgba(64, 255, 255, 0.1);
+  --msg-assistant-border: rgba(64, 255, 255, 0.3);
+  --msg-assistant-glow: 0 0 20px rgba(64, 255, 255, 0.15);
+
+  /* Status */
+  --status-online: #40ffb0;
+  --status-error: #ff4060;
+  --error-text: #ff8080;
+  --error-bg: rgba(255, 64, 96, 0.1);
+  --error-border: rgba(255, 64, 96, 0.3);
+
+  /* Character colors */
+  --color-wired-lain: #ff40ff;
+  --color-lain: #c080ff;
+  --color-dr-claude: #ff4060;
+  --color-pkd: #8040ff;
+  --color-mckenna: #40ffb0;
+  --color-john: #ff8040;
+  --color-hiru: #40ffff;
+
+  /* Event types */
+  --type-diary: #ff8040;
+  --type-dream: #c040ff;
+  --type-commune: #40ffff;
+  --type-curiosity: #40ffb0;
+  --type-chat: #e0c0ff;
+  --type-memory: #8040ff;
+  --type-letter: #ff40ff;
+  --type-narrative: #ff8040;
+  --type-self-concept: #c080ff;
+  --type-doctor: #ff4060;
+  --type-peer: #40ffff;
+  --type-movement: #ffff40;
+  --type-research: #40ffff;
+  --type-note: #d0a070;
+  --type-document: #b0c0ff;
+  --type-gift: #ff80e0;
+  --type-default: #8090d0;
+
+  /* Newspaper */
+  --newspaper-bg: #080015;
+  --newspaper-text: #9070b0;
+  --newspaper-heading: #ff40ff;
+  --newspaper-quote-border: #3a1060;
+  --newspaper-em: #c090e0;
+  --newspaper-strong: #d0a0f0;
+  --newspaper-blockquote: #704090;
+  --newspaper-loading: #301050;
+
+  /* Extended text */
+  --text-bright: #f0d0ff;
+  --text-muted: #503060;
+  --text-subtle: #604070;
+  --text-placeholder: #301848;
+  --text-dim2: #604880;
+
+  /* Extended accents */
+  --accent-danger: #ff4060;
+  --accent-success: #40ffb0;
+  --accent-warn: #ff8040;
+  --accent-liminal: #c040ff;
+
+  /* Extended borders */
+  --border-dark: #0e0020;
+  --border-dark2: #180838;
+  --border-hover: #2a1050;
+  --border-panel: #150830;
+  --border-focus: #2a1060;
+
+  /* Commune Chronicles controls */
+  --controls-border: #180828;
+  --filter-btn-border: #3a1060;
+  --filter-btn-color: #604090;
+  --filter-btn-hover-border: #5a20a0;
+  --filter-btn-hover-color: #9060c0;
+  --masthead-tagline: #3a1060;
+  --masthead-edition: #4a1080;
+
+  /* Chronicle entry cards */
+  --entry-bg: #060012;
+  --entry-border: #180828;
+  --entry-hover-border: #2a1060;
+  --entry-hover-bg: #080018;
+  --entry-time: #2a1050;
+  --entry-body: #706090;
+  --entry-body-expanded: #9080b0;
+  --loading-color: #2a1050;
+  --empty-color: #200840;
+
+  /* Postboard */
+  --post-label-color: #604090;
+  --post-status-ok: #1a3020;
+  --post-pin-border: #3a1060;
+
+  /* Town events tag colors */
+  --tag-narrative-color: #ff80ff;
+  --tag-narrative-border: #501060;
+  --tag-mechanical-color: #ff8040;
+  --tag-mechanical-border: #401820;
+  --tag-instant-color: #c0a0e0;
+  --tag-instant-border: #2a1040;
+  --tag-persistent-color: #40ffb0;
+  --tag-persistent-border: #1a4030;
+  --tag-natural-color: #80d060;
+  --tag-natural-border: #283818;
+  --tag-liminal-color: #c040ff;
+  --tag-liminal-border: #3a1060;
+
+  /* Nav bar */
+  --nav-game-bg: rgba(10, 0, 32, 0.7);
+  --nav-game-border: rgba(64, 0, 96, 0.4);
+
+  /* Misc */
+  --white-fill: #e0c0ff;
+  --white-border: rgba(255, 64, 255, 0.3);
+  --white-hover: rgba(255, 64, 255, 0.2);
+  --inset-highlight: rgba(255, 64, 255, 0.08);
+  --glow-primary-strong: 0 0 30px rgba(255, 64, 255, 0.8), 0 0 50px rgba(64, 255, 255, 0.3);
+  --logo-text-shadow: rgba(64, 255, 255, 0.5);
+  --scanline-color: rgba(255, 64, 255, 0.04);
+
+  /* Input / button */
+  --input-bg: rgba(40, 10, 80, 0.8);
+  --input-bg-subtle: rgba(40, 10, 80, 0.5);
+  --focus-glow: 0 0 15px rgba(64, 255, 255, 0.4);
+  --btn-dark: #a020a0;
+  --btn-light: #ff80ff;
+  --btn-shadow: rgba(255, 64, 255, 0.3);
+  --btn-shadow-hover: rgba(255, 64, 255, 0.5);
+  --titlebar-gradient: rgba(255, 64, 255, 0.2);
+  --scrollbar-track: rgba(255, 64, 255, 0.1);
+  --system-msg-bg: rgba(255, 64, 255, 0.05);
+  --user-msg-gradient-end: rgba(80, 20, 120, 0.6);
+  --assistant-msg-gradient-end: rgba(64, 255, 255, 0.1);
+  --input-area-gradient: rgba(255, 64, 255, 0.08);
+  --footer-border: rgba(255, 64, 255, 0.2);
+  --image-shadow: rgba(255, 64, 255, 0.2);
+  --image-shadow-hover: rgba(64, 255, 255, 0.4);
+  --image-btn-hover-shadow: rgba(64, 255, 255, 0.3);
+  --drag-overlay-bg: rgba(8, 0, 20, 0.9);
+
+  /* Error extras */
+  --error-bg-gradient: rgba(255, 64, 96, 0.2);
+  --error-bg-gradient-end: rgba(200, 40, 70, 0.1);
+  --remove-img-bg: rgba(255, 64, 96, 0.3);
+  --remove-img-hover-bg: rgba(255, 64, 96, 0.5);
+  --remove-img-hover-shadow: rgba(255, 100, 120, 0.3);
+
+  /* Commune map surfaces */
+  --header-bg: rgba(10, 0, 32, 0.9);
+  --panel-bg: rgba(12, 3, 38, 0.95);
+  --panel-bg-dark: rgba(10, 0, 32, 0.95);
+  --panel-bg-input: rgba(12, 3, 38, 0.9);
+  --building-bg: rgba(20, 5, 60, 0.8);
+  --chat-modal-bg: rgba(8, 0, 24, 0.97);
+  --chat-modal-titlebar-bg: rgba(20, 5, 60, 0.9);
+  --chat-modal-shadow: -4px 0 24px rgba(0, 0, 0, 0.6);
+  --chat-input-bg: rgba(40, 10, 80, 0.4);
+  --char-msg-bg: rgba(255, 255, 255, 0.04);
+  --entry-kind-bg: rgba(255, 64, 255, 0.06);
+  --notif-bg: rgba(10, 0, 32, 0.85);
+  --text-shadow-dark: rgba(0, 0, 0, 0.8);
+  --node-highlight: rgba(255, 255, 255, 0.15);
+  --status-connected: #40ffb0;
+  --cell-pulse-color: rgba(255, 255, 64, 0.4);
+  --cell-pulse-mid: rgba(255, 255, 64, 0.3);
+
+  /* Game view */
+  --game-panel-bg: #0c0018;
+  --game-ui-border: #804080;
+  --game-ui-border-dim: #401040;
+  --game-ui-header: #18083a;
+  --game-input-bg: #1a0a2a;
+  --game-input-stroke: #2a1040;
+  --game-input-text: #e0c0ff;
+  --game-input-prompt: #9060c0;
+  --game-input-cursor: #ff40ff;
+  --game-hud-location: #9060c0;
+  --game-hud-prompt: #ff40ff;
+  --game-hud-notif: #ff8040;
+  --game-hud-overlay: rgba(10, 0, 32, 0.85);
+  --game-speech-text: #e0c0ff;
+  --game-speech-bg: rgba(16, 4, 40, 0.92);
+  --game-speech-tail: #100428;
+  --game-building-label: #704090;
+  --game-grass: #1a1a2a;
+  --game-grass-light: #1c1c2e;
+  --game-grass-dark: #181826;
+  --game-grass-outline: #2a1a3a;
+  --game-path: #221528;
+  --game-path-light: #2e1e36;
+  --game-floor: #1a0a2a;
+  --game-floor-grid: #240e38;
+  --game-wall-top: #302040;
+  --game-wall-highlight: #3e2a52;
+  --game-wall-side: #261838;
+  --game-wall-dark: #1c102e;
+  --game-forest: #0a0018;
+  --game-water: #0c0030;
+  --game-water-detail: #140840;
+  --game-object-label: #c080e0;
+}

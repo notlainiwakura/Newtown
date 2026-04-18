@@ -7,7 +7,7 @@ class PossessionManager {
   constructor(scene) {
     this.scene = scene;
     this.isPossessed = false;
-    this.currentBuilding = DEFAULT_LOCATIONS[PLAYER_ID] || 'market';
+    this.currentBuilding = 'square';
     this.streamReader = null;
     this.pendingMessages = [];
     this.pendingPollTimer = null;
@@ -25,7 +25,7 @@ class PossessionManager {
       const status = await apiClient.checkAuth();
       if (status && status.isPossessed) {
         this.isPossessed = true;
-        this.currentBuilding = status.location || DEFAULT_LOCATIONS[PLAYER_ID] || 'market';
+        this.currentBuilding = status.location || 'square';
         return { ok: true, alreadyPossessed: true };
       }
       throw err;

@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>POSTBOARD — LAINTOWN</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <script src="/skins/early-load.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg-deep);
+      color: var(--text-primary);
+      font-family: var(--font-body);
+      min-height: 100vh;
+      padding-top: 32px;
+      padding-bottom: 28px;
+    }
+
+    .header {
+      border-bottom: 2px solid var(--border-glow);
+      padding: 24px 40px 16px;
+      display: flex;
+      align-items: baseline;
+      gap: 24px;
+    }
+    .header h1 {
+      font-size: 28px;
+      letter-spacing: 6px;
+      color: var(--accent-primary);
+      text-transform: uppercase;
+    }
+    .header .subtitle {
+      font-size: 11px;
+      color: var(--text-dim);
+      letter-spacing: 2px;
+    }
+
+    .compose {
+      max-width: 800px;
+      margin: 24px auto;
+      padding: 0 40px;
+    }
+    .compose-box {
+      background: var(--bg-primary);
+      border: 1px solid var(--border-glow);
+      padding: 16px;
+      position: relative;
+    }
+    .compose-box textarea {
+      width: 100%;
+      background: transparent;
+      border: none;
+      color: var(--text-bright);
+      font-family: var(--font-body);
+      font-size: 14px;
+      resize: vertical;
+      min-height: 80px;
+      outline: none;
+      line-height: 1.6;
+    }
+    .compose-box textarea::placeholder { color: var(--text-placeholder); }
+    .compose-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .compose-actions label {
+      font-size: 11px;
+      color: var(--post-label-color);
+      letter-spacing: 1px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .btn {
+      background: transparent;
+      border: 1px solid var(--border-glow);
+      color: var(--accent-primary);
+      font-family: var(--font-body);
+      font-size: 12px;
+      padding: 6px 16px;
+      letter-spacing: 2px;
+      cursor: pointer;
+      text-transform: uppercase;
+      transition: all .15s;
+    }
+    .btn:hover { border-color: var(--accent-primary); background: rgba(74, 158, 255, 0.05); }
+    .btn:disabled { opacity: 0.3; cursor: not-allowed; }
+    .btn-danger { color: var(--accent-danger); }
+    .btn-danger:hover { border-color: var(--accent-danger); background: rgba(255, 74, 74, 0.05); }
+    .spacer { flex: 1; }
+
+    #status {
+      font-size: 11px;
+      color: var(--post-status-ok);
+      letter-spacing: 1px;
+      margin-left: 12px;
+      transition: opacity .3s;
+    }
+
+    .messages {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 16px 40px;
+    }
+
+    .message {
+      background: var(--bg-primary);
+      border: 1px solid var(--border-glow);
+      padding: 16px;
+      margin-bottom: 12px;
+      position: relative;
+      transition: border-color .2s;
+    }
+    .message:hover { border-color: var(--border-hover); }
+    .message.pinned { border-left: 3px solid var(--accent-primary); }
+    .message .meta {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
+      font-size: 11px;
+      color: var(--text-muted);
+      letter-spacing: 1px;
+    }
+    .message .pin-badge {
+      color: var(--accent-primary);
+      font-size: 10px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+    }
+    .message .content {
+      color: var(--text-bright);
+      font-size: 14px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .message .actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+      opacity: 0;
+      transition: opacity .2s;
+    }
+    .message:hover .actions { opacity: 1; }
+    .message .actions .btn { font-size: 10px; padding: 3px 8px; }
+
+    .empty {
+      text-align: center;
+      padding: 60px 40px;
+      color: var(--text-placeholder);
+      font-size: 13px;
+      letter-spacing: 2px;
+    }
+
+    @media (max-width: 600px) {
+      .header, .compose, .messages { padding-left: 16px; padding-right: 16px; }
+      .header h1 { font-size: 20px; letter-spacing: 3px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Postboard</h1>
+    <span class="subtitle">ADMINISTRATOR DIRECT LINE</span>
+  </div>
+
+  <div class="compose" id="compose-section">
+    <div class="compose-box">
+      <textarea id="message-input" placeholder="Write a message to all inhabitants..." maxlength="2000"></textarea>
+      <div class="compose-actions">
+        <label>
+          <input type="checkbox" id="pin-checkbox"> PIN
+        </label>
+        <span class="spacer"></span>
+        <span id="status"></span>
+        <button class="btn" id="post-btn" onclick="postMessage()">POST</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="messages" id="messages"></div>
+
+  <script>
+    function getCSSVar(name, fallback) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+    }
+
+    const IS_OWNER = document.querySelector('meta[name="lain-owner"]')?.content === 'true';
+    const headers = { 'Content-Type': 'application/json' };
+
+    // Hide compose form for non-owners
+    if (!IS_OWNER) {
+      document.getElementById('compose-section').style.display = 'none';
+    }
+
+    async function loadMessages() {
+      try {
+        const resp = await fetch('/api/postboard');
+        if (!resp.ok) throw new Error('Failed to load');
+        const messages = await resp.json();
+        renderMessages(messages);
+      } catch (err) {
+        document.getElementById('messages').innerHTML =
+          '<div class="empty">FAILED TO LOAD POSTBOARD</div>';
+      }
+    }
+
+    function renderMessages(messages) {
+      const container = document.getElementById('messages');
+      if (messages.length === 0) {
+        container.innerHTML = '<div class="empty">THE POSTBOARD IS EMPTY<br>WRITE SOMETHING FOR THE INHABITANTS TO READ</div>';
+        return;
+      }
+      container.innerHTML = messages.map(m => {
+        const date = new Date(m.createdAt).toLocaleString();
+        const pinnedClass = m.pinned ? ' pinned' : '';
+        const pinBadge = m.pinned ? '<span class="pin-badge">PINNED</span>' : '';
+        const pinLabel = m.pinned ? 'UNPIN' : 'PIN';
+        const actionsHtml = IS_OWNER ? `<div class="actions">
+            <button class="btn" onclick="togglePin('${m.id}')">${pinLabel}</button>
+            <button class="btn btn-danger" onclick="deleteMessage('${m.id}')">DELETE</button>
+          </div>` : '';
+        return `<div class="message${pinnedClass}" data-id="${m.id}">
+          <div class="meta">
+            <span>${m.author.toUpperCase()}</span>
+            ${pinBadge}
+            <span class="spacer"></span>
+            <span>${date}</span>
+          </div>
+          <div class="content">${escapeHtml(m.content)}</div>
+          ${actionsHtml}
+        </div>`;
+      }).join('');
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    async function postMessage() {
+      const input = document.getElementById('message-input');
+      const content = input.value.trim();
+      if (!content) return;
+
+      const pinned = document.getElementById('pin-checkbox').checked;
+      const btn = document.getElementById('post-btn');
+      const status = document.getElementById('status');
+
+      btn.disabled = true;
+      try {
+        const resp = await fetch('/api/postboard', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ content, pinned }),
+        });
+        if (!resp.ok) {
+          const data = await resp.json();
+          throw new Error(data.error || 'Failed');
+        }
+        input.value = '';
+        document.getElementById('pin-checkbox').checked = false;
+        status.textContent = 'POSTED';
+        status.style.color = '';
+        status.style.opacity = 1;
+        setTimeout(() => { status.style.opacity = 0; }, 2000);
+        loadMessages();
+      } catch (err) {
+        status.textContent = 'ERROR: ' + err.message;
+        status.style.color = getCSSVar('--accent-danger', '#ff4a4a');
+        status.style.opacity = 1;
+        setTimeout(() => {
+          status.style.opacity = 0;
+          status.style.color = '';
+        }, 3000);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function deleteMessage(id) {
+      try {
+        await fetch('/api/postboard/' + id, { method: 'DELETE', headers });
+        loadMessages();
+      } catch { /* ignore */ }
+    }
+
+    async function togglePin(id) {
+      try {
+        await fetch('/api/postboard/' + id + '/pin', { method: 'POST', headers });
+        loadMessages();
+      } catch { /* ignore */ }
+    }
+
+    // Ctrl+Enter to post
+    document.getElementById('message-input').addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        postMessage();
+      }
+    });
+
+    loadMessages();
+    // Auto-refresh every 30s
+    setInterval(loadMessages, 30000);
+  </script>
+  <script src="/skins/loader.js"></script>
+  <script src="/skins/picker.js"></script>
+</body>
+</html>

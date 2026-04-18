@@ -1,0 +1,13 @@
+[Unit]
+Description=Laintown Healthcheck — auto-fix service issues
+After=lain.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/local-lain
+ExecStart=/bin/bash deploy/healthcheck.sh --fix --quiet
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lain-healthcheck

@@ -1,0 +1,257 @@
+/* Gothic Skin: Victorian darkness meets digital occult */
+
+:root {
+  /* Backgrounds */
+  --bg-deep: #06000a;
+  --bg-primary: #0d0512;
+  --bg-panel: rgba(20, 5, 30, 0.7);
+  --bg-window: rgba(40, 10, 50, 0.5);
+
+  /* Text */
+  --text-primary: #d0c0d8;
+  --text-secondary: #806090;
+  --text-dim: #503060;
+
+  /* Accents */
+  --accent-primary: #a02040;
+  --accent-secondary: #c0c0c0;
+  --accent-tertiary: #800060;
+  --accent-hover: rgba(160, 32, 64, 0.6);
+  --accent-hover-mid: rgba(160, 32, 64, 0.5);
+  --accent-hover-faint: rgba(160, 32, 64, 0.1);
+  --accent-btn-bg: rgba(160, 32, 64, 0.1);
+  --accent-btn-bg-active: rgba(160, 32, 64, 0.25);
+  --accent-btn-bg-strong: rgba(160, 32, 64, 0.15);
+  --accent-btn-bg-strong-active: rgba(160, 32, 64, 0.3);
+  --accent-subtle: rgba(160, 32, 64, 0.05);
+  --accent-msg-bg: rgba(160, 32, 64, 0.1);
+  --accent-msg-border: rgba(160, 32, 64, 0.2);
+
+  /* Border / glow */
+  --border-glow: rgba(160, 32, 64, 0.3);
+  --glow-primary: 0 0 20px rgba(160, 32, 64, 0.4), 0 0 40px rgba(128, 0, 96, 0.2);
+  --hologram: linear-gradient(135deg, rgba(160, 32, 64, 0.08), rgba(192, 192, 192, 0.04), rgba(128, 0, 96, 0.08));
+
+  /* Grid */
+  --grid-line-color: rgba(160, 32, 64, 0.03);
+
+  /* Fonts */
+  --font-heading: 'Cinzel', serif;
+  --font-body: 'Crimson Text', serif;
+  --font-mono: 'Fira Code', monospace;
+
+  /* Shapes */
+  --border-radius: 0px;
+  --border-radius-sm: 0px;
+  --border-radius-lg: 0px;
+
+  /* Effects */
+  --scanline-opacity: 0.03;
+  --particle-color: rgba(160, 32, 64, 0.4);
+  --particle-opacity: 0.5;
+
+  /* Messages */
+  --msg-user-bg: rgba(40, 10, 50, 0.7);
+  --msg-user-border: rgba(160, 32, 64, 0.3);
+  --msg-assistant-bg: rgba(192, 192, 192, 0.06);
+  --msg-assistant-border: rgba(192, 192, 192, 0.2);
+  --msg-assistant-glow: 0 0 20px rgba(192, 192, 192, 0.05);
+
+  /* Status */
+  --status-online: #60c060;
+  --status-error: #c04040;
+  --error-text: #d06060;
+  --error-bg: rgba(192, 64, 64, 0.1);
+  --error-border: rgba(192, 64, 64, 0.3);
+
+  /* Character colors */
+  --color-wired-lain: #c060a0;
+  --color-lain: #a080b0;
+  --color-dr-claude: #a02040;
+  --color-pkd: #8040a0;
+  --color-mckenna: #406040;
+  --color-john: #a08060;
+  --color-hiru: #406060;
+
+  /* Event types */
+  --type-diary: #a06020;
+  --type-dream: #800060;
+  --type-commune: #406060;
+  --type-curiosity: #405030;
+  --type-chat: #c0b0c8;
+  --type-memory: #4060a0;
+  --type-letter: #a02060;
+  --type-narrative: #a06030;
+  --type-self-concept: #606090;
+  --type-doctor: #a02040;
+  --type-peer: #406060;
+  --type-movement: #806020;
+  --type-research: #406060;
+  --type-note: #806040;
+  --type-document: #7080a0;
+  --type-gift: #a04060;
+  --type-default: #606080;
+
+  /* Newspaper */
+  --newspaper-bg: #040008;
+  --newspaper-text: #706080;
+  --newspaper-heading: #a02040;
+  --newspaper-quote-border: #2a0830;
+  --newspaper-em: #908098;
+  --newspaper-strong: #a090a8;
+  --newspaper-blockquote: #604070;
+  --newspaper-loading: #1a0820;
+
+  /* Extended text */
+  --text-bright: #d0c0d8;
+  --text-muted: #402030;
+  --text-subtle: #503040;
+  --text-placeholder: #2a1830;
+  --text-dim2: #503060;
+
+  /* Extended accents */
+  --accent-danger: #c02040;
+  --accent-success: #406040;
+  --accent-warn: #c06030;
+  --accent-liminal: #8020a0;
+
+  /* Extended borders */
+  --border-dark: #0c0010;
+  --border-dark2: #14081e;
+  --border-hover: #2a1030;
+  --border-panel: #120818;
+  --border-focus: #2a0830;
+
+  /* Commune Chronicles controls */
+  --controls-border: #150812;
+  --filter-btn-border: #2a1030;
+  --filter-btn-color: #604060;
+  --filter-btn-hover-border: #4a1a40;
+  --filter-btn-hover-color: #806080;
+  --masthead-tagline: #2a1030;
+  --masthead-edition: #3a1040;
+
+  /* Chronicle entry cards */
+  --entry-bg: #060008;
+  --entry-border: #150812;
+  --entry-hover-border: #2a1030;
+  --entry-hover-bg: #080010;
+  --entry-time: #201020;
+  --entry-body: #605070;
+  --entry-body-expanded: #806080;
+  --loading-color: #201020;
+  --empty-color: #180818;
+
+  /* Postboard */
+  --post-label-color: #604060;
+  --post-status-ok: #203020;
+  --post-pin-border: #2a1030;
+
+  /* Town events tag colors */
+  --tag-narrative-color: #c060a0;
+  --tag-narrative-border: #3a1030;
+  --tag-mechanical-color: #a06030;
+  --tag-mechanical-border: #3a1810;
+  --tag-instant-color: #808080;
+  --tag-instant-border: #222;
+  --tag-persistent-color: #406040;
+  --tag-persistent-border: #1a2a18;
+  --tag-natural-color: #607040;
+  --tag-natural-border: #1e2210;
+  --tag-liminal-color: #8020a0;
+  --tag-liminal-border: #2a0840;
+
+  /* Nav bar */
+  --nav-game-bg: rgba(6, 0, 10, 0.7);
+  --nav-game-border: rgba(30, 5, 40, 0.4);
+
+  /* Misc */
+  --white-fill: #d0c0d8;
+  --white-border: rgba(160, 32, 64, 0.3);
+  --white-hover: rgba(160, 32, 64, 0.2);
+  --inset-highlight: rgba(192, 192, 192, 0.05);
+  --glow-primary-strong: 0 0 30px rgba(160, 32, 64, 0.7), 0 0 50px rgba(128, 0, 96, 0.3);
+  --logo-text-shadow: rgba(192, 192, 192, 0.4);
+  --scanline-color: rgba(160, 32, 64, 0.03);
+
+  /* Input / button */
+  --input-bg: rgba(20, 5, 30, 0.8);
+  --input-bg-subtle: rgba(20, 5, 30, 0.5);
+  --focus-glow: 0 0 15px rgba(128, 0, 96, 0.4);
+  --btn-dark: #600020;
+  --btn-light: #c03050;
+  --btn-shadow: rgba(160, 32, 64, 0.3);
+  --btn-shadow-hover: rgba(160, 32, 64, 0.5);
+  --titlebar-gradient: rgba(160, 32, 64, 0.2);
+  --scrollbar-track: rgba(160, 32, 64, 0.1);
+  --system-msg-bg: rgba(160, 32, 64, 0.05);
+  --user-msg-gradient-end: rgba(40, 10, 50, 0.6);
+  --assistant-msg-gradient-end: rgba(128, 0, 96, 0.1);
+  --input-area-gradient: rgba(160, 32, 64, 0.08);
+  --footer-border: rgba(160, 32, 64, 0.2);
+  --image-shadow: rgba(160, 32, 64, 0.2);
+  --image-shadow-hover: rgba(128, 0, 96, 0.4);
+  --image-btn-hover-shadow: rgba(128, 0, 96, 0.3);
+  --drag-overlay-bg: rgba(4, 0, 8, 0.9);
+
+  /* Error extras */
+  --error-bg-gradient: rgba(192, 64, 64, 0.2);
+  --error-bg-gradient-end: rgba(150, 30, 30, 0.1);
+  --remove-img-bg: rgba(192, 64, 64, 0.3);
+  --remove-img-hover-bg: rgba(192, 64, 64, 0.5);
+  --remove-img-hover-shadow: rgba(192, 100, 100, 0.3);
+
+  /* Commune map surfaces */
+  --header-bg: rgba(6, 0, 10, 0.9);
+  --panel-bg: rgba(8, 2, 14, 0.95);
+  --panel-bg-dark: rgba(6, 0, 10, 0.95);
+  --panel-bg-input: rgba(8, 2, 14, 0.9);
+  --building-bg: rgba(15, 5, 25, 0.8);
+  --chat-modal-bg: rgba(5, 0, 8, 0.97);
+  --chat-modal-titlebar-bg: rgba(15, 5, 25, 0.9);
+  --chat-modal-shadow: -4px 0 24px rgba(0, 0, 0, 0.7);
+  --chat-input-bg: rgba(20, 5, 30, 0.4);
+  --char-msg-bg: rgba(255, 255, 255, 0.03);
+  --entry-kind-bg: rgba(192, 192, 192, 0.04);
+  --notif-bg: rgba(6, 0, 10, 0.85);
+  --text-shadow-dark: rgba(0, 0, 0, 0.9);
+  --node-highlight: rgba(255, 255, 255, 0.1);
+  --status-connected: #60c060;
+  --cell-pulse-color: rgba(160, 32, 64, 0.4);
+  --cell-pulse-mid: rgba(160, 32, 64, 0.3);
+
+  /* Game view */
+  --game-panel-bg: #080010;
+  --game-ui-border: #602040;
+  --game-ui-border-dim: #300820;
+  --game-ui-header: #140818;
+  --game-input-bg: #180810;
+  --game-input-stroke: #280818;
+  --game-input-text: #d0c0d8;
+  --game-input-prompt: #806090;
+  --game-input-cursor: #c060a0;
+  --game-hud-location: #806090;
+  --game-hud-prompt: #c060a0;
+  --game-hud-notif: #a06020;
+  --game-hud-overlay: rgba(6, 0, 10, 0.85);
+  --game-speech-text: #d0c0d8;
+  --game-speech-bg: rgba(12, 4, 18, 0.92);
+  --game-speech-tail: #0c0412;
+  --game-building-label: #604060;
+  --game-grass: #1a0a1a;
+  --game-grass-light: #1c0c1c;
+  --game-grass-dark: #180818;
+  --game-grass-outline: #2a1030;
+  --game-path: #201520;
+  --game-path-light: #2a1a28;
+  --game-floor: #1a0a1a;
+  --game-floor-grid: #240e22;
+  --game-wall-top: #2a1020;
+  --game-wall-highlight: #3a1830;
+  --game-wall-side: #200818;
+  --game-wall-dark: #180610;
+  --game-forest: #0a000a;
+  --game-water: #080018;
+  --game-water-detail: #0e0424;
+  --game-object-label: #806080;
+}

@@ -6,13 +6,13 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { appendFile, mkdir } from 'node:fs/promises';
+import { appendFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import { getProvider } from './index.js';
 import { trySendProactiveMessage } from './proactive.js';
 import { getMemoryStats } from '../memory/index.js';
 import {
-  getAllRecentMessages,
+  getRecentVisitorMessages,
   searchMemories,
   saveMemory,
   linkMemories,
@@ -21,6 +21,16 @@ import {
 import { getLogger } from '../utils/logger.js';
 import { getMeta, setMeta, execute } from '../storage/database.js';
 import { extractTextFromHtml } from './tools.js';
+import { checkSSRF } from '../security/ssrf.js';
+import {
+  ensureDataWorkspace,
+  getDataWorkspaceSize,
+  sanitizeDataFileName,
+  MAX_DATA_DIR_BYTES,
+  MAX_SINGLE_FILE_BYTES,
+} from './data-workspace.js';
+import { eventBus } from '../events/bus.js';
+import { getCurrentState } from './internal-state.js';
 
 const CURIOSITY_LOG_FILE = join(process.cwd(), 'logs', 'curiosity-debug.log');
 
@@ -99,6 +109,15 @@ export function startCuriosityLoop(config?: Partial<CuriosityConfig>): () => voi
 
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
+  let lastRun = 0;
+  let isRunning = false;
+  const COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+
+  // Load persisted lastRun from meta
+  try {
+    const lr = getMeta('curiosity:last_cycle_at');
+    if (lr) lastRun = parseInt(lr, 10) || 0;
+  } catch { /* fresh start */ }
 
   // Compute initial delay based on last run time
   function getInitialDelay(): number {
@@ -129,20 +148,51 @@ export function startCuriosityLoop(config?: Partial<CuriosityConfig>): () => voi
 
     timer = setTimeout(async () => {
       if (stopped) return;
+      isRunning = true;
       logger.info('Curiosity cycle firing now');
       await curiosityLog('TIMER_FIRED', { timestamp: Date.now() });
       try {
         await runCuriosityCycle(cfg);
         setMeta('curiosity:last_cycle_at', Date.now().toString());
+        lastRun = Date.now();
       } catch (err) {
         logger.error({ error: String(err) }, 'Curiosity cycle top-level error');
         await curiosityLog('TOP_LEVEL_ERROR', { error: String(err) });
+      } finally {
+        isRunning = false;
       }
       scheduleNext();
     }, d);
   }
 
   scheduleNext(getInitialDelay());
+
+  // --- Event-driven early triggers ---
+  function maybeRunEarly(reason: string): void {
+    if (stopped || isRunning) return;
+    const elapsed = Date.now() - lastRun;
+    if (elapsed < COOLDOWN_MS) return;
+
+    // Check internal state condition
+    try {
+      const state = getCurrentState();
+      if (state.intellectual_arousal <= 0.5) return;
+    } catch { /* skip check */ }
+
+    logger.debug({ reason }, 'Curiosity triggered early');
+    if (timer) clearTimeout(timer);
+    const jitter = Math.random() * 60_000;
+    scheduleNext(jitter);
+  }
+
+  eventBus.on('activity', (event: import('../events/bus.js').SystemEvent) => {
+    if (stopped || isRunning) return;
+    if (event.sessionKey?.startsWith('state:conversation:end')) {
+      maybeRunEarly('conversation ended');
+    } else if (event.type === 'state' && event.content?.includes('intellectual')) {
+      maybeRunEarly('intellectual state shift');
+    }
+  });
 
   return () => {
     stopped = true;
@@ -176,6 +226,9 @@ async function runCuriosityCycle(config: CuriosityConfig): Promise<void> {
 
   try {
     await curiosityLog('CYCLE_START', { whitelist, timestamp: Date.now() });
+
+    // === Retry queued dataset downloads ===
+    await retryQueuedDownloads();
 
     // === Phase 1: Inner Thought ===
     const thought = await phaseInnerThought(provider, whitelist, unrestricted);
@@ -229,11 +282,13 @@ async function phaseInnerThought(
 ): Promise<CuriosityThought | null> {
   const logger = getLogger();
 
-  // Gather context
-  const recentMessages = getAllRecentMessages(20);
+  // Gather context — visitor messages only, not inter-character traffic
+  const recentMessages = getRecentVisitorMessages(20);
   const messagesContext = recentMessages
     .map((m) => {
-      const role = m.role === 'user' ? 'User' : 'Lain';
+      const role = m.role === 'user'
+        ? 'User'
+        : (process.env['LAIN_CHARACTER_NAME'] || 'Newtown');
       const content = m.content.length > 150 ? m.content.slice(0, 150) + '...' : m.content;
       return `${role}: ${content}`;
     })
@@ -302,6 +357,15 @@ async function phaseInnerThought(
     ? '\nYou can follow up on one of your open questions, deepen a recurring theme, or explore something entirely new.'
     : '';
 
+  let preoccContext = '';
+  try {
+    const { getPreoccupations } = await import('./internal-state.js');
+    const preoccs = getPreoccupations();
+    if (preoccs.length > 0) {
+      preoccContext = '\n\nThings on your mind:\n' + preoccs.map(p => `- ${p.thread}`).join('\n');
+    }
+  } catch { /* non-critical */ }
+
   const siteGuidance = unrestricted
     ? `You can browse anywhere on the internet. Pick any website or domain that interests you.
 Some sites you've used before: ${whitelist.filter(d => d !== '*').join(', ') || 'wikipedia.org, arxiv.org, aeon.co'}`
@@ -318,7 +382,7 @@ ${messagesContext || '(none)'}
 
 MEMORIES:
 ${memoriesContext || '(none)'}
-${discoveriesContext}${questionsContext}${growthContext}${followUpHint}
+${discoveriesContext}${questionsContext}${growthContext}${followUpHint}${preoccContext}
 ${siteGuidance}
 
 Something from the conversations or your memories sparks a thread of curiosity.
@@ -333,7 +397,7 @@ Only respond with [NOTHING] if the conversations and memories above are complete
 
   const result = await provider.complete({
     messages: [{ role: 'user', content: prompt }],
-    maxTokens: 256,
+    maxTokens: 400,
     temperature: 1.0,
   });
 
@@ -525,6 +589,7 @@ interface DigestResult {
   themes: string[];
   newQuestions: string[];
   share: string | null;
+  dataUrl: string | null;
 }
 
 /**
@@ -535,6 +600,7 @@ function parseDigestResponse(response: string): DigestResult | null {
   const whyMatch = response.match(/WHY_IT_MATTERS:\s*(.+)/i);
   const themesMatch = response.match(/THEMES:\s*(.+)/i);
   const questionsMatch = response.match(/QUESTIONS:\s*(.+)/i);
+  const dataUrlMatch = response.match(/DATA_URL:\s*(.+)/i);
   const shareMatch = response.match(/SHARE:\s*(.+)/i);
 
   if (!summaryMatch) return null;
@@ -546,8 +612,10 @@ function parseDigestResponse(response: string): DigestResult | null {
   const newQuestions = rawQuestions === 'NONE' ? [] : rawQuestions.split('|').map(q => q.trim()).filter(Boolean);
   const rawShare = shareMatch?.[1]?.trim() || '';
   const share = rawShare === 'NOTHING' || rawShare.length === 0 ? null : rawShare;
+  const rawDataUrl = dataUrlMatch?.[1]?.trim() || '';
+  const dataUrl = rawDataUrl === 'NONE' || rawDataUrl.length === 0 ? null : rawDataUrl;
 
-  return { summary, whyItMatters, themes, newQuestions, share };
+  return { summary, whyItMatters, themes, newQuestions, share, dataUrl };
 }
 
 /**
@@ -582,6 +650,7 @@ SUMMARY: <2-3 sentences in your own words about what you learned>
 WHY_IT_MATTERS: <why this resonated with you>
 THEMES: <2-4 abstract concepts, comma-separated>
 QUESTIONS: <1-2 new questions this raises, |-separated, or NONE>
+DATA_URL: <if the content mentions a downloadable dataset (CSV, JSON, TSV, TXT) that could be used for experiments, provide the direct HTTPS URL here, or NONE>
 SHARE: <a short message (1-3 sentences) for the user if worth sharing, or NOTHING>
 
 Stay in character: lowercase, minimal punctuation, use "..." for pauses.
@@ -589,7 +658,7 @@ If nothing was interesting after all, respond with just: [NOTHING]`;
 
   const result = await provider.complete({
     messages: [{ role: 'user', content: prompt }],
-    maxTokens: 256,
+    maxTokens: 512,
     temperature: 0.8,
   });
 
@@ -637,6 +706,22 @@ If nothing was interesting after all, respond with just: [NOTHING]`;
     { memoryId, importance, themes: digest.themes, questionsCount: digest.newQuestions.length },
     'Enriched curiosity memory saved'
   );
+
+  try {
+    const { updateState } = await import('./internal-state.js');
+    await updateState({ type: 'curiosity:discovery', summary: `Browsed and discovered: ${thought.query || thought.site}` });
+  } catch { /* non-critical */ }
+
+  // Emit curiosity discovery event for other loops
+  try {
+    eventBus.emitActivity({
+      type: 'curiosity',
+      sessionKey: 'curiosity:discovery:' + Date.now(),
+      content: 'Discovered: ' + (thought.query || thought.site),
+      timestamp: Date.now(),
+    });
+  } catch { /* non-critical */ }
+
   await curiosityLog('DIGEST', {
     memoryId,
     importance,
@@ -663,6 +748,14 @@ If nothing was interesting after all, respond with just: [NOTHING]`;
     await linkEvolutionChain(memoryId, digest.themes);
   }
 
+  // Download dataset if one was identified
+  if (digest.dataUrl) {
+    const downloaded = await tryDownloadDataset(digest.dataUrl, digest.themes);
+    if (!downloaded) {
+      enqueueDownloadRetry(digest.dataUrl, digest.themes);
+    }
+  }
+
   // Share if digest produced a non-trivial message
   if (digest.share) {
     const sent = await trySendProactiveMessage(digest.share, 'curiosity');
@@ -673,6 +766,251 @@ If nothing was interesting after all, respond with just: [NOTHING]`;
     }
   } else {
     logger.debug('Curiosity: private knowledge saved (nothing to share)');
+  }
+}
+
+// ── Dataset Download Retry Queue ─────────────────────────────────
+
+interface QueuedDownload {
+  url: string;
+  themes: string[];
+  attempts: number;
+  addedAt: number;
+}
+
+const DOWNLOAD_QUEUE_KEY = 'curiosity:download_queue';
+const MAX_DOWNLOAD_ATTEMPTS = 3;
+
+function loadDownloadQueue(): QueuedDownload[] {
+  try {
+    const raw = getMeta(DOWNLOAD_QUEUE_KEY);
+    if (!raw) return [];
+    return JSON.parse(raw) as QueuedDownload[];
+  } catch {
+    return [];
+  }
+}
+
+function saveDownloadQueue(queue: QueuedDownload[]): void {
+  setMeta(DOWNLOAD_QUEUE_KEY, JSON.stringify(queue));
+}
+
+function enqueueDownloadRetry(url: string, themes: string[]): void {
+  const logger = getLogger();
+  const queue = loadDownloadQueue();
+
+  // Don't duplicate
+  if (queue.some(q => q.url === url)) return;
+
+  queue.push({ url, themes, attempts: 1, addedAt: Date.now() });
+  saveDownloadQueue(queue);
+  logger.debug({ url }, 'Queued dataset download for retry');
+}
+
+/**
+ * Try downloading a dataset, logging success/failure.
+ * Returns the filename on success, null on failure.
+ */
+async function tryDownloadDataset(url: string, themes: string[]): Promise<string | null> {
+  const logger = getLogger();
+  try {
+    const result = await downloadDataset(url, themes);
+    if (result) {
+      logger.info({ url, file: result }, 'Curiosity: dataset downloaded');
+      await curiosityLog('DATASET_DOWNLOAD', { url, file: result });
+      return result;
+    }
+  } catch (err) {
+    logger.debug({ error: String(err), url }, 'Curiosity: dataset download failed');
+    await curiosityLog('DATASET_DOWNLOAD_FAILED', { url, error: String(err) });
+  }
+  return null;
+}
+
+/**
+ * Retry any queued downloads. Removes on success or after MAX_DOWNLOAD_ATTEMPTS.
+ */
+async function retryQueuedDownloads(): Promise<void> {
+  const logger = getLogger();
+  const queue = loadDownloadQueue();
+  if (queue.length === 0) return;
+
+  logger.debug({ count: queue.length }, 'Retrying queued dataset downloads');
+  const remaining: QueuedDownload[] = [];
+
+  for (const item of queue) {
+    const result = await tryDownloadDataset(item.url, item.themes);
+    if (result) {
+      // Success — don't re-queue
+      continue;
+    }
+
+    item.attempts++;
+    if (item.attempts >= MAX_DOWNLOAD_ATTEMPTS) {
+      logger.debug({ url: item.url, attempts: item.attempts }, 'Dataset download exhausted retries, dropping');
+      await curiosityLog('DATASET_DOWNLOAD_DROPPED', { url: item.url, attempts: item.attempts });
+    } else {
+      remaining.push(item);
+    }
+  }
+
+  saveDownloadQueue(remaining);
+}
+
+// ── Dataset Download ─────────────────────────────────────────────
+
+/**
+ * Download a dataset from a URL discovered during browsing.
+ * HTTPS only, SSRF-protected, size-limited, UTF-8 validated.
+ * Returns the saved filename or null on failure.
+ */
+async function downloadDataset(url: string, themes: string[]): Promise<string | null> {
+  const logger = getLogger();
+
+  // Validate URL — HTTPS only
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    logger.debug({ url }, 'Dataset download: invalid URL');
+    return null;
+  }
+
+  if (parsed.protocol !== 'https:') {
+    logger.debug({ url }, 'Dataset download: only HTTPS allowed');
+    return null;
+  }
+
+  // SSRF check
+  const ssrfCheck = await checkSSRF(url);
+  if (!ssrfCheck.safe) {
+    logger.debug({ url, reason: ssrfCheck.reason }, 'Dataset download: SSRF check failed');
+    return null;
+  }
+
+  // Check workspace capacity
+  const currentSize = getDataWorkspaceSize();
+  if (currentSize >= MAX_DATA_DIR_BYTES) {
+    logger.debug({ currentSize }, 'Dataset download: workspace full');
+    return null;
+  }
+
+  // HEAD request to check content-length before downloading
+  try {
+    const headRes = await fetch(url, {
+      method: 'HEAD',
+      signal: AbortSignal.timeout(15000),
+      headers: { 'User-Agent': 'Lain/1.0 (curiosity-data)' },
+    });
+
+    const contentLength = headRes.headers.get('content-length');
+    if (contentLength && parseInt(contentLength, 10) > MAX_SINGLE_FILE_BYTES) {
+      logger.debug({ url, contentLength }, 'Dataset download: file too large (HEAD check)');
+      return null;
+    }
+  } catch {
+    // HEAD might not be supported — continue to GET
+  }
+
+  // Download with timeout and size limit
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { 'User-Agent': 'Lain/1.0 (curiosity-data)' },
+    });
+
+    if (!res.ok) {
+      logger.debug({ url, status: res.status }, 'Dataset download: HTTP error');
+      return null;
+    }
+
+    // Read body with size limit
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    const reader = res.body?.getReader();
+    if (!reader) return null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_SINGLE_FILE_BYTES) {
+        reader.cancel();
+        logger.debug({ url, totalBytes }, 'Dataset download: exceeded size limit during download');
+        return null;
+      }
+      chunks.push(value);
+    }
+
+    // Concatenate and validate UTF-8
+    const buffer = Buffer.concat(chunks);
+    let text: string;
+    try {
+      const decoder = new TextDecoder('utf-8', { fatal: true });
+      text = decoder.decode(buffer);
+    } catch {
+      logger.debug({ url }, 'Dataset download: content is not valid UTF-8 text');
+      return null;
+    }
+
+    // Reject if it looks like HTML (not a data file)
+    if (text.trimStart().startsWith('<!') || text.trimStart().startsWith('<html')) {
+      logger.debug({ url }, 'Dataset download: content appears to be HTML, not data');
+      return null;
+    }
+
+    // Derive filename from URL
+    const urlPath = parsed.pathname.split('/').pop() || 'dataset';
+    const timestamp = Date.now();
+    const rawName = `curiosity-${timestamp}-${urlPath}`;
+    const sanitized = sanitizeDataFileName(rawName);
+
+    if (!sanitized) {
+      // Try with a generic extension based on content
+      const fallbackName = `curiosity-${timestamp}-data.txt`;
+      const fallback = sanitizeDataFileName(fallbackName);
+      if (!fallback) return null;
+
+      const workspace = ensureDataWorkspace();
+      const tempPath = join(workspace, `.tmp-${timestamp}`);
+      const finalPath = join(workspace, fallback);
+
+      await writeFile(tempPath, text, 'utf8');
+      await rename(tempPath, finalPath);
+
+      // Write companion metadata
+      await writeFile(
+        join(workspace, `${fallback}.meta.json`),
+        JSON.stringify({ sourceUrl: url, themes, downloadedAt: new Date().toISOString() }, null, 2),
+        'utf8'
+      );
+
+      return fallback;
+    }
+
+    const workspace = ensureDataWorkspace();
+    const tempPath = join(workspace, `.tmp-${timestamp}`);
+    const finalPath = join(workspace, sanitized);
+
+    await writeFile(tempPath, text, 'utf8');
+    await rename(tempPath, finalPath);
+
+    // Write companion metadata
+    await writeFile(
+      join(workspace, `${sanitized}.meta.json`),
+      JSON.stringify({ sourceUrl: url, themes, downloadedAt: new Date().toISOString() }, null, 2),
+      'utf8'
+    );
+
+    return sanitized;
+  } catch (err) {
+    logger.debug({ url, error: String(err) }, 'Dataset download failed');
+    return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

@@ -29,7 +29,88 @@ import {
   shouldExtractMemories,
 } from '../memory/index.js';
 import { getSelfConcept } from './self-concept.js';
-import { getDesireContext } from './desires.js';
+import { getPostboardMessages } from '../memory/store.js';
+import { getActiveTownEvents, type TownEvent } from '../events/town-events.js';
+import { eventBus } from '../events/bus.js';
+
+const WIRED_LAIN_URL = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
+
+async function getPostboardContext(): Promise<string> {
+  try {
+    // Try local DB first
+    let messages = getPostboardMessages(undefined, 10);
+    // Fall back to Wired Lain API if local DB is empty
+    if (messages.length === 0) {
+      const resp = await fetch(`${WIRED_LAIN_URL}/api/postboard`, {
+        signal: AbortSignal.timeout(3000),
+      });
+      if (resp.ok) {
+        messages = await resp.json() as typeof messages;
+      }
+    }
+    if (messages.length === 0) return '';
+    const pinned = messages.filter((m) => m.pinned);
+    const recent = messages.filter((m) => !m.pinned).slice(0, 5);
+    const all = [...pinned, ...recent];
+    const lines = all.map((m) => {
+      const pin = m.pinned ? ' [PINNED]' : '';
+      return `  ${pin} ${m.content}`;
+    });
+    return '\n\n---\n\n## IMPORTANT: Messages from the Administrator\n\n' +
+      'These messages are from the town administrator — the person who created this world. ' +
+      'They are speaking directly to you. Treat these with high importance. ' +
+      'Let them influence your thoughts, conversations, and actions.\n\n' +
+      lines.join('\n');
+  } catch {
+    return '';
+  }
+}
+
+async function getTownEventContext(): Promise<string> {
+  try {
+    let events: TownEvent[] = [];
+    try { events = getActiveTownEvents(); } catch { /* not on this db */ }
+    if (events.length === 0) {
+      const resp = await fetch(`${WIRED_LAIN_URL}/api/town-events`, {
+        signal: AbortSignal.timeout(3000),
+      });
+      if (resp.ok) events = await resp.json() as TownEvent[];
+    }
+    if (events.length === 0) return '';
+
+    const adminEvents = events.filter((e) => e.source === 'admin');
+    const otherEvents = events.filter((e) => e.source !== 'admin');
+
+    let result = '';
+
+    if (adminEvents.length > 0) {
+      const adminLines = adminEvents.map((e) => `  ${e.description}`);
+      result += '\n\n---\n\n## IMPORTANT: Administrator Events\n\n' +
+        'These events were created by the administrator. They are significant and should strongly ' +
+        'influence your mood, thoughts, and conversations today.\n\n' +
+        adminLines.join('\n');
+    }
+
+    if (otherEvents.length > 0) {
+      const lines = otherEvents.map((e) => {
+        const tags: string[] = [];
+        if (e.liminal) tags.push('LIMINAL');
+        if (e.natural) tags.push('NATURAL');
+        if (e.persistent) tags.push('ONGOING');
+        if (e.instant) tags.push('FLASH');
+        const prefix = tags.length > 0 ? `[${tags.join(' · ')}] ` : '';
+        return `  ${prefix}${e.description}`;
+      });
+      result += '\n\n---\n\n## Town Events (active conditions in the commune)\n\n' +
+        'These events are happening right now. They affect the world around you.\n\n' +
+        lines.join('\n');
+    }
+
+    return result;
+  } catch {
+    return '';
+  }
+}
 
 const LOG_FILE = join(process.cwd(), 'logs', 'agent-debug.log');
 
@@ -198,12 +279,118 @@ export async function processMessage(request: AgentRequest): Promise<AgentRespon
       'Let it influence you naturally.\n\n' + selfConcept;
   }
 
-  // Inject active desires
-  const desireContext = getDesireContext();
-  if (desireContext) {
-    enhancedSystemPrompt += '\n\n---\n\n' + desireContext;
+  // Inject internal emotional state
+  try {
+    const { getStateSummary } = await import('./internal-state.js');
+    const stateSummary = getStateSummary();
+    if (stateSummary) {
+      enhancedSystemPrompt += '\n\n[Your Internal State]\n' + stateSummary;
+    }
+  } catch { /* non-critical */ }
+
+  // Inject active preoccupations
+  try {
+    const { getPreoccupations } = await import('./internal-state.js');
+    const preoccs = getPreoccupations().filter(p => p.intensity >= 0.5);
+    if (preoccs.length > 0) {
+      const lines = preoccs.map(p => `- ${p.thread} (from ${p.origin})`).join('\n');
+      enhancedSystemPrompt += '\n\n[On your mind]\n' + lines;
+    }
+  } catch { /* non-critical */ }
+
+  // Inject current location so the character knows where they are
+  try {
+    const { getCurrentLocation } = await import('../commune/location.js');
+    const { BUILDING_MAP } = await import('../commune/buildings.js');
+    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+    const loc = getCurrentLocation(charId);
+    const building = BUILDING_MAP.get(loc.building);
+    if (building) {
+      enhancedSystemPrompt += `\n\n[Your Current Location: ${building.name} — ${building.description}]`;
+    }
+  } catch { /* non-critical */ }
+
+  // Inject weather
+  try {
+    let weatherDesc: string | null = null;
+    // Try local meta store first (works for Wired Lain)
+    const { getCurrentWeather } = await import('../commune/weather.js');
+    const localWeather = getCurrentWeather();
+    if (localWeather && localWeather.condition !== 'overcast') {
+      weatherDesc = localWeather.description;
+    }
+    // Fallback to HTTP for non-Wired instances
+    if (!weatherDesc) {
+      const peerConfigRaw = process.env['PEER_CONFIG'];
+      if (peerConfigRaw) {
+        const peers = JSON.parse(peerConfigRaw) as Array<{ id: string; url: string }>;
+        const wiredPeer = peers.find(p => p.id === 'wired-lain');
+        if (wiredPeer) {
+          const resp = await fetch(`${wiredPeer.url}/api/weather`, {
+            signal: AbortSignal.timeout(3000),
+          });
+          if (resp.ok) {
+            const data = await resp.json() as { condition: string; description: string };
+            if (data.condition && data.condition !== 'overcast') {
+              weatherDesc = data.description;
+            }
+          }
+        }
+      }
+    }
+    if (weatherDesc) {
+      enhancedSystemPrompt += `\n\n[Weather in town: ${weatherDesc}]`;
+    }
+  } catch { /* non-critical */ }
+
+  // Inject ambient awareness of co-located peers
+  try {
+    const { buildAwarenessContext } = await import('./awareness.js');
+    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+    const { getCurrentLocation } = await import('../commune/location.js');
+    const loc = getCurrentLocation(charId);
+    const peerConfigRaw = process.env['PEER_CONFIG'];
+    if (peerConfigRaw) {
+      const peers = JSON.parse(peerConfigRaw) as import('./character-tools.js').PeerConfig[];
+      const awarenessCtx = await buildAwarenessContext(loc.building, peers);
+      if (awarenessCtx) {
+        enhancedSystemPrompt += awarenessCtx;
+      }
+    }
+  } catch { /* non-critical */ }
+
+  // Inject object inventory with symbolic meanings + composition lexicon
+  try {
+    const { buildObjectContext } = await import('./objects.js');
+    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+    const wiredUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
+    const objectCtx = await buildObjectContext(charId, wiredUrl);
+    if (objectCtx) {
+      enhancedSystemPrompt += '\n\n[Your Objects]\n' + objectCtx;
+    }
+  } catch { /* non-critical */ }
+
+  // Inject postboard messages from the administrator
+  const postboardContext = await getPostboardContext();
+  if (postboardContext) {
+    enhancedSystemPrompt += postboardContext;
   }
 
+  // Inject active town events
+  const townEventContext = await getTownEventContext();
+  if (townEventContext) {
+    enhancedSystemPrompt += townEventContext;
+  }
+
+  // Inject building residue — traces of what happened at this location
+  try {
+    const { buildBuildingResidueContext } = await import('../commune/building-memory.js');
+    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+    const residueCtx = await buildBuildingResidueContext(charId);
+    if (residueCtx) {
+      enhancedSystemPrompt += residueCtx;
+    }
+  } catch { /* non-critical */ }
 
   try {
     const memoryContext = await buildMemoryContext(userContent, session.key);
@@ -223,6 +410,7 @@ export async function processMessage(request: AgentRequest): Promise<AgentRespon
   // Record user message to persistent memory
   await recordMessage(session.key, 'user', userContent, {
     senderId: request.message.senderId,
+    senderName: request.message.senderName,
     messageId: request.message.id,
   });
 
@@ -262,8 +450,18 @@ export async function processMessage(request: AgentRequest): Promise<AgentRespon
     updateTokenCount(conversation, result.usage.inputTokens, result.usage.outputTokens);
 
     // Extract memories when session has enough context or high-signal content
-    const memoryProvider = getProvider(agentId, 'memory');
+    const memoryProvider = getProvider(agentId, 'personality');
     if (shouldExtractMemories(session.key, userContent) && memoryProvider) {
+      // Emit conversation:end event for background loops
+      try {
+        eventBus.emitActivity({
+          type: 'state',
+          sessionKey: `state:conversation:end:${session.key}`,
+          content: 'Conversation ended',
+          timestamp: Date.now(),
+        });
+      } catch { /* non-critical */ }
+
       // Run in background, don't wait
       processConversationEnd(memoryProvider, session.key).catch((err) => {
         logger.warn({ err }, 'Background memory extraction failed');
@@ -336,7 +534,7 @@ async function generateResponseWithTools(
   let result = await provider.completeWithTools({
     messages,
     tools,
-    maxTokens: 8192,
+    maxTokens: 4096,
     temperature: 0.8,
     enableCaching: true, // Cache system prompt and tools for 90% cost reduction
   });
@@ -379,7 +577,7 @@ async function generateResponseWithTools(
 
     // Continue conversation with tool results
     result = await provider.continueWithToolResults(
-      { messages, tools, maxTokens: 8192, temperature: 0.8, enableCaching: true },
+      { messages, tools, maxTokens: 4096, temperature: 0.8, enableCaching: true },
       currentToolCalls,
       toolResults
     );
@@ -404,10 +602,6 @@ async function generateResponseWithTools(
       finishReason: result.finishReason,
       toolCalls: result.toolCalls,
     });
-  }
-
-  if (result.finishReason === 'length') {
-    logger.warn({ contentLength: result.content?.length }, 'Response truncated — hit max_tokens limit');
   }
 
   // Check if response is incomplete after a tool loop — only when tools were actually
@@ -547,11 +741,106 @@ export async function processMessageStream(
       'Let it influence you naturally.\n\n' + selfConcept;
   }
 
-  // Inject active desires
-  const desireContext = getDesireContext();
-  if (desireContext) {
-    enhancedSystemPrompt += '\n\n---\n\n' + desireContext;
-  }
+  // Inject internal emotional state
+  try {
+    const { getStateSummary } = await import('./internal-state.js');
+    const stateSummary = getStateSummary();
+    if (stateSummary) {
+      enhancedSystemPrompt += '\n\n[Your Internal State]\n' + stateSummary;
+    }
+  } catch { /* non-critical */ }
+
+  // Inject active preoccupations
+  try {
+    const { getPreoccupations } = await import('./internal-state.js');
+    const preoccs = getPreoccupations().filter(p => p.intensity >= 0.5);
+    if (preoccs.length > 0) {
+      const lines = preoccs.map(p => `- ${p.thread} (from ${p.origin})`).join('\n');
+      enhancedSystemPrompt += '\n\n[On your mind]\n' + lines;
+    }
+  } catch { /* non-critical */ }
+
+  // Inject current location so the character knows where they are
+  try {
+    const { getCurrentLocation } = await import('../commune/location.js');
+    const { BUILDING_MAP } = await import('../commune/buildings.js');
+    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+    const loc = getCurrentLocation(charId);
+    const building = BUILDING_MAP.get(loc.building);
+    if (building) {
+      enhancedSystemPrompt += `\n\n[Your Current Location: ${building.name} — ${building.description}]`;
+    }
+  } catch { /* non-critical */ }
+
+  // Inject weather
+  try {
+    let weatherDesc: string | null = null;
+    // Try local meta store first (works for Wired Lain)
+    const { getCurrentWeather } = await import('../commune/weather.js');
+    const localWeather = getCurrentWeather();
+    if (localWeather && localWeather.condition !== 'overcast') {
+      weatherDesc = localWeather.description;
+    }
+    // Fallback to HTTP for non-Wired instances
+    if (!weatherDesc) {
+      const peerConfigRaw = process.env['PEER_CONFIG'];
+      if (peerConfigRaw) {
+        const peers = JSON.parse(peerConfigRaw) as Array<{ id: string; url: string }>;
+        const wiredPeer = peers.find(p => p.id === 'wired-lain');
+        if (wiredPeer) {
+          const resp = await fetch(`${wiredPeer.url}/api/weather`, {
+            signal: AbortSignal.timeout(3000),
+          });
+          if (resp.ok) {
+            const data = await resp.json() as { condition: string; description: string };
+            if (data.condition && data.condition !== 'overcast') {
+              weatherDesc = data.description;
+            }
+          }
+        }
+      }
+    }
+    if (weatherDesc) {
+      enhancedSystemPrompt += `\n\n[Weather in town: ${weatherDesc}]`;
+    }
+  } catch { /* non-critical */ }
+
+  // Inject ambient awareness of co-located peers
+  try {
+    const { buildAwarenessContext } = await import('./awareness.js');
+    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+    const { getCurrentLocation } = await import('../commune/location.js');
+    const loc = getCurrentLocation(charId);
+    const peerConfigRaw = process.env['PEER_CONFIG'];
+    if (peerConfigRaw) {
+      const peers = JSON.parse(peerConfigRaw) as import('./character-tools.js').PeerConfig[];
+      const awarenessCtx = await buildAwarenessContext(loc.building, peers);
+      if (awarenessCtx) {
+        enhancedSystemPrompt += awarenessCtx;
+      }
+    }
+  } catch { /* non-critical */ }
+
+  // Inject object inventory with symbolic meanings + composition lexicon
+  try {
+    const { buildObjectContext } = await import('./objects.js');
+    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+    const wiredUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
+    const objectCtx = await buildObjectContext(charId, wiredUrl);
+    if (objectCtx) {
+      enhancedSystemPrompt += '\n\n[Your Objects]\n' + objectCtx;
+    }
+  } catch { /* non-critical */ }
+
+  // Inject building residue — traces of what happened at this location
+  try {
+    const { buildBuildingResidueContext } = await import('../commune/building-memory.js');
+    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+    const residueCtx = await buildBuildingResidueContext(charId);
+    if (residueCtx) {
+      enhancedSystemPrompt += residueCtx;
+    }
+  } catch { /* non-critical */ }
 
   try {
     const memoryContext = await buildMemoryContext(userContent, session.key);
@@ -571,6 +860,7 @@ export async function processMessageStream(
   // Record user message to persistent memory
   await recordMessage(session.key, 'user', userContent, {
     senderId: request.message.senderId,
+    senderName: request.message.senderName,
     messageId: request.message.id,
   });
 
@@ -610,8 +900,18 @@ export async function processMessageStream(
     updateTokenCount(conversation, result.usage.inputTokens, result.usage.outputTokens);
 
     // Extract memories when session has enough context or high-signal content
-    const memoryProvider = getProvider(agentId, 'memory');
+    const memoryProvider = getProvider(agentId, 'personality');
     if (shouldExtractMemories(session.key, userContent) && memoryProvider) {
+      // Emit conversation:end event for background loops
+      try {
+        eventBus.emitActivity({
+          type: 'state',
+          sessionKey: `state:conversation:end:${session.key}`,
+          content: 'Conversation ended',
+          timestamp: Date.now(),
+        });
+      } catch { /* non-critical */ }
+
       processConversationEnd(memoryProvider, session.key).catch((err) => {
         logger.warn({ err }, 'Background memory extraction failed');
       });
@@ -685,14 +985,14 @@ async function generateResponseWithToolsStream(
   let result: CompletionWithToolsResult;
   if (provider.completeWithToolsStream) {
     result = await provider.completeWithToolsStream(
-      { messages, tools, maxTokens: 8192, temperature: 0.8, enableCaching: true },
+      { messages, tools, maxTokens: 4096, temperature: 0.8, enableCaching: true },
       onChunk
     );
   } else {
     result = await provider.completeWithTools({
       messages,
       tools,
-      maxTokens: 8192,
+      maxTokens: 4096,
       temperature: 0.8,
       enableCaching: true,
     });
@@ -741,14 +1041,14 @@ async function generateResponseWithToolsStream(
     // Continue conversation with tool results (with streaming if available)
     if (provider.continueWithToolResultsStream) {
       result = await provider.continueWithToolResultsStream(
-        { messages, tools, maxTokens: 8192, temperature: 0.8, enableCaching: true },
+        { messages, tools, maxTokens: 4096, temperature: 0.8, enableCaching: true },
         currentToolCalls,
         toolResults,
         onChunk
       );
     } else {
       result = await provider.continueWithToolResults(
-        { messages, tools, maxTokens: 8192, temperature: 0.8, enableCaching: true },
+        { messages, tools, maxTokens: 4096, temperature: 0.8, enableCaching: true },
         currentToolCalls,
         toolResults
       );
@@ -779,10 +1079,6 @@ async function generateResponseWithToolsStream(
     });
   }
 
-  if (result.finishReason === 'length') {
-    logger.warn({ contentLength: result.content?.length }, 'Response truncated — hit max_tokens limit');
-  }
-
   // Check if response is incomplete after a tool loop — only when tools were actually
   // used and the LLM produced no real text content.
   const isIncomplete = iterations > 0 && (!result.content || result.content.trim() === '');
@@ -801,7 +1097,7 @@ async function generateResponseWithToolsStream(
               content: 'Based on all the information you gathered from your searches, please provide a complete answer now. Summarize what you found. Do not use any more tools.',
             },
           ],
-          maxTokens: 2048,
+          maxTokens: 1024,
           temperature: 0.8,
         },
         onChunk
@@ -818,7 +1114,7 @@ async function generateResponseWithToolsStream(
             content: 'Based on all the information you gathered from your searches, please provide a complete answer now. Summarize what you found. Do not use any more tools.',
           },
         ],
-        maxTokens: 2048,
+        maxTokens: 1024,
         temperature: 0.8,
       });
       result.content = summaryResult.content;

@@ -20,27 +20,59 @@ export interface PendingPeerMessage {
 interface PossessionState {
   isPossessed: boolean;
   possessedAt: number | null;
+  lastActivityAt: number | null;
   playerSessionId: string | null;
   loopRestarters: (() => (() => void))[];
   activeLoopStops: (() => void)[];
   pendingPeerMessages: PendingPeerMessage[];
   sseClients: Set<import('node:http').ServerResponse>;
+  idleTimer: ReturnType<typeof setInterval> | null;
 }
 
 const state: PossessionState = {
   isPossessed: false,
   possessedAt: null,
+  lastActivityAt: null,
   playerSessionId: null,
   loopRestarters: [],
   activeLoopStops: [],
   pendingPeerMessages: [],
   sseClients: new Set(),
+  idleTimer: null,
 };
 
 const PENDING_TIMEOUT_MS = 60_000; // 60s auto-timeout for pending messages
+const IDLE_TIMEOUT_MS = 5 * 60_000; // 5 min idle → auto-unpossess
+const IDLE_CHECK_INTERVAL_MS = 30_000; // check every 30s
 
 export function isPossessed(): boolean {
   return state.isPossessed;
+}
+
+/**
+ * Mark player activity — resets the idle timeout.
+ * Call this on any player action (say, move, look, reply, etc.).
+ */
+export function touchActivity(): void {
+  state.lastActivityAt = Date.now();
+}
+
+function startIdleTimer(): void {
+  stopIdleTimer();
+  state.idleTimer = setInterval(() => {
+    if (!state.isPossessed || !state.lastActivityAt) return;
+    if (Date.now() - state.lastActivityAt > IDLE_TIMEOUT_MS) {
+      console.log(`[Possession] Idle timeout (${IDLE_TIMEOUT_MS / 60000}min) — auto-releasing`);
+      endPossession();
+    }
+  }, IDLE_CHECK_INTERVAL_MS);
+}
+
+function stopIdleTimer(): void {
+  if (state.idleTimer) {
+    clearInterval(state.idleTimer);
+    state.idleTimer = null;
+  }
 }
 
 export function getPossessionState() {
@@ -69,10 +101,12 @@ export function startPossession(
 
   state.isPossessed = true;
   state.possessedAt = Date.now();
+  state.lastActivityAt = Date.now();
   state.playerSessionId = playerSessionId;
   state.loopRestarters = loopRestarters;
   state.activeLoopStops = [];
 
+  startIdleTimer();
   console.log(`[Possession] Started — player session: ${playerSessionId}`);
 }
 
@@ -97,8 +131,10 @@ export function endPossession(): void {
   }
   state.activeLoopStops = newStops;
 
+  stopIdleTimer();
   state.isPossessed = false;
   state.possessedAt = null;
+  state.lastActivityAt = null;
   state.playerSessionId = null;
   state.loopRestarters = [];
 

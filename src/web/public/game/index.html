@@ -3,15 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>&#10016; laintown &#10016;</title>
+  <title>LAINTOWN</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@400;500;700&display=swap');
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body {
       width: 100%; height: 100%;
-      background: #1a1520;
+      background: var(--bg-deep, #0a0a0f);
       overflow: hidden;
-      font-family: 'M PLUS Rounded 1c', sans-serif;
+      font-family: monospace;
     }
     #game-container {
       width: 100%;
@@ -25,23 +24,145 @@
     #game-container canvas {
       image-rendering: pixelated;
       image-rendering: crisp-edges;
-      border-radius: 8px;
-      box-shadow: 0 4px 30px rgba(200, 120, 152, 0.1);
+    }
+
+    /* Mobile touch controls — hidden on desktop */
+    #mobile-controls { display: none; }
+    @media (pointer: coarse) {
+      #mobile-controls {
+        display: block;
+        position: fixed;
+        bottom: 0; left: 0; right: 0;
+        z-index: 1000;
+        pointer-events: none;
+      }
+      #mobile-controls * { pointer-events: auto; }
+
+      #dpad {
+        position: fixed;
+        bottom: 24px; left: 24px;
+        width: 140px; height: 140px;
+      }
+      .dpad-btn {
+        position: absolute;
+        width: 46px; height: 46px;
+        background: rgba(60,80,120,0.6);
+        border: 1px solid rgba(100,160,255,0.4);
+        border-radius: 8px;
+        color: #c0d8ff;
+        font-size: 18px;
+        display: flex; align-items: center; justify-content: center;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+      }
+      .dpad-btn:active { background: rgba(64,128,255,0.5); }
+      .dpad-btn[data-dir="up"]    { top: 0;   left: 47px; }
+      .dpad-btn[data-dir="left"]  { top: 47px; left: 0; }
+      .dpad-btn[data-dir="right"] { top: 47px; left: 94px; }
+      .dpad-btn[data-dir="down"]  { top: 94px; left: 47px; }
+
+      #action-buttons {
+        position: fixed;
+        bottom: 24px; right: 24px;
+        display: flex; flex-direction: column; gap: 12px;
+      }
+      #btn-act {
+        width: 64px; height: 64px;
+        background: rgba(60,80,120,0.6);
+        border: 1px solid rgba(100,160,255,0.4);
+        border-radius: 50%;
+        color: #c0d8ff;
+        font-family: monospace;
+        font-size: 11px;
+        letter-spacing: 1px;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+      }
+      #btn-act:active { background: rgba(64,128,255,0.5); }
+
+      #dialog-controls {
+        position: fixed;
+        bottom: 12px; left: 12px; right: 12px;
+        display: flex; gap: 8px;
+        align-items: center;
+      }
+      #mobile-input {
+        flex: 1;
+        background: rgba(10,12,20,0.9);
+        border: 1px solid rgba(100,160,255,0.4);
+        border-radius: 8px;
+        color: #c0d8ff;
+        font-family: monospace;
+        font-size: 16px;
+        padding: 12px;
+        outline: none;
+        -webkit-appearance: none;
+      }
+      #mobile-input::placeholder { color: #405880; }
+      #btn-send {
+        width: 48px; height: 48px;
+        background: rgba(64,128,255,0.5);
+        border: 1px solid rgba(100,160,255,0.5);
+        border-radius: 50%;
+        color: #fff;
+        font-size: 18px;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+      }
     }
   </style>
+  <script src="/skins/early-load.js"></script>
 </head>
 <body>
   <div id="game-container"></div>
+
+  <!-- Mobile touch controls overlay -->
+  <div id="mobile-controls">
+    <div id="dpad">
+      <button class="dpad-btn" data-dir="up">&#9650;</button>
+      <button class="dpad-btn" data-dir="left">&#9664;</button>
+      <button class="dpad-btn" data-dir="right">&#9654;</button>
+      <button class="dpad-btn" data-dir="down">&#9660;</button>
+    </div>
+    <div id="action-buttons">
+      <button id="btn-act">ACT</button>
+    </div>
+    <!-- Dialog-mode controls (hidden until dialog opens) -->
+    <div id="dialog-controls" style="display:none">
+      <input id="mobile-input" type="text" placeholder="speak..." autocomplete="off" autocapitalize="off" autocorrect="off" />
+      <button id="btn-send">&#9654;</button>
+    </div>
+  </div>
+
+  <!-- Phaser (loaded first — scene classes extend Phaser.Scene) -->
   <script src="/game/lib/phaser.min.js"></script>
-  <script src="/game/js/config.js?v=5"></script>
+
+  <!-- Config & constants -->
+  <script src="/game/js/config.js"></script>
+
+  <!-- Pixel art sprite definitions -->
+  <script src="/game/js/sprites.js"></script>
+
+  <!-- Fixture sprite renderers -->
+  <script src="/game/js/fixtures.js"></script>
+
+  <!-- Pathfinding utility -->
+  <script src="/game/js/pathfinding.js"></script>
+
+  <!-- Systems (no Phaser dependency in class definitions) -->
   <script src="/game/js/systems/APIClient.js"></script>
   <script src="/game/js/systems/DialogSystem.js"></script>
   <script src="/game/js/systems/CharacterManager.js"></script>
   <script src="/game/js/systems/PossessionManager.js"></script>
-  <script src="/game/js/scenes/TitleScene.js?v=5"></script>
-  <script src="/game/js/scenes/BootScene.js?v=7"></script>
-  <script src="/game/js/scenes/WorldScene.js?v=5"></script>
-  <script src="/game/js/scenes/DialogScene.js?v=5"></script>
+  <script src="/game/js/systems/ObjectManager.js"></script>
+
+  <!-- Scenes (extend Phaser.Scene) -->
+  <script src="/game/js/scenes/TitleScene.js"></script>
+  <script src="/game/js/scenes/BootScene.js"></script>
+  <script src="/game/js/scenes/WorldScene.js"></script>
+  <script src="/game/js/scenes/DialogScene.js"></script>
+  <script src="/skins/loader.js"></script>
+  <script src="/skins/picker.js"></script>
   <script>
     const game = new Phaser.Game({
       type: Phaser.AUTO,
@@ -54,9 +175,135 @@
         mode: Phaser.Scale.FIT,
         autoCenter: Phaser.Scale.CENTER_BOTH,
       },
-      backgroundColor: '#1a1520',
+      backgroundColor: GAME_THEME.bgDeep,
       scene: [TitleScene, BootScene, WorldScene, DialogScene],
+      input: { activePointers: 3 },
     });
+
+    /* ===== Mobile touch controls ===== */
+    // Global state flag — scenes set this directly
+    window._mobileState = 'world'; // 'title' | 'world' | 'dialog'
+
+    (function() {
+      var isMobile = matchMedia('(pointer: coarse)').matches;
+      if (!isMobile) return;
+
+      function getScene(name) { return game.scene.getScene(name); }
+
+      // --- D-pad: directly call _tryMove on WorldScene ---
+      var DIR_DELTAS = { up: [0,-1], down: [0,1], left: [-1,0], right: [1,0] };
+      var dpadTimers = {};
+
+      document.querySelectorAll('.dpad-btn').forEach(function(btn) {
+        var dir = btn.dataset.dir;
+        var delta = DIR_DELTAS[dir];
+
+        function doMove() {
+          var ws = getScene('WorldScene');
+          if (ws && !ws.dialogOpen && !ws.isMoving) {
+            ws._tryMove(delta[0], delta[1]);
+          }
+        }
+
+        btn.addEventListener('touchstart', function(e) {
+          e.preventDefault();
+          doMove();
+          dpadTimers[dir] = setInterval(doMove, 200);
+        }, { passive: false });
+
+        btn.addEventListener('touchend', function(e) {
+          e.preventDefault();
+          clearInterval(dpadTimers[dir]);
+        });
+        btn.addEventListener('touchcancel', function() {
+          clearInterval(dpadTimers[dir]);
+        });
+      });
+
+      // --- ACT button: NPC → object → pending messages ---
+      document.getElementById('btn-act').addEventListener('touchstart', function(e) {
+        e.preventDefault();
+        var ws = getScene('WorldScene');
+        if (!ws || ws.dialogOpen) return;
+        if (ws.nearbyNPC) {
+          ws._openDialog(ws.nearbyNPC);
+          return;
+        }
+        var objId = ws.objectManager.getNearestObject(ws.playerTileX, ws.playerTileY, 2);
+        if (objId) {
+          var objData = ws.objectManager.getObjectData(objId);
+          if (objData) { ws._showObjectInfo(objData); return; }
+        }
+        if (ws.possessionManager.hasPending()) {
+          var pending = ws.possessionManager.getNextPending();
+          if (pending) ws._openPendingDialog(pending);
+        }
+      }, { passive: false });
+
+      // --- Dialog controls ---
+      var dialogControls = document.getElementById('dialog-controls');
+      var dpad = document.getElementById('dpad');
+      var actionBtns = document.getElementById('action-buttons');
+      var mobileInput = document.getElementById('mobile-input');
+
+      // Send: call _sendMessage directly on DialogScene
+      document.getElementById('btn-send').addEventListener('touchstart', function(e) {
+        e.preventDefault();
+        var text = mobileInput.value.trim();
+        if (!text) return;
+        var ds = getScene('DialogScene');
+        if (!ds) return;
+        // Set state + call send directly (bypasses DialogSystem callback chain)
+        ds.dialogSystem.inputText = text;
+        ds.dialogSystem.inputActive = false;
+        ds._sendMessage(text);
+        mobileInput.value = '';
+      }, { passive: false });
+
+
+      // Sync DOM input → Phaser display
+      mobileInput.addEventListener('input', function() {
+        var ds = getScene('DialogScene');
+        if (!ds || !ds.dialogSystem) return;
+        ds.dialogSystem.inputText = mobileInput.value;
+        if (ds.inputDisplay) {
+          ds.inputDisplay.setText(mobileInput.value);
+          var textW = ds.inputDisplay.width;
+          ds.inputDisplay.x = textW > ds.maxInputW
+            ? ds.inputTextX - (textW - ds.maxInputW)
+            : ds.inputTextX;
+          if (ds.inputCursor) ds.inputCursor.x = ds.inputDisplay.x + textW;
+        }
+      });
+
+      // Toggle controls based on global state flag
+      setInterval(function() {
+        var state = window._mobileState;
+        if (state === 'dialog') {
+          dpad.style.display = 'none';
+          actionBtns.style.display = 'none';
+          dialogControls.style.display = 'flex';
+        } else if (state === 'world') {
+          dpad.style.display = '';
+          actionBtns.style.display = '';
+          dialogControls.style.display = 'none';
+          if (document.activeElement === mobileInput) mobileInput.blur();
+        } else {
+          // title or other — hide all game controls
+          dpad.style.display = 'none';
+          actionBtns.style.display = 'none';
+          dialogControls.style.display = 'none';
+        }
+      }, 150);
+
+      // TitleScene: tap canvas to proceed
+      document.getElementById('game-container').addEventListener('touchstart', function() {
+        var ts = getScene('TitleScene');
+        if (ts && ts._keyHandler && window._mobileState === 'title') {
+          ts._keyHandler({ key: 'Enter', preventDefault: function(){} });
+        }
+      });
+    })();
   </script>
 </body>
 </html>

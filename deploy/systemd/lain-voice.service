@@ -1,6 +1,9 @@
 [Unit]
 Description=Lain Voice Call Service
 After=network.target
+PartOf=lain.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -9,7 +12,9 @@ WorkingDirectory=/opt/wired-lain/services/voice-call
 ExecStart=/opt/wired-lain/services/voice-call/.venv/bin/python -m lain_voice.main
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=/opt/wired-lain/.env
+
+EnvironmentFile=/opt/local-lain/.env
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=lain-voice

@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>THE LAINTOWN CHRONICLE</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <script src="/skins/early-load.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--newspaper-bg);
+      color: var(--text-primary);
+      font-family: var(--font-mono);
+      min-height: 100vh;
+      padding-top: 32px;
+    }
+
+    .masthead {
+      border-bottom: 2px solid var(--border-glow);
+      padding: 24px 40px 16px;
+      display: flex;
+      align-items: baseline;
+      gap: 24px;
+    }
+    .masthead h1 {
+      font-size: 28px;
+      letter-spacing: 6px;
+      color: var(--accent-primary);
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .masthead .subtitle {
+      font-size: 12px;
+      color: var(--text-dim);
+      letter-spacing: 2px;
+    }
+    .masthead .date {
+      margin-left: auto;
+      font-size: 12px;
+      color: var(--text-dim2);
+      white-space: nowrap;
+    }
+
+    /* Edition picker */
+    .editions-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 40px;
+      border-bottom: 1px solid var(--border-dark);
+      overflow-x: auto;
+    }
+    .editions-bar .label {
+      font-size: 10px;
+      color: var(--text-dim);
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      margin-right: 8px;
+      white-space: nowrap;
+    }
+    .edition-btn {
+      background: none;
+      border: 1px solid var(--border-dark2);
+      color: var(--text-dim2);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      padding: 4px 10px;
+      cursor: pointer;
+      transition: all 0.2s;
+      white-space: nowrap;
+    }
+    .edition-btn:hover {
+      color: var(--accent-hover);
+      border-color: var(--newspaper-quote-border);
+    }
+    .edition-btn.active {
+      color: var(--accent-primary);
+      border-color: var(--accent-primary);
+      background: color-mix(in srgb, var(--accent-primary) 5%, transparent);
+    }
+
+    /* Article content */
+    .article-container {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 32px 40px 80px;
+    }
+
+    .article-meta {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border-dark);
+    }
+    .editor-tag {
+      font-size: 10px;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      padding: 3px 8px;
+      border: 1px solid;
+    }
+    .editor-tag[data-editor="newtown"] { color: var(--accent-primary); border-color: color-mix(in srgb, var(--accent-primary) 25%, transparent); }
+    .editor-tag[data-editor="neo"] { color: var(--color-neo); border-color: color-mix(in srgb, var(--color-neo) 25%, transparent); }
+    .editor-tag[data-editor="plato"] { color: var(--color-plato); border-color: color-mix(in srgb, var(--color-plato) 25%, transparent); }
+    .editor-tag[data-editor="joe"] { color: var(--color-joe); border-color: color-mix(in srgb, var(--color-joe) 25%, transparent); }
+    .activity-count {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-left: auto;
+    }
+
+    /* Rendered markdown */
+    .article-body h2 {
+      font-size: 18px;
+      color: var(--newspaper-heading);
+      letter-spacing: 2px;
+      margin: 32px 0 12px;
+    }
+    .article-body h3 {
+      font-size: 14px;
+      color: var(--text-secondary);
+      letter-spacing: 1.5px;
+      margin: 24px 0 8px;
+    }
+    .article-body p {
+      font-size: 13px;
+      line-height: 1.8;
+      margin: 12px 0;
+      color: var(--newspaper-text);
+    }
+    .article-body em {
+      color: var(--newspaper-em);
+      font-style: italic;
+    }
+    .article-body strong {
+      color: var(--newspaper-strong);
+    }
+    .article-body hr {
+      border: none;
+      border-top: 1px solid var(--border-glow);
+      margin: 24px 0;
+    }
+    .article-body ul, .article-body ol {
+      margin: 12px 0;
+      padding-left: 24px;
+    }
+    .article-body li {
+      font-size: 13px;
+      line-height: 1.7;
+      color: var(--newspaper-text);
+      margin: 4px 0;
+    }
+    .article-body blockquote {
+      border-left: 2px solid var(--newspaper-quote-border);
+      padding-left: 16px;
+      margin: 16px 0;
+      color: var(--newspaper-blockquote);
+      font-style: italic;
+    }
+
+    .loading {
+      text-align: center;
+      padding: 80px 0;
+      color: var(--newspaper-loading);
+      font-size: 12px;
+      letter-spacing: 2px;
+    }
+
+    .no-editions {
+      text-align: center;
+      padding: 80px 0;
+      color: var(--newspaper-loading);
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <script src="/laintown-nav.js"></script>
+
+  <div class="masthead">
+    <h1>The Laintown Chronicle</h1>
+    <span class="subtitle">daily edition</span>
+    <span class="date" id="current-date"></span>
+  </div>
+
+  <div class="editions-bar" id="editions-bar">
+    <span class="label">Editions</span>
+  </div>
+
+  <div class="article-container">
+    <div class="article-meta" id="article-meta" style="display:none">
+      <span class="editor-tag" id="editor-tag"></span>
+      <span class="activity-count" id="activity-count"></span>
+    </div>
+    <div class="article-body" id="article-body">
+      <div class="loading">loading editions...</div>
+    </div>
+  </div>
+
+  <script>
+    const editionsBar = document.getElementById('editions-bar');
+    const articleBody = document.getElementById('article-body');
+    const articleMeta = document.getElementById('article-meta');
+    const editorTag = document.getElementById('editor-tag');
+    const activityCount = document.getElementById('activity-count');
+    const currentDate = document.getElementById('current-date');
+
+    let editions = [];
+    let currentEdition = null;
+
+    // Minimal markdown renderer (no external deps)
+    function renderMarkdown(md) {
+      let html = md
+        // Headings
+        .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+        .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+        // Horizontal rules
+        .replace(/^---+$/gm, '<hr>')
+        // Bold + italic
+        .replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>')
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*(.+?)\*/g, '<em>$1</em>')
+        // Blockquotes
+        .replace(/^> (.+)$/gm, '<blockquote>$1</blockquote>')
+        // Lists
+        .replace(/^- (.+)$/gm, '<li>$1</li>')
+        .replace(/^(\d+)\. (.+)$/gm, '<li>$2</li>');
+
+      // Wrap consecutive <li> in <ul>
+      html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
+
+      // Paragraphs: wrap remaining text blocks
+      html = html.split('\n\n').map(block => {
+        block = block.trim();
+        if (!block) return '';
+        if (block.startsWith('<h') || block.startsWith('<hr') ||
+            block.startsWith('<ul') || block.startsWith('<ol') ||
+            block.startsWith('<blockquote')) return block;
+        return '<p>' + block.replace(/\n/g, '<br>') + '</p>';
+      }).join('\n');
+
+      return html;
+    }
+
+    function formatDate(dateStr) {
+      const d = new Date(dateStr + 'T12:00:00Z');
+      return d.toLocaleDateString('en-US', {
+        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC'
+      });
+    }
+
+    async function loadEdition(date) {
+      currentEdition = date;
+
+      // Update active button
+      editionsBar.querySelectorAll('.edition-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.date === date);
+      });
+
+      articleBody.innerHTML = '<div class="loading">loading...</div>';
+      articleMeta.style.display = 'none';
+
+      try {
+        const resp = await fetch('/newspapers/' + date + '.json');
+        if (!resp.ok) throw new Error('not found');
+        const data = await resp.json();
+
+        currentDate.textContent = formatDate(data.date);
+        editorTag.textContent = 'Editor: ' + data.editor_name;
+        editorTag.dataset.editor = data.editor_id;
+        activityCount.textContent = data.activity_count + ' events observed';
+        articleMeta.style.display = 'flex';
+
+        articleBody.innerHTML = renderMarkdown(data.content);
+      } catch {
+        articleBody.innerHTML = '<div class="no-editions">edition not available</div>';
+      }
+    }
+
+    async function init() {
+      try {
+        const resp = await fetch('/newspapers/index.json');
+        if (!resp.ok) throw new Error('no index');
+        editions = await resp.json();
+      } catch {
+        articleBody.innerHTML = '<div class="no-editions">no editions published yet</div>';
+        return;
+      }
+
+      if (editions.length === 0) {
+        articleBody.innerHTML = '<div class="no-editions">no editions published yet</div>';
+        return;
+      }
+
+      // Build edition buttons (newest first)
+      for (const ed of editions) {
+        const btn = document.createElement('button');
+        btn.className = 'edition-btn';
+        btn.dataset.date = ed.date;
+        const d = new Date(ed.date + 'T12:00:00Z');
+        const month = d.toLocaleDateString('en-US', { month: 'short', timeZone: 'UTC' });
+        const day = d.getUTCDate();
+        btn.textContent = month + ' ' + day;
+        btn.title = ed.editor_name + ' — ' + ed.activity_count + ' events';
+        btn.onclick = () => loadEdition(ed.date);
+        editionsBar.appendChild(btn);
+      }
+
+      // Load latest
+      loadEdition(editions[0].date);
+    }
+
+    init();
+  </script>
+  <script src="/skins/loader.js"></script>
+  <script src="/skins/picker.js"></script>
+</body>
+</html>

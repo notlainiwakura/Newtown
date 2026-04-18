@@ -20,7 +20,9 @@ LOG_DIR="$NEWTOWN_HOME/logs"
 PID_FILE="$NEWTOWN_HOME/pids.txt"
 WEB_PORT="${WEB_PORT:-3000}"
 POSSESSION_TOKEN="${POSSESSION_TOKEN:-newtown}"
-export POSSESSION_TOKEN
+LAIN_INTERLINK_TOKEN="${LAIN_INTERLINK_TOKEN:-newtown-interlink}"
+ENABLE_RESEARCH="${ENABLE_RESEARCH:-0}"
+export POSSESSION_TOKEN LAIN_INTERLINK_TOKEN ENABLE_RESEARCH
 
 mkdir -p "$LOG_DIR"
 
@@ -38,23 +40,23 @@ node dist/scripts/bootstrap-town.js --home "$JOE_HOME" --persona joe
 
 echo "Starting services..."
 
-LAIN_HOME="$WEB_HOME" node dist/index.js web --port "$WEB_PORT" > "$LOG_DIR/web.log" 2>&1 &
+LAIN_HOME="$WEB_HOME" node dist/scripts/run-service.js web "$WEB_PORT" > "$LOG_DIR/web.log" 2>&1 &
 WEB_PID=$!
 
-LAIN_HOME="$WEB_HOME" node dist/index.js gateway > "$LOG_DIR/gateway.log" 2>&1 &
+LAIN_HOME="$WEB_HOME" node dist/scripts/run-service.js gateway > "$LOG_DIR/gateway.log" 2>&1 &
 GATEWAY_PID=$!
 
 PEERS_NEO='[{"id":"plato","name":"Plato","url":"http://127.0.0.1:3004"},{"id":"joe","name":"Joe","url":"http://127.0.0.1:3005"}]'
 PEERS_PLATO='[{"id":"neo","name":"Neo","url":"http://127.0.0.1:3003"},{"id":"joe","name":"Joe","url":"http://127.0.0.1:3005"}]'
 PEERS_JOE='[{"id":"neo","name":"Neo","url":"http://127.0.0.1:3003"},{"id":"plato","name":"Plato","url":"http://127.0.0.1:3004"}]'
 
-LAIN_HOME="$NEO_HOME" PORT=3003 PEER_CONFIG="$PEERS_NEO" CHARACTER_PROVIDER=openai CHARACTER_MODEL="${CHARACTER_MODEL:-${OPENAI_MODEL:-MiniMax-M2.7}}" CHARACTER_BASE_URL="${CHARACTER_BASE_URL:-${OPENAI_BASE_URL:-http://192.168.68.69:8080/v1}}" node dist/index.js neo --port 3003 > "$LOG_DIR/neo.log" 2>&1 &
+LAIN_HOME="$NEO_HOME" PORT=3003 PEER_CONFIG="$PEERS_NEO" CHARACTER_PROVIDER=openai CHARACTER_MODEL="${CHARACTER_MODEL:-${OPENAI_MODEL:-MiniMax-M2.7}}" CHARACTER_BASE_URL="${CHARACTER_BASE_URL:-${OPENAI_BASE_URL:-http://192.168.68.69:8080/v1}}" node dist/scripts/run-service.js neo 3003 > "$LOG_DIR/neo.log" 2>&1 &
 NEO_PID=$!
 
-LAIN_HOME="$PLATO_HOME" PORT=3004 PEER_CONFIG="$PEERS_PLATO" CHARACTER_PROVIDER=openai CHARACTER_MODEL="${CHARACTER_MODEL:-${OPENAI_MODEL:-MiniMax-M2.7}}" CHARACTER_BASE_URL="${CHARACTER_BASE_URL:-${OPENAI_BASE_URL:-http://192.168.68.69:8080/v1}}" node dist/index.js plato --port 3004 > "$LOG_DIR/plato.log" 2>&1 &
+LAIN_HOME="$PLATO_HOME" PORT=3004 PEER_CONFIG="$PEERS_PLATO" CHARACTER_PROVIDER=openai CHARACTER_MODEL="${CHARACTER_MODEL:-${OPENAI_MODEL:-MiniMax-M2.7}}" CHARACTER_BASE_URL="${CHARACTER_BASE_URL:-${OPENAI_BASE_URL:-http://192.168.68.69:8080/v1}}" node dist/scripts/run-service.js plato 3004 > "$LOG_DIR/plato.log" 2>&1 &
 PLATO_PID=$!
 
-LAIN_HOME="$JOE_HOME" PORT=3005 PEER_CONFIG="$PEERS_JOE" CHARACTER_PROVIDER=openai CHARACTER_MODEL="${CHARACTER_MODEL:-${OPENAI_MODEL:-MiniMax-M2.7}}" CHARACTER_BASE_URL="${CHARACTER_BASE_URL:-${OPENAI_BASE_URL:-http://192.168.68.69:8080/v1}}" node dist/index.js joe --port 3005 > "$LOG_DIR/joe.log" 2>&1 &
+LAIN_HOME="$JOE_HOME" PORT=3005 PEER_CONFIG="$PEERS_JOE" CHARACTER_PROVIDER=openai CHARACTER_MODEL="${CHARACTER_MODEL:-${OPENAI_MODEL:-MiniMax-M2.7}}" CHARACTER_BASE_URL="${CHARACTER_BASE_URL:-${OPENAI_BASE_URL:-http://192.168.68.69:8080/v1}}" node dist/scripts/run-service.js joe 3005 > "$LOG_DIR/joe.log" 2>&1 &
 JOE_PID=$!
 
 echo "$WEB_PID $GATEWAY_PID $NEO_PID $PLATO_PID $JOE_PID" > "$PID_FILE"

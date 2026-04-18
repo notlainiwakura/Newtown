@@ -1,0 +1,33 @@
+[Unit]
+Description=Lain Hiru Character Server (Possessable)
+After=network.target lain-wired.service
+PartOf=lain.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/local-lain
+ExecStartPre=/bin/bash -c 'fuser -k 3006/tcp 2>/dev/null || true'
+ExecStartPre=/bin/bash -c 'mkdir -p /root/.lain-hiru/workspace && [ -d workspace/characters/hiru ] && cp -r workspace/characters/hiru/* /root/.lain-hiru/workspace/ || true'
+ExecStart=/usr/bin/node dist/index.js hiru --port 3006
+Restart=on-failure
+RestartSec=5
+
+Environment=NODE_ENV=production
+Environment=LAIN_HOME=/root/.lain-hiru
+Environment=CHARACTER_PROVIDER=anthropic
+Environment=CHARACTER_MODEL=claude-haiku-4-5-20251001
+Environment=CHARACTER_API_KEY_ENV=ANTHROPIC_API_KEY
+Environment=WIRED_LAIN_URL=http://localhost:3000
+Environment=PORT=3006
+EnvironmentFile=/opt/local-lain/.env
+EnvironmentFile=/opt/local-lain/deploy/env/lain-hiru.env
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lain-hiru
+
+[Install]
+WantedBy=lain.target

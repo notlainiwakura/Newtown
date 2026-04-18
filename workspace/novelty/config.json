@@ -1,0 +1,46 @@
+{
+  "enabled": true,
+  "ambient": {
+    "checkIntervalMs": 3600000,
+    "fireChance": 0.05,
+    "maxPerDayPerCharacter": 2,
+    "targetCount": [1, 2]
+  },
+  "major": {
+    "checkIntervalMs": 3600000,
+    "fireChance": 0.03,
+    "maxPerWeek": 2
+  },
+  "categoryDurations": {
+    "sound": 3600000,
+    "weather-glitch": 3600000,
+    "absence": 3600000,
+    "strange-signal": 14400000,
+    "wired-glitch": 14400000,
+    "dream-echo": 14400000,
+    "anomaly": 14400000,
+    "found-object": 86400000,
+    "note": 86400000,
+    "visitor-trace": 86400000,
+    "discussion-prompt": 86400000,
+    "major-default": 43200000
+  },
+  "peers": [
+    { "id": "lain", "name": "Lain", "url": "http://localhost:3001" },
+    { "id": "wired-lain", "name": "Wired Lain", "url": "http://localhost:3000" },
+    { "id": "dr-claude", "name": "Dr. Claude", "url": "http://localhost:3002" },
+    { "id": "pkd", "name": "Philip K. Dick", "url": "http://localhost:3003" },
+    { "id": "mckenna", "name": "Terence McKenna", "url": "http://localhost:3004" },
+    { "id": "john", "name": "John", "url": "http://localhost:3005" },
+    { "id": "hiru", "name": "Hiru", "url": "http://localhost:3006" }
+  ],
+  "sources": {
+    "refreshIntervalMs": 14400000,
+    "cacheSize": 20,
+    "weights": {
+      "rss": 0,
+      "wikipedia": 0,
+      "static": 1.0
+    }
+  }
+}

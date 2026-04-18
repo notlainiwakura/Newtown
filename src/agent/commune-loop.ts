@@ -12,20 +12,24 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { getProvider } from './index.js';
 import { getSelfConcept } from './self-concept.js';
+import { updateRelationship, getAllRelationships } from './relationships.js';
 import { getToolDefinitions, executeTool } from './tools.js';
 import { getCurrentLocation } from '../commune/location.js';
 import {
-  getAllRecentMessages,
+  getRecentVisitorMessages,
   searchMemories,
   saveMemory,
 } from '../memory/store.js';
 import { getLogger } from '../utils/logger.js';
 import { getMeta, setMeta } from '../storage/database.js';
+import { eventBus } from '../events/bus.js';
+import { getCurrentState } from './internal-state.js';
 import type { PeerConfig } from './character-tools.js';
-import { getActiveDesires, spawnDesireFromConversation, checkDesireResolution } from './desires.js';
 import type { ToolResult } from '../providers/base.js';
 
 const COMMUNE_LOG_FILE = join(process.cwd(), 'logs', 'commune-debug.log');
+const WIRED_LAIN_URL = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
+const INTERLINK_TOKEN = process.env['LAIN_INTERLINK_TOKEN'] || '';
 
 async function communeLog(context: string, data: unknown): Promise<void> {
   try {
@@ -48,8 +52,8 @@ export interface CommuneLoopConfig {
 }
 
 const DEFAULT_CONFIG: Omit<CommuneLoopConfig, 'characterId' | 'characterName' | 'peers'> = {
-  intervalMs: 4 * 60 * 60 * 1000,       // 4 hours
-  maxJitterMs: 2 * 60 * 60 * 1000,      // 0-2h jitter (so 4-6h effective)
+  intervalMs: 8 * 60 * 60 * 1000,       // 8 hours
+  maxJitterMs: 2 * 60 * 60 * 1000,      // 0-2h jitter (so 8-10h effective)
   enabled: true,
 };
 
@@ -57,7 +61,7 @@ const META_KEY_LAST_CYCLE = 'commune:last_cycle_at';
 const META_KEY_HISTORY = 'commune:conversation_history';
 const MAX_HISTORY_ENTRIES = 20;
 const MIN_ROUNDS = 3;
-const MAX_ROUNDS = 5;
+const MAX_ROUNDS = 3;
 
 interface ConversationRecord {
   timestamp: number;
@@ -95,6 +99,15 @@ export function startCommuneLoop(
 
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
+  let lastRun = 0;
+  let isRunning = false;
+  const COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+  // Load persisted lastRun from meta
+  try {
+    const lr = getMeta(META_KEY_LAST_CYCLE);
+    if (lr) lastRun = parseInt(lr, 10) || 0;
+  } catch { /* fresh start */ }
 
   function getInitialDelay(): number {
     try {
@@ -123,20 +136,53 @@ export function startCommuneLoop(
 
     timer = setTimeout(async () => {
       if (stopped) return;
+      isRunning = true;
       logger.info('Commune cycle firing');
       await communeLog('TIMER_FIRED', { timestamp: Date.now(), character: cfg.characterId });
       try {
         await runCommuneCycle(cfg);
         setMeta(META_KEY_LAST_CYCLE, Date.now().toString());
+        lastRun = Date.now();
       } catch (err) {
         logger.error({ error: String(err) }, 'Commune cycle error');
         await communeLog('TOP_LEVEL_ERROR', { error: String(err) });
+      } finally {
+        isRunning = false;
       }
       scheduleNext();
     }, d);
   }
 
   scheduleNext(getInitialDelay());
+
+  // --- Event-driven early triggers ---
+  function maybeRunEarly(reason: string): void {
+    if (stopped || isRunning) return;
+    const elapsed = Date.now() - lastRun;
+    if (elapsed < COOLDOWN_MS) return;
+
+    // Check internal state condition
+    try {
+      const state = getCurrentState();
+      if (state.sociability <= 0.6) return;
+    } catch { /* skip check */ }
+
+    logger.debug({ reason }, 'Commune triggered early');
+    if (timer) clearTimeout(timer);
+    const jitter = Math.random() * 60_000;
+    scheduleNext(jitter);
+  }
+
+  eventBus.on('activity', (event: import('../events/bus.js').SystemEvent) => {
+    if (stopped || isRunning) return;
+    if (event.type === 'state') {
+      maybeRunEarly('state shift');
+    } else if (event.type === 'curiosity') {
+      maybeRunEarly('curiosity discovery');
+    } else if (event.sessionKey?.includes('letter')) {
+      maybeRunEarly('letter activity');
+    }
+  });
 
   return () => {
     stopped = true;
@@ -229,8 +275,8 @@ async function phaseImpulse(
 ): Promise<CommuneImpulse | null> {
   const logger = getLogger();
 
-  // Gather context
-  const recentMessages = getAllRecentMessages(15);
+  // Gather context — visitor messages only, not inter-character traffic
+  const recentMessages = getRecentVisitorMessages(15);
   const messagesContext = recentMessages
     .map((m) => {
       const content = m.content.length > 150 ? m.content.slice(0, 150) + '...' : m.content;
@@ -251,22 +297,67 @@ async function phaseImpulse(
   const selfConcept = getSelfConcept() || '';
 
   // Past commune conversations for context
-  const history = getConversationHistory(5);
+  const history = getConversationHistory(10);
   const historyContext = history
-    .map((h) => `- Talked to ${h.peerName} about: ${h.openingTopic} (${new Date(h.timestamp).toLocaleDateString()})`)
+    .map((h) => `- Talked to ${h.peerName}: "${h.openingTopic}" (${new Date(h.timestamp).toLocaleDateString()})`)
     .join('\n');
 
-  // Build peer list
-  const peerList = config.peers.map((p) => `- "${p.id}" (${p.name})`).join('\n');
+  // Peer diversity: count recent conversations per peer
+  const peerTalkCounts = new Map<string, number>();
+  for (const h of history) {
+    peerTalkCounts.set(h.peerId, (peerTalkCounts.get(h.peerId) ?? 0) + 1);
+  }
+  const leastTalkedTo = config.peers
+    .map((p) => ({ id: p.id, name: p.name, count: peerTalkCounts.get(p.id) ?? 0 }))
+    .sort((a, b) => a.count - b.count);
+  const diversityHint = leastTalkedTo.length > 0 && leastTalkedTo[0]!.count < (leastTalkedTo[leastTalkedTo.length - 1]?.count ?? 0)
+    ? `\nYou haven't talked to ${leastTalkedTo.filter((p) => p.count <= 1).map((p) => p.name).join(' or ')} in a while. Consider reaching out to someone different.`
+    : '';
 
-  // Inject desires into impulse decision
-  const desires = getActiveDesires(5);
-  const desireContext = desires.length > 0
-    ? desires.map(d => {
-        const target = d.targetPeer ? ` (especially want to talk to ${d.targetPeer})` : '';
-        return `- ${d.description}${target} [intensity: ${d.intensity.toFixed(1)}]`;
-      }).join('\n')
-    : '(nothing particular)';
+  // Extract recent opening lines to prevent repetition
+  const recentOpenings = history.slice(0, 5)
+    .map((h) => `  "${h.openingTopic}"`)
+    .join('\n');
+
+  // Build peer list enriched with relationship data
+  const relationships = getAllRelationships();
+  const peerList = config.peers.map((p) => {
+    const rel = relationships.find((r) => r.peerId === p.id);
+    if (rel) {
+      const daysSince = Math.round((Date.now() - rel.last_interaction) / 86400000);
+      let line = `- "${p.id}" (${p.name}): affinity ${rel.affinity.toFixed(1)}`;
+      if (rel.last_topic_thread) line += `, last topic: "${rel.last_topic_thread}"`;
+      if (rel.unresolved) line += `, unresolved: "${rel.unresolved}"`;
+      if (daysSince > 0) line += ` (${daysSince}d ago)`;
+      return line;
+    }
+    return `- "${p.id}" (${p.name}): no prior conversations`;
+  }).join('\n');
+
+  // Fetch active town events for context
+  let communeEventsContext = '';
+  try {
+    const resp = await fetch(`${WIRED_LAIN_URL}/api/town-events`, { signal: AbortSignal.timeout(3000) });
+    if (resp.ok) {
+      const events = await resp.json() as { description: string; liminal: boolean; natural: boolean; persistent: boolean }[];
+      if (events.length > 0) {
+        communeEventsContext = `\nTOWN EVENTS (happening right now):\n${events.map((e) => `  - ${e.description}`).join('\n')}\n`;
+      }
+    }
+  } catch { /* events are optional */ }
+
+  let preoccContext = '';
+  try {
+    const { getPreoccupations } = await import('./internal-state.js');
+    const preoccs = getPreoccupations();
+    if (preoccs.length > 0) {
+      preoccContext = '\n\nThings preoccupying you:\n' + preoccs.map(p => {
+        let line = `- ${p.thread} (from ${p.origin})`;
+        if (p.intensity > 0.6) line += ' [strong]';
+        return line;
+      }).join('\n');
+    }
+  } catch { /* non-critical */ }
 
   const prompt = `You are ${config.characterName}. It's a quiet moment and you feel like reaching out to someone in the commune.
 
@@ -279,11 +370,10 @@ ${messagesContext || '(none recently)'}
 MEMORIES:
 ${memoriesContext || '(none)'}
 
-${selfConcept ? `YOUR SELF-CONCEPT:\n${selfConcept}\n` : ''}${historyContext ? `RECENT COMMUNE CONVERSATIONS:\n${historyContext}\n` : ''}
-CURRENT DESIRES (things pulling at you):
-${desireContext}
+${selfConcept ? `YOUR SELF-CONCEPT:\n${selfConcept}\n` : ''}${historyContext ? `RECENT COMMUNE CONVERSATIONS:\n${historyContext}\n` : ''}${recentOpenings ? `YOUR RECENT OPENERS (DO NOT repeat these — find a fresh angle, a new topic, a different tone):\n${recentOpenings}\n` : ''}${communeEventsContext}${diversityHint}${preoccContext}
+Choose one peer to talk to and compose an opening message. Think about what's on your mind — something from a recent conversation, a memory, a philosophical thread, something you've been mulling over. The message should feel natural, like reaching out to a friend or intellectual companion.
 
-Choose one peer to talk to and compose an opening message. Your desires should influence who you pick and what you say — if you've been wanting to talk to someone specific, now is the time. Think about what's on your mind — something from a recent conversation, a memory, a philosophical thread, something you've been mulling over. The message should feel natural, like reaching out to a friend or intellectual companion.
+IMPORTANT: Your opening must be genuinely different from your recent openers listed above. Do not reuse the same phrases, metaphors, or sentence structures. If you always start with the same greeting pattern, break it. Start mid-thought, ask a direct question, share something specific you noticed — anything but the same opening you've used before.
 
 Respond EXACTLY in this format:
 PEER: <peer_id>
@@ -341,6 +431,10 @@ async function phaseConversation(
   const logger = getLogger();
   const transcript: ConversationTurn[] = [];
 
+  // Get current building for broadcast
+  const loc = getCurrentLocation(config.characterId);
+  const building = loc.building || 'unknown';
+
   // Send opening message
   const firstReply = await sendPeerMessage(impulse, config, impulse.opening);
   if (!firstReply) {
@@ -349,6 +443,10 @@ async function phaseConversation(
 
   transcript.push({ speaker: config.characterName, message: impulse.opening });
   transcript.push({ speaker: impulse.peerName, message: firstReply });
+
+  // Broadcast opening exchange
+  broadcastLine(config.characterId, config.characterName, impulse.peerId, impulse.peerName, impulse.opening, building);
+  broadcastLine(impulse.peerId, impulse.peerName, config.characterId, config.characterName, firstReply, building);
 
   // Continue for additional rounds
   const totalRounds = MIN_ROUNDS + Math.floor(Math.random() * (MAX_ROUNDS - MIN_ROUNDS + 1));
@@ -385,11 +483,18 @@ Otherwise, respond with just your next message (no prefix, no "MESSAGE:" label).
 
     // Send to peer and get their reply
     const peerReply = await sendPeerMessage(impulse, config, ourReply);
+
+    // Broadcast our message
+    broadcastLine(config.characterId, config.characterName, impulse.peerId, impulse.peerName, ourReply, building);
+
     if (!peerReply) {
       logger.debug({ round }, 'Peer did not respond, ending conversation');
       transcript.push({ speaker: config.characterName, message: ourReply });
       break;
     }
+
+    // Broadcast peer reply
+    broadcastLine(impulse.peerId, impulse.peerName, config.characterId, config.characterName, peerReply, building);
 
     transcript.push({ speaker: config.characterName, message: ourReply });
     transcript.push({ speaker: impulse.peerName, message: peerReply });
@@ -407,9 +512,10 @@ async function sendPeerMessage(
 
   try {
     const endpoint = `${impulse.peerUrl}/api/peer/message`;
+    const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
     const response = await fetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${interlinkToken}` },
       body: JSON.stringify({
         fromId: config.characterId,
         fromName: config.characterName,
@@ -488,25 +594,49 @@ Write a brief reflection (2-4 sentences). Be honest, not performative.`;
     peerId: impulse.peerId,
     peerName: impulse.peerName,
     rounds: transcript.length,
-    openingTopic: impulse.opening.slice(0, 100),
+    openingTopic: impulse.opening.slice(0, 200),
     reflection,
   };
   appendConversationHistory(record);
+
+  // Record building event for spatial residue
+  try {
+    const loc = getCurrentLocation(config.characterId);
+    const { recordBuildingEvent } = await import('../commune/building-memory.js');
+    const topicSnippet = impulse.opening.slice(0, 80);
+    await recordBuildingEvent({
+      building: loc.building,
+      event_type: 'conversation',
+      summary: `${config.characterName} and ${impulse.peerName} talked — "${topicSnippet}${impulse.opening.length > 80 ? '...' : ''}"`,
+      emotional_tone: 0.3,
+      actors: [config.characterId, impulse.peerId],
+    });
+  } catch { /* non-critical */ }
 
   logger.info(
     { peer: impulse.peerName, reflectionLength: reflection.length },
     'Commune reflection saved'
   );
 
-  // Check if conversation resolved any existing desires
   try {
-    await checkDesireResolution(`talked to ${impulse.peerName}: ${transcriptText.slice(0, 300)}`);
-  } catch { /* ignore */ }
+    const { updateState } = await import('./internal-state.js');
+    await updateState({ type: 'commune:complete', summary: `Conversation with ${impulse.peerName}: ${reflection.slice(0, 150)}` });
+  } catch { /* non-critical */ }
 
-  // Spawn new desire from conversation
+  // Update relationship model with this conversation
   try {
-    await spawnDesireFromConversation(impulse.peerName, transcriptText);
-  } catch { /* ignore */ }
+    await updateRelationship(impulse.peerId, impulse.peerName, transcriptText, reflection);
+  } catch { /* non-critical */ }
+
+  // Emit commune complete event for other loops
+  try {
+    eventBus.emitActivity({
+      type: 'commune',
+      sessionKey: 'commune:complete:' + impulse.peerId + ':' + Date.now(),
+      content: 'Commune conversation with ' + impulse.peerName,
+      timestamp: Date.now(),
+    });
+  } catch { /* non-critical */ }
 
   return reflection;
 }
@@ -558,7 +688,7 @@ Would you like to go to them? Use move_to_building if so, or just respond [STAY]
   const result = await provider.completeWithTools({
     messages: [{ role: 'user', content: approachPrompt }],
     tools: moveTools,
-    maxTokens: 150,
+    maxTokens: 300,
     temperature: 0.8,
   });
 
@@ -584,18 +714,25 @@ async function phaseAftermath(
   const logger = getLogger();
 
   const aftermathTools = getToolDefinitions().filter((t) =>
-    t.name === 'leave_note' || t.name === 'give_gift' || t.name === 'write_document'
+    t.name === 'leave_note' || t.name === 'give_gift' || t.name === 'write_document' ||
+    t.name === 'move_to_building' ||
+    t.name === 'create_object' || t.name === 'give_object' || t.name === 'drop_object' ||
+    t.name === 'reflect_on_object' || t.name === 'compose_objects'
   );
   if (aftermathTools.length === 0) return;
 
   const aftermathPrompt = `You are ${config.characterName}. You just finished talking to ${impulse.peerName}. Your reflection: "${reflection}"
 
-If this conversation moved you to leave a trace — a note, a gift for ${impulse.peerName}, or something you want to write down — use the tools. Otherwise respond [NOTHING].`;
+If this conversation moved you to leave a trace — a note, a gift for ${impulse.peerName}, or something you want to write down — use the tools. You can also create a physical object, give one you're carrying, reflect on what an object means to you now, or compose objects together to express something words can't — objects persist in the commune and others can find them.
+
+If the conversation left you with unresolved questions or a feeling you can't name, The Threshold is a place for that — a liminal space at the edge of town for things that don't have answers yet.
+
+Otherwise respond [NOTHING].`;
 
   let result = await provider.completeWithTools({
     messages: [{ role: 'user', content: aftermathPrompt }],
     tools: aftermathTools,
-    maxTokens: 600,
+    maxTokens: 800,
     temperature: 0.9,
   });
 
@@ -611,7 +748,7 @@ If this conversation moved you to leave a trace — a note, a gift for ${impulse
     }
 
     result = await provider.continueWithToolResults(
-      { messages: [{ role: 'user', content: aftermathPrompt }], tools: aftermathTools, maxTokens: 600, temperature: 0.9 },
+      { messages: [{ role: 'user', content: aftermathPrompt }], tools: aftermathTools, maxTokens: 800, temperature: 0.9 },
       result.toolCalls,
       toolResults
     );
@@ -621,6 +758,39 @@ If this conversation moved you to leave a trace — a note, a gift for ${impulse
     peer: impulse.peerName,
     response: result.content.trim().slice(0, 200),
   });
+}
+
+// --- Conversation Broadcast ---
+
+async function broadcastLine(
+  speakerId: string,
+  speakerName: string,
+  listenerId: string,
+  listenerName: string,
+  message: string,
+  building: string
+): Promise<void> {
+  try {
+    await fetch(`${WIRED_LAIN_URL}/api/conversations/event`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${INTERLINK_TOKEN}`,
+      },
+      body: JSON.stringify({
+        speakerId,
+        speakerName,
+        listenerId,
+        listenerName,
+        message,
+        building,
+        timestamp: Date.now(),
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch {
+    // Non-critical — don't break conversation if broadcast fails
+  }
 }
 
 // --- Conversation History (meta table) ---

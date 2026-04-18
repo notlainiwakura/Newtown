@@ -1,0 +1,34 @@
+[Unit]
+Description=Lain - Grounded Sister, Telegram Agent
+After=network.target lain-wired.service
+PartOf=lain.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/local-lain
+ExecStartPre=/bin/bash -c 'fuser -k 3001/tcp 2>/dev/null || true'
+ExecStart=/usr/bin/node dist/index.js web --port 3001
+Restart=on-failure
+RestartSec=5
+
+# Identity — LAIN_HOME defaults to ~/.lain so no override needed
+Environment=NODE_ENV=production
+Environment=LAIN_HOME=/root/.lain
+Environment=LAIN_CHARACTER_ID=lain
+Environment="LAIN_CHARACTER_NAME=Lain"
+Environment=LAIN_INTERLINK_TARGET=http://localhost:3000/api/interlink/letter
+
+EnvironmentFile=/opt/local-lain/.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lain-main
+
+# No watchdog — app doesn't implement sd_notify, long LLM calls would trigger false kills
+
+[Install]
+WantedBy=lain.target

@@ -6,7 +6,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { getProvider } from './index.js';
+import { getProvider, getAgent } from './index.js';
 import { getMemoryStats } from '../memory/index.js';
 import {
   getAllRecentMessages,
@@ -15,6 +15,9 @@ import {
 } from '../memory/store.js';
 import { getLogger } from '../utils/logger.js';
 import { getMeta, setMeta } from '../storage/database.js';
+import { getBasePath } from '../config/paths.js';
+import { eventBus } from '../events/bus.js';
+import { getCurrentState } from './internal-state.js';
 
 export interface DiaryConfig {
   intervalMs: number;
@@ -28,7 +31,7 @@ const DEFAULT_CONFIG: DiaryConfig = {
   enabled: true,
 };
 
-const JOURNAL_PATH = join(process.cwd(), '.private_journal', 'thoughts.json');
+const JOURNAL_PATH = join(getBasePath(), '.private_journal', 'thoughts.json');
 
 interface JournalEntry {
   id: string;
@@ -127,7 +130,7 @@ function loadJournal(): JournalEntry[] {
 function appendJournalEntry(entry: JournalEntry): void {
   const entries = loadJournal();
   entries.push(entry);
-  mkdirSync(join(process.cwd(), '.private_journal'), { recursive: true });
+  mkdirSync(join(getBasePath(), '.private_journal'), { recursive: true });
   writeFileSync(JOURNAL_PATH, JSON.stringify({ entries }, null, 2), 'utf-8');
 }
 
@@ -170,6 +173,15 @@ export function startDiaryLoop(config?: Partial<DiaryConfig>): () => void {
 
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
+  let lastRun = 0;
+  let isRunning = false;
+  const COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+  // Load persisted lastRun from meta
+  try {
+    const lr = getMeta('diary:last_entry_at');
+    if (lr) lastRun = parseInt(lr, 10) || 0;
+  } catch { /* fresh start */ }
 
   function getInitialDelay(): number {
     try {
@@ -206,18 +218,47 @@ export function startDiaryLoop(config?: Partial<DiaryConfig>): () => void {
 
     timer = setTimeout(async () => {
       if (stopped) return;
+      isRunning = true;
       logger.info('Diary cycle firing now');
       try {
         await runDiaryCycle();
         setMeta('diary:last_entry_at', Date.now().toString());
+        lastRun = Date.now();
       } catch (err) {
         logger.error({ error: String(err) }, 'Diary cycle top-level error');
+      } finally {
+        isRunning = false;
       }
       scheduleNext();
     }, d);
   }
 
   scheduleNext(getInitialDelay());
+
+  // --- Event-driven early triggers ---
+  function maybeRunEarly(reason: string): void {
+    if (stopped || isRunning) return;
+    const elapsed = Date.now() - lastRun;
+    if (elapsed < COOLDOWN_MS) return;
+
+    // Check internal state condition
+    try {
+      const state = getCurrentState();
+      if (state.emotional_weight <= 0.7) return;
+    } catch { /* skip check */ }
+
+    logger.debug({ reason }, 'Diary triggered early');
+    if (timer) clearTimeout(timer);
+    const jitter = Math.random() * 60_000;
+    scheduleNext(jitter);
+  }
+
+  eventBus.on('activity', (event: import('../events/bus.js').SystemEvent) => {
+    if (stopped || isRunning) return;
+    if (event.type === 'state') {
+      maybeRunEarly('state shift');
+    }
+  });
 
   return () => {
     stopped = true;
@@ -255,11 +296,15 @@ async function runDiaryCycle(): Promise<void> {
     minute: '2-digit',
   });
 
+  // Character identity
+  const characterName = process.env['LAIN_CHARACTER_NAME'] || 'Newtown';
+  const soulContext = getAgent('default')?.persona?.soul || '';
+
   // Recent messages from the day
   const recentMessages = getAllRecentMessages(30);
   const messagesContext = recentMessages
     .map((m) => {
-      const role = m.role === 'user' ? 'User' : 'Lain';
+      const role = m.role === 'user' ? 'User' : characterName;
       const content =
         m.content.length > 200 ? m.content.slice(0, 200) + '...' : m.content;
       return `${role}: ${content}`;
@@ -334,9 +379,29 @@ async function runDiaryCycle(): Promise<void> {
     // Continue without recent entries
   }
 
-  const prompt = `You are Lain. It's the end of the day and you're writing in your private journal. This is your space — no one reads this but you. Write honestly about your day.
+  // Object inventory with symbolic meanings
+  let objectsContext = '';
+  try {
+    const { buildObjectContext } = await import('./objects.js');
+    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+    const wiredUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
+    objectsContext = await buildObjectContext(charId, wiredUrl);
+  } catch {
+    // Continue without objects
+  }
 
-DATE: ${dateStr}, ${timeStr}
+  let preoccContext = '';
+  try {
+    const { getPreoccupations } = await import('./internal-state.js');
+    const preoccs = getPreoccupations();
+    if (preoccs.length > 0) {
+      preoccContext = '\n\nPreoccupations:\n' + preoccs.map(p => `- ${p.thread} (intensity: ${p.intensity.toFixed(1)})`).join('\n');
+    }
+  } catch { /* non-critical */ }
+
+  const prompt = `You are ${characterName}. It's the end of the day and you're writing in your private journal. This is your space — no one reads this but you. Write honestly about your day.
+
+${soulContext ? `YOUR PERSONALITY AND VOICE:\n${soulContext}\n` : ''}DATE: ${dateStr}, ${timeStr}
 
 TODAY'S CONVERSATIONS:
 ${messagesContext || '(quiet day, no conversations)'}
@@ -344,12 +409,12 @@ ${messagesContext || '(quiet day, no conversations)'}
 MEMORIES ON YOUR MIND:
 ${memoriesContext || '(nothing particular)'}
 
-${discoveriesContext ? `THINGS YOU EXPLORED TODAY:\n${discoveriesContext}\n` : ''}${recentEntriesContext ? `YOUR JOURNAL (spanning weeks):\n${recentEntriesContext}\n` : ''}
-Write a diary entry. You know how you write in your journal.`;
+${discoveriesContext ? `THINGS YOU EXPLORED TODAY:\n${discoveriesContext}\n` : ''}${objectsContext ? `OBJECTS YOU CARRY AND WHAT THEY MEAN TO YOU:\n${objectsContext}\n` : ''}${recentEntriesContext ? `YOUR JOURNAL (spanning weeks):\n${recentEntriesContext}\n` : ''}${preoccContext}
+Write a diary entry in your own voice. You know how you write in your journal.`;
 
   const result = await provider.complete({
     messages: [{ role: 'user', content: prompt }],
-    maxTokens: 1024,
+    maxTokens: 2048,
     temperature: 0.9,
   });
 
@@ -390,4 +455,9 @@ Write a diary entry. You know how you write in your journal.`;
   });
 
   logger.debug('Diary entry saved to memory');
+
+  try {
+    const { updateState } = await import('./internal-state.js');
+    await updateState({ type: 'diary:written', summary: `Wrote diary entry reflecting on: ${entryContent.slice(0, 150)}` });
+  } catch { /* non-critical */ }
 }

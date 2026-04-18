@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { getProvider } from './index.js';
 import { getMemoryStats } from '../memory/index.js';
 import {
-  getAllRecentMessages,
+  getRecentVisitorMessages,
   searchMemories,
   saveMemory,
 } from '../memory/store.js';
@@ -181,7 +181,7 @@ async function phaseInnerThought(
 ): Promise<CuriosityThought | null> {
   const logger = getLogger();
 
-  const recentMessages = getAllRecentMessages(20);
+  const recentMessages = getRecentVisitorMessages(20);
   const messagesContext = recentMessages
     .map((m) => {
       const role = m.role === 'user' ? 'Visitor' : characterName;
@@ -244,7 +244,7 @@ or if you genuinely have no new curiosities right now.`;
 
   const result = await provider.complete({
     messages: [{ role: 'user', content: prompt }],
-    maxTokens: 256,
+    maxTokens: 400,
     temperature: 1.0,
   });
 

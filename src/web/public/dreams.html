@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DREAMS — LAINTOWN</title>
+  <script src="/skins/early-load.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-deep: #05050a;
+      --bg-surface: #0a0a14;
+      --text-primary: #a0b0c0;
+      --text-dim: #3a4a5a;
+      --text-muted: #334;
+      --border-glow: #1a2a3a;
+      --accent-primary: #4a9eff;
+      --accent-cyan: #40e0ff;
+      --accent-amber: #e0a040;
+      --accent-green: #40e080;
+      --accent-purple: #b464ff;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg-deep);
+      color: var(--text-primary);
+      font-family: 'Share Tech Mono', monospace;
+      min-height: 100vh;
+      padding-top: 32px;
+      padding-bottom: 28px;
+    }
+
+    .header {
+      border-bottom: 2px solid var(--border-glow);
+      padding: 24px 40px 16px;
+      display: flex;
+      align-items: baseline;
+      gap: 24px;
+    }
+    .header h1 {
+      font-size: 28px;
+      letter-spacing: 6px;
+      color: var(--accent-primary);
+      text-transform: uppercase;
+    }
+    .header .subtitle {
+      font-size: 11px;
+      color: var(--text-muted);
+      letter-spacing: 2px;
+    }
+
+    .section {
+      max-width: 960px;
+      margin: 24px auto;
+      padding: 0 40px;
+    }
+    .section-title {
+      font-size: 12px;
+      letter-spacing: 3px;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      margin-bottom: 12px;
+    }
+
+    /* Upload section */
+    .upload-box {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-glow);
+      padding: 20px;
+    }
+    .mode-tabs {
+      display: flex;
+      gap: 0;
+      margin-bottom: 16px;
+    }
+    .mode-tab {
+      background: transparent;
+      border: 1px solid var(--border-glow);
+      color: var(--text-dim);
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 11px;
+      padding: 6px 18px;
+      letter-spacing: 1.5px;
+      cursor: pointer;
+      text-transform: uppercase;
+      transition: all .15s;
+    }
+    .mode-tab:first-child { border-radius: 2px 0 0 2px; }
+    .mode-tab:last-child { border-radius: 0 2px 2px 0; }
+    .mode-tab + .mode-tab { border-left: none; }
+    .mode-tab.active {
+      background: rgba(74, 158, 255, 0.1);
+      border-color: var(--accent-primary);
+      color: var(--accent-primary);
+    }
+
+    .drop-zone {
+      border: 2px dashed var(--border-glow);
+      padding: 32px;
+      text-align: center;
+      cursor: pointer;
+      transition: all .2s;
+      color: var(--text-dim);
+      font-size: 12px;
+      letter-spacing: 1px;
+    }
+    .drop-zone.dragover {
+      border-color: var(--accent-primary);
+      background: rgba(74, 158, 255, 0.03);
+      box-shadow: 0 0 20px rgba(74, 158, 255, 0.05);
+    }
+    .drop-zone .drop-label { pointer-events: none; }
+    .drop-zone input[type="file"] { display: none; }
+
+    .paste-area {
+      width: 100%;
+      min-height: 120px;
+      background: transparent;
+      border: 1px solid var(--border-glow);
+      color: var(--text-primary);
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 12px;
+      padding: 12px;
+      resize: vertical;
+      outline: none;
+    }
+    .paste-area:focus { border-color: var(--accent-primary); }
+    .paste-area::placeholder { color: var(--text-dim); }
+
+    .hidden { display: none !important; }
+
+    /* Fragment preview */
+    .preview-box {
+      margin-top: 16px;
+      padding: 12px;
+      border: 1px solid var(--border-glow);
+      background: rgba(74, 158, 255, 0.02);
+      font-size: 11px;
+    }
+    .preview-box .frag-count {
+      color: var(--accent-primary);
+      letter-spacing: 1px;
+    }
+    .preview-box .frag-sample {
+      color: var(--text-dim);
+      margin-top: 6px;
+      line-height: 1.5;
+    }
+
+    /* Character targets */
+    .targets {
+      margin-top: 16px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0;
+    }
+    .target-btn {
+      background: transparent;
+      border: 1px solid var(--border-glow);
+      color: var(--text-dim);
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 11px;
+      padding: 5px 12px;
+      letter-spacing: 1px;
+      cursor: pointer;
+      text-transform: uppercase;
+      transition: all .15s;
+    }
+    .target-btn + .target-btn { border-left: none; }
+    .target-btn:first-child { border-radius: 2px 0 0 2px; }
+    .target-btn:last-child { border-radius: 0 2px 2px 0; }
+    .target-btn.active {
+      background: rgba(74, 158, 255, 0.1);
+      border-color: var(--accent-primary);
+      color: var(--accent-primary);
+    }
+
+    /* Action row */
+    .action-row {
+      margin-top: 16px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .btn {
+      background: transparent;
+      border: 1px solid var(--border-glow);
+      color: var(--accent-primary);
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 12px;
+      padding: 8px 24px;
+      letter-spacing: 2px;
+      cursor: pointer;
+      text-transform: uppercase;
+      transition: all .15s;
+    }
+    .btn:hover {
+      border-color: var(--accent-primary);
+      background: rgba(74, 158, 255, 0.05);
+    }
+    .btn:disabled {
+      opacity: 0.3;
+      cursor: default;
+    }
+    .status-text {
+      font-size: 11px;
+      letter-spacing: 1px;
+      transition: opacity .3s;
+    }
+
+    /* Progress bar */
+    .progress-bar {
+      width: 100%;
+      height: 3px;
+      background: var(--border-glow);
+      margin-top: 12px;
+      border-radius: 1px;
+      overflow: hidden;
+    }
+    .progress-bar .fill {
+      height: 100%;
+      background: var(--accent-primary);
+      width: 0%;
+      transition: width .2s;
+    }
+
+    /* Stats cards */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+      gap: 10px;
+    }
+    .stat-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-glow);
+      padding: 14px;
+      text-align: center;
+      transition: border-color .3s;
+    }
+    .stat-card.recent { border-color: rgba(74, 158, 255, 0.3); animation: pulse-border 3s ease-in-out infinite; }
+    .stat-card.total-card { border-color: var(--accent-primary); }
+    .stat-card .char-name {
+      font-size: 10px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+    .stat-card .stat-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      margin-bottom: 3px;
+    }
+    .stat-card .stat-label { color: var(--text-dim); }
+    .stat-card .stat-val { color: var(--text-primary); }
+    .stat-card .stat-val.pending { color: var(--accent-amber); }
+    .stat-card .stat-val.consumed { color: var(--accent-green); }
+    .stat-card .last-cycle {
+      font-size: 10px;
+      color: var(--text-dim);
+      margin-top: 6px;
+      border-top: 1px solid var(--border-glow);
+      padding-top: 6px;
+    }
+
+    @keyframes pulse-border {
+      0%, 100% { border-color: rgba(74, 158, 255, 0.15); }
+      50% { border-color: rgba(74, 158, 255, 0.4); }
+    }
+
+    /* Seed feed */
+    .feed-list { display: flex; flex-direction: column; gap: 6px; }
+    .seed-entry {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-glow);
+      padding: 10px 14px;
+      cursor: pointer;
+      transition: all .15s;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .seed-entry:hover { border-color: rgba(74, 158, 255, 0.3); }
+    .seed-entry .seed-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 11px;
+    }
+    .seed-entry .char-tag {
+      font-size: 10px;
+      letter-spacing: 1px;
+      padding: 2px 8px;
+      border-radius: 2px;
+      text-transform: uppercase;
+    }
+    .seed-entry .status-badge {
+      font-size: 10px;
+      letter-spacing: 1px;
+      padding: 1px 6px;
+      border-radius: 2px;
+    }
+    .status-badge.pending { background: rgba(224, 160, 64, 0.12); color: var(--accent-amber); }
+    .status-badge.consumed { background: rgba(64, 224, 128, 0.12); color: var(--accent-green); }
+    .seed-entry .seed-time {
+      font-size: 10px;
+      color: var(--text-dim);
+      margin-left: auto;
+    }
+    .seed-entry .seed-preview {
+      font-size: 11px;
+      color: var(--text-dim);
+      line-height: 1.4;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .seed-entry.expanded .seed-preview {
+      white-space: normal;
+      overflow: visible;
+    }
+    .load-more-row {
+      text-align: center;
+      margin-top: 12px;
+    }
+
+    /* Character colors */
+    .char-neo { border-left: 3px solid var(--color-neo); }
+    .char-plato { border-left: 3px solid var(--color-plato); }
+    .char-joe { border-left: 3px solid var(--color-joe); }
+
+    .tag-neo { background: color-mix(in srgb, var(--color-neo) 12%, transparent); color: var(--color-neo); }
+    .tag-plato { background: color-mix(in srgb, var(--color-plato) 12%, transparent); color: var(--color-plato); }
+    .tag-joe { background: color-mix(in srgb, var(--color-joe) 12%, transparent); color: var(--color-joe); }
+
+    @media (max-width: 600px) {
+      .header { padding: 16px 16px 12px; gap: 12px; }
+      .header h1 { font-size: 22px; letter-spacing: 4px; }
+      .section { padding: 0 16px; }
+      .stats-grid { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Dreams</h1>
+  <span class="subtitle">subconscious seeding interface</span>
+</div>
+
+<!-- Section 1: Upload -->
+<div class="section">
+  <div class="section-title">Seed Material</div>
+  <div class="upload-box">
+    <div class="mode-tabs">
+      <button class="mode-tab active" data-mode="file">File Upload</button>
+      <button class="mode-tab" data-mode="paste">Text Paste</button>
+    </div>
+
+    <div id="file-mode">
+      <div class="drop-zone" id="drop-zone">
+        <span class="drop-label">Drop .txt or .rtf here — or click to browse</span>
+        <input type="file" id="file-input" accept=".txt,.rtf">
+      </div>
+    </div>
+
+    <div id="paste-mode" class="hidden">
+      <textarea class="paste-area" id="paste-area" placeholder="Paste text content here..."></textarea>
+    </div>
+
+    <div id="preview-box" class="preview-box hidden">
+      <div class="frag-count" id="frag-count"></div>
+      <div class="frag-sample" id="frag-first"></div>
+      <div class="frag-sample" id="frag-last"></div>
+    </div>
+
+    <div class="targets" id="targets"></div>
+
+    <div class="action-row">
+      <button class="btn" id="seed-btn" disabled>Seed</button>
+      <span class="status-text" id="seed-status"></span>
+    </div>
+    <div class="progress-bar hidden" id="progress-bar"><div class="fill" id="progress-fill"></div></div>
+  </div>
+</div>
+
+<!-- Section 2: Stats -->
+<div class="section">
+  <div class="section-title">Dream Status</div>
+  <div class="stats-grid" id="stats-grid"></div>
+</div>
+
+<!-- Section 3: Seed Feed -->
+<div class="section">
+  <div class="section-title">Seed Feed</div>
+  <div class="feed-list" id="feed-list"></div>
+  <div class="load-more-row">
+    <button class="btn hidden" id="load-more-btn">Load More</button>
+  </div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  // --- Auth ---
+  var IS_OWNER = document.querySelector('meta[name="lain-owner"]')?.content === 'true';
+
+  function authHeaders() {
+    return { 'Content-Type': 'application/json' };
+  }
+
+  // Hide seed upload form for non-owners
+  if (!IS_OWNER) {
+    var uploadBox = document.querySelector('.upload-box');
+    if (uploadBox) uploadBox.style.display = 'none';
+  }
+
+  // --- Characters ---
+  var CHARACTERS = [
+    { id: 'neo', name: 'Neo', path: '/neo/api/interlink/dream-seed' },
+    { id: 'plato', name: 'Plato', path: '/plato/api/interlink/dream-seed' },
+    { id: 'joe', name: 'Joe', path: '/joe/api/interlink/dream-seed' },
+  ];
+
+  // --- Fragment splitting ---
+  function stripRtf(text) {
+    return text
+      .replace(/\{\\rtf1[\s\S]*?\\viewkind\d*\s*/i, '')
+      .replace(/\{\\[^{}]*\}/g, '')
+      .replace(/\\[a-z]+\d*\s?/gi, '')
+      .replace(/[{}]/g, '')
+      .replace(/\r\n/g, '\n')
+      .trim();
+  }
+
+  function splitFragments(text) {
+    var paragraphs = text.split(/\n\s*\n/).map(function(p) { return p.trim(); }).filter(Boolean);
+    var fragments = [];
+    var current = '';
+
+    for (var i = 0; i < paragraphs.length; i++) {
+      var para = paragraphs[i];
+      if (para.length > 1900) {
+        // Flush current
+        if (current.trim()) { fragments.push(current.trim()); current = ''; }
+        // Split at sentence boundaries
+        var sentences = para.match(/[^.!?]+[.!?]+\s*/g) || [para];
+        var chunk = '';
+        for (var j = 0; j < sentences.length; j++) {
+          if ((chunk + sentences[j]).length > 1900 && chunk.length >= 400) {
+            fragments.push(chunk.trim());
+            chunk = '';
+          }
+          chunk += sentences[j];
+        }
+        if (chunk.trim()) { current = chunk; }
+      } else if ((current + '\n\n' + para).length > 1900 && current.length >= 400) {
+        fragments.push(current.trim());
+        current = para;
+      } else {
+        current = current ? current + '\n\n' + para : para;
+      }
+    }
+    if (current.trim()) fragments.push(current.trim());
+
+    // Filter: discard < 10 chars
+    return fragments.filter(function(f) { return f.length >= 10; });
+  }
+
+  function truncate(str, n) {
+    return str.length > n ? str.slice(0, n) + '...' : str;
+  }
+
+  // --- State ---
+  var fragments = [];
+  var selectedTargets = {};
+  var feedOffset = 0;
+  var feedTotal = 0;
+
+  // Init target checkboxes
+  var targetsEl = document.getElementById('targets');
+  var allBtn = document.createElement('button');
+  allBtn.className = 'target-btn active';
+  allBtn.textContent = 'ALL';
+  allBtn.dataset.id = 'all';
+  targetsEl.appendChild(allBtn);
+  CHARACTERS.forEach(function(c) {
+    selectedTargets[c.id] = true;
+    var btn = document.createElement('button');
+    btn.className = 'target-btn active';
+    btn.textContent = c.name.toUpperCase();
+    btn.dataset.id = c.id;
+    targetsEl.appendChild(btn);
+  });
+
+  targetsEl.addEventListener('click', function(e) {
+    var btn = e.target.closest('.target-btn');
+    if (!btn) return;
+    var id = btn.dataset.id;
+    if (id === 'all') {
+      var allActive = btn.classList.contains('active');
+      var btns = targetsEl.querySelectorAll('.target-btn');
+      btns.forEach(function(b) {
+        if (allActive) b.classList.remove('active'); else b.classList.add('active');
+      });
+      CHARACTERS.forEach(function(c) { selectedTargets[c.id] = !allActive; });
+    } else {
+      btn.classList.toggle('active');
+      selectedTargets[id] = btn.classList.contains('active');
+      // Update ALL button
+      var allOn = CHARACTERS.every(function(c) { return selectedTargets[c.id]; });
+      allBtn.classList.toggle('active', allOn);
+    }
+  });
+
+  // --- Mode tabs ---
+  var modeTabs = document.querySelectorAll('.mode-tab');
+  var fileMode = document.getElementById('file-mode');
+  var pasteMode = document.getElementById('paste-mode');
+
+  modeTabs.forEach(function(tab) {
+    tab.addEventListener('click', function() {
+      modeTabs.forEach(function(t) { t.classList.remove('active'); });
+      tab.classList.add('active');
+      var mode = tab.dataset.mode;
+      fileMode.classList.toggle('hidden', mode !== 'file');
+      pasteMode.classList.toggle('hidden', mode !== 'paste');
+    });
+  });
+
+  // --- File upload ---
+  var dropZone = document.getElementById('drop-zone');
+  var fileInput = document.getElementById('file-input');
+
+  dropZone.addEventListener('click', function() { fileInput.click(); });
+  dropZone.addEventListener('dragover', function(e) { e.preventDefault(); dropZone.classList.add('dragover'); });
+  dropZone.addEventListener('dragleave', function() { dropZone.classList.remove('dragover'); });
+  dropZone.addEventListener('drop', function(e) {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    if (e.dataTransfer.files.length) processFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', function() {
+    if (fileInput.files.length) processFile(fileInput.files[0]);
+  });
+
+  function processFile(file) {
+    var reader = new FileReader();
+    reader.onload = function() {
+      var text = reader.result;
+      if (file.name.endsWith('.rtf')) text = stripRtf(text);
+      showFragments(splitFragments(text));
+    };
+    reader.readAsText(file);
+  }
+
+  // --- Paste area ---
+  var pasteArea = document.getElementById('paste-area');
+  var pasteTimer = null;
+  pasteArea.addEventListener('input', function() {
+    clearTimeout(pasteTimer);
+    pasteTimer = setTimeout(function() {
+      var text = pasteArea.value.trim();
+      if (text.length > 10) showFragments(splitFragments(text));
+      else hidePreview();
+    }, 500);
+  });
+
+  // --- Preview ---
+  function showFragments(frags) {
+    fragments = frags;
+    if (!fragments.length) { hidePreview(); return; }
+    document.getElementById('preview-box').classList.remove('hidden');
+    document.getElementById('frag-count').textContent = fragments.length + ' fragment' + (fragments.length !== 1 ? 's' : '') + ' (' + fragments.reduce(function(s, f) { return s + f.length; }, 0) + ' chars total)';
+    document.getElementById('frag-first').textContent = 'First: ' + truncate(fragments[0], 100);
+    document.getElementById('frag-last').textContent = fragments.length > 1 ? 'Last: ' + truncate(fragments[fragments.length - 1], 100) : '';
+    document.getElementById('seed-btn').disabled = false;
+  }
+
+  function hidePreview() {
+    fragments = [];
+    document.getElementById('preview-box').classList.add('hidden');
+    document.getElementById('seed-btn').disabled = true;
+  }
+
+  // --- Seeding ---
+  var seedBtn = document.getElementById('seed-btn');
+  var seedStatus = document.getElementById('seed-status');
+  var progressBar = document.getElementById('progress-bar');
+  var progressFill = document.getElementById('progress-fill');
+
+  seedBtn.addEventListener('click', async function() {
+    var targets = CHARACTERS.filter(function(c) { return selectedTargets[c.id]; });
+    if (!targets.length || !fragments.length) return;
+    seedBtn.disabled = true;
+    progressBar.classList.remove('hidden');
+    var total = fragments.length * targets.length;
+    var done = 0;
+    var errors = 0;
+
+    for (var t = 0; t < targets.length; t++) {
+      for (var f = 0; f < fragments.length; f++) {
+        seedStatus.textContent = 'Seeding ' + (done + 1) + '/' + total + ' to ' + targets[t].name + '...';
+        seedStatus.style.color = 'var(--accent-primary)';
+        progressFill.style.width = ((done / total) * 100) + '%';
+        try {
+          var resp = await fetch(targets[t].path, {
+            method: 'POST',
+            headers: authHeaders(),
+            body: JSON.stringify({ content: fragments[f], emotionalWeight: 0.5 }),
+          });
+          if (!resp.ok) errors++;
+        } catch(e) { errors++; }
+        done++;
+      }
+    }
+
+    progressFill.style.width = '100%';
+    if (errors === 0) {
+      seedStatus.textContent = 'Seeded ' + fragments.length + ' fragment' + (fragments.length !== 1 ? 's' : '') + ' to ' + targets.length + ' character' + (targets.length !== 1 ? 's' : '');
+      seedStatus.style.color = 'var(--accent-green)';
+    } else {
+      seedStatus.textContent = 'Done with ' + errors + ' error' + (errors !== 1 ? 's' : '') + ' out of ' + total;
+      seedStatus.style.color = 'var(--accent-amber)';
+    }
+    seedBtn.disabled = false;
+    setTimeout(function() { progressBar.classList.add('hidden'); progressFill.style.width = '0%'; }, 2000);
+    // Refresh stats & feed
+    loadStats();
+    feedOffset = 0;
+    loadFeed(true);
+  });
+
+  // --- Stats ---
+  var statsGrid = document.getElementById('stats-grid');
+
+  function relativeTime(ts) {
+    if (!ts) return 'never';
+    var diff = Date.now() - ts;
+    if (diff < 60000) return 'just now';
+    if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+    if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
+    return Math.floor(diff / 86400000) + 'd ago';
+  }
+
+  async function loadStats() {
+    try {
+      var resp = await fetch('/api/dreams/status');
+      if (!resp.ok) return;
+      var data = await resp.json();
+      statsGrid.innerHTML = '';
+
+      // Total card first
+      var totalCard = document.createElement('div');
+      totalCard.className = 'stat-card total-card';
+      totalCard.innerHTML =
+        '<div class="char-name" style="color:var(--accent-primary)">Total</div>' +
+        '<div class="stat-row"><span class="stat-label">Pending</span><span class="stat-val pending">' + data.totals.pending + '</span></div>' +
+        '<div class="stat-row"><span class="stat-label">Consumed</span><span class="stat-val consumed">' + data.totals.consumed + '</span></div>';
+      statsGrid.appendChild(totalCard);
+
+      data.characters.forEach(function(c) {
+        var card = document.createElement('div');
+        var isRecent = c.lastDreamCycle && (Date.now() - c.lastDreamCycle < 3600000);
+        card.className = 'stat-card' + (isRecent ? ' recent' : '');
+        var nameColor = getCharColor(c.id);
+        card.innerHTML =
+          '<div class="char-name" style="color:' + nameColor + '">' + escapeHtml(c.name) + '</div>' +
+          '<div class="stat-row"><span class="stat-label">Pending</span><span class="stat-val pending">' + c.pending + '</span></div>' +
+          '<div class="stat-row"><span class="stat-label">Consumed</span><span class="stat-val consumed">' + c.consumed + '</span></div>' +
+          '<div class="last-cycle">Last dream: ' + relativeTime(c.lastDreamCycle) + '</div>';
+        statsGrid.appendChild(card);
+      });
+    } catch(e) {
+      console.error('Failed to load dream stats:', e);
+    }
+  }
+
+  function getCharColor(id) {
+    var colors = {
+      'neo': 'var(--color-neo)',
+      'plato': 'var(--color-plato)',
+      'joe': 'var(--color-joe)',
+    };
+    return colors[id] || 'var(--text-primary)';
+  }
+
+  // --- Feed ---
+  var feedList = document.getElementById('feed-list');
+  var loadMoreBtn = document.getElementById('load-more-btn');
+
+  async function loadFeed(reset) {
+    if (reset) { feedOffset = 0; feedList.innerHTML = ''; }
+    try {
+      var resp = await fetch('/api/dreams/seeds?limit=50&offset=' + feedOffset);
+      if (!resp.ok) return;
+      var data = await resp.json();
+      feedTotal = data.total;
+      data.seeds.forEach(function(seed) {
+        var entry = document.createElement('div');
+        entry.className = 'seed-entry char-' + seed.characterId;
+        var timeStr = seed.status === 'consumed' && seed.consumedAt
+          ? 'consumed ' + relativeTime(seed.consumedAt)
+          : 'deposited ' + relativeTime(seed.depositedAt);
+        entry.innerHTML =
+          '<div class="seed-header">' +
+            '<span class="char-tag tag-' + seed.characterId + '">' + escapeHtml(seed.characterName) + '</span>' +
+            '<span class="status-badge ' + seed.status + '">' + seed.status.toUpperCase() + '</span>' +
+            '<span class="seed-time">' + timeStr + '</span>' +
+          '</div>' +
+          '<div class="seed-preview">' + escapeHtml(seed.content) + '</div>';
+        entry.addEventListener('click', function() { entry.classList.toggle('expanded'); });
+        feedList.appendChild(entry);
+      });
+      feedOffset += data.seeds.length;
+      loadMoreBtn.classList.toggle('hidden', feedOffset >= feedTotal);
+    } catch(e) {
+      console.error('Failed to load dream feed:', e);
+    }
+  }
+
+  loadMoreBtn.addEventListener('click', function() { loadFeed(false); });
+
+  function escapeHtml(str) {
+    var d = document.createElement('div');
+    d.textContent = str;
+    return d.innerHTML;
+  }
+
+  // --- Init ---
+  loadStats();
+  loadFeed(true);
+  setInterval(loadStats, 30000);
+})();
+</script>
+<script src="/skins/loader.js"></script>
+<script src="/skins/picker.js"></script>
+</body>
+</html>

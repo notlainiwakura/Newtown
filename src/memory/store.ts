@@ -31,6 +31,11 @@ export interface Memory {
   lifecycleState: LifecycleState;
   lifecycleChangedAt: number | null;
   phase: string | null;
+  wingId: string | null;
+  roomId: string | null;
+  hall: string | null;
+  aaakContent: string | null;
+  aaakCompressedAt: number | null;
 }
 
 export interface Association {
@@ -79,6 +84,11 @@ interface MemoryRow {
   lifecycle_state: string | null;
   lifecycle_changed_at: number | null;
   phase: string | null;
+  wing_id: string | null;
+  room_id: string | null;
+  hall: string | null;
+  aaak_content: string | null;
+  aaak_compressed_at: number | null;
 }
 
 interface CoherenceGroupRow {
@@ -203,10 +213,34 @@ export function getAllRecentMessages(limit = 50): StoredMessage[] {
 }
 
 /**
+ * Get recent messages from visitor/user sessions only.
+ * Excludes inter-character traffic: peer conversations, letters,
+ * commune sessions, proactive outreach, doctor sessions, and town events.
+ */
+export function getRecentVisitorMessages(limit = 50): StoredMessage[] {
+  const rows = query<MessageRow>(
+    `SELECT * FROM messages
+     WHERE session_key NOT LIKE 'peer:%'
+       AND session_key NOT LIKE '%:letter:%'
+       AND session_key NOT LIKE 'wired:letter'
+       AND session_key NOT LIKE 'lain:letter'
+       AND session_key NOT LIKE 'commune:%'
+       AND session_key NOT LIKE 'proactive:%'
+       AND session_key NOT LIKE 'doctor:%'
+       AND session_key NOT LIKE 'town:%'
+     ORDER BY timestamp DESC
+     LIMIT ?`,
+    [limit]
+  );
+
+  return rows.reverse().map(rowToMessage);
+}
+
+/**
  * Save a memory with embedding
  */
 export async function saveMemory(
-  memory: Omit<Memory, 'id' | 'embedding' | 'createdAt' | 'lastAccessed' | 'accessCount' | 'lifecycleState' | 'lifecycleChangedAt' | 'phase'> & { lifecycleState?: LifecycleState }
+  memory: Omit<Memory, 'id' | 'embedding' | 'createdAt' | 'lastAccessed' | 'accessCount' | 'lifecycleState' | 'lifecycleChangedAt' | 'phase' | 'wingId' | 'roomId' | 'hall' | 'aaakContent' | 'aaakCompressedAt'> & { lifecycleState?: LifecycleState }
 ): Promise<string> {
   const logger = getLogger();
   const id = nanoid(16);
@@ -222,9 +256,18 @@ export async function saveMemory(
     logger.warn({ error }, 'Failed to generate embedding for memory');
   }
 
+  // Assign palace placement
+  const { assignHall, resolveWingForMemory, resolveWing, resolveRoom, incrementWingCount, incrementRoomCount } = await import('./palace.js');
+  const hall = assignHall(memory.memoryType, memory.sessionKey ?? '');
+  const { wingName, wingDescription } = resolveWingForMemory(memory.sessionKey ?? '', memory.userId ?? null, memory.metadata || {});
+  const wingId = resolveWing(wingName, wingDescription);
+  const roomId = resolveRoom(wingId, hall, `${hall} in ${wingName}`);
+  incrementWingCount(wingId);
+  incrementRoomCount(roomId);
+
   execute(
-    `INSERT INTO memories (id, session_key, user_id, content, memory_type, importance, emotional_weight, embedding, created_at, related_to, source_message_id, metadata, lifecycle_state, lifecycle_changed_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO memories (id, session_key, user_id, content, memory_type, importance, emotional_weight, embedding, created_at, related_to, source_message_id, metadata, lifecycle_state, lifecycle_changed_at, wing_id, room_id, hall)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       id,
       memory.sessionKey,
@@ -240,8 +283,24 @@ export async function saveMemory(
       JSON.stringify(memory.metadata || {}),
       lifecycleState,
       now,
+      wingId,
+      roomId,
+      hall,
     ]
   );
+
+  // Insert into vec0 if embedding exists
+  if (embeddingBuffer) {
+    try {
+      const embedding = deserializeEmbedding(embeddingBuffer);
+      execute(
+        'INSERT INTO memory_embeddings(rowid, embedding, memory_id) VALUES (?, ?, ?)',
+        [BigInt(Date.now() * 1000 + Math.floor(Math.random() * 1000)), embedding, id]
+      );
+    } catch {
+      // vec0 insert failure is non-critical
+    }
+  }
 
   eventBus.emitActivity({
     type: parseEventType(memory.sessionKey),
@@ -294,8 +353,9 @@ function calculateEffectiveImportance(memory: Memory): number {
 }
 
 /**
- * Search memories by semantic similarity
- * Optionally filter by user ID for user-specific memories
+ * Search memories by semantic similarity.
+ * Uses SQLite-vec (vec0) KNN search when the index has entries;
+ * falls back to brute-force cosine similarity when the index is empty.
  */
 export async function searchMemories(
   queryText: string,
@@ -305,6 +365,8 @@ export async function searchMemories(
   options?: {
     sortBy?: MemorySortBy;
     memoryTypes?: Memory['memoryType'][];
+    wingId?: string;
+    hall?: string;
   }
 ): Promise<{ memory: Memory; similarity: number; effectiveScore: number }[]> {
   const logger = getLogger();
@@ -319,37 +381,74 @@ export async function searchMemories(
     return [];
   }
 
-  // Get memories - filter by user if specified, exclude composting
-  let memories = getAllMemories().filter((m) => m.embedding !== null && m.lifecycleState !== 'composting');
+  // Check if vec0 index has entries
+  const vecCountRow = queryOne<{ count: number }>('SELECT COUNT(*) as count FROM memory_embeddings');
+  const vecCount = vecCountRow?.count ?? 0;
 
-  if (userId) {
-    // Include user-specific memories AND global memories (userId = null)
-    memories = memories.filter((m) => m.userId === userId || m.userId === null);
-  }
-
-  // Filter by memory types if specified
-  if (options?.memoryTypes && options.memoryTypes.length > 0) {
-    memories = memories.filter((m) => options.memoryTypes!.includes(m.memoryType));
-  }
-
-  // Calculate similarities with importance weighting
   const results: { memory: Memory; similarity: number; effectiveScore: number }[] = [];
-  for (const memory of memories) {
-    if (memory.embedding) {
+
+  if (vecCount > 0) {
+    // ── vec0 KNN path ──────────────────────────────────────────────────────────
+    const k = Math.min(limit * 5, vecCount);
+    let vecRows: Array<{ memory_id: string; distance: number }> = [];
+    try {
+      vecRows = query<{ memory_id: string; distance: number }>(
+        'SELECT memory_id, distance FROM memory_embeddings WHERE embedding MATCH ? AND k = ?',
+        [queryEmbedding, k]
+      );
+    } catch (error) {
+      logger.warn({ error }, 'vec0 KNN search failed, falling back to brute-force');
+    }
+
+    for (const { memory_id, distance } of vecRows) {
+      // Map cosine distance [0, 2] to similarity [1, -1]; clamp to [0, 1]
+      const similarity = Math.max(0, 1 - distance);
+      if (similarity < minSimilarity) continue;
+
+      const memory = getMemory(memory_id);
+      if (!memory) continue;
+      if (memory.lifecycleState === 'composting') continue;
+      if (userId && memory.userId !== userId && memory.userId !== null) continue;
+      if (options?.memoryTypes && options.memoryTypes.length > 0 && !options.memoryTypes.includes(memory.memoryType)) continue;
+      if (options?.wingId && memory.wingId !== options.wingId) continue;
+      if (options?.hall && memory.hall !== options.hall) continue;
+
+      const effectiveImportance = calculateEffectiveImportance(memory);
+      const daysSinceCreated = (Date.now() - memory.createdAt) / (1000 * 60 * 60 * 24);
+      const recencyFactor = Math.max(0.4, 1 - daysSinceCreated / 730);
+      const emotionalRelevance = (memory.emotionalWeight ?? 0) * recencyFactor;
+      let effectiveScore = similarity * 0.35 + effectiveImportance * 0.35 + emotionalRelevance * 0.30;
+      if (memory.metadata?.distilledInto) effectiveScore -= 0.3;
+      results.push({ memory, similarity, effectiveScore });
+    }
+  } else {
+    // ── Brute-force fallback (pre-vec0 memories or empty index) ───────────────
+    let memories = getAllMemories().filter((m) => m.embedding !== null && m.lifecycleState !== 'composting');
+
+    if (userId) {
+      memories = memories.filter((m) => m.userId === userId || m.userId === null);
+    }
+    if (options?.memoryTypes && options.memoryTypes.length > 0) {
+      memories = memories.filter((m) => options.memoryTypes!.includes(m.memoryType));
+    }
+    if (options?.wingId) {
+      memories = memories.filter((m) => m.wingId === options.wingId);
+    }
+    if (options?.hall) {
+      memories = memories.filter((m) => m.hall === options.hall);
+    }
+
+    for (const memory of memories) {
+      if (!memory.embedding) continue;
       const similarity = cosineSimilarity(queryEmbedding, memory.embedding);
-      if (similarity >= minSimilarity) {
-        const effectiveImportance = calculateEffectiveImportance(memory);
-        // Emotional relevance: emotional weight with slow decay (2 years)
-        const daysSinceCreated = (Date.now() - memory.createdAt) / (1000 * 60 * 60 * 24);
-        const recencyFactor = Math.max(0.4, 1 - daysSinceCreated / 730);
-        const emotionalRelevance = (memory.emotionalWeight ?? 0) * recencyFactor;
-        // Combine: similarity (35%) + importance (35%) + emotional relevance (30%)
-        // Importance and emotion matter as much as raw semantic match
-        let effectiveScore = similarity * 0.35 + effectiveImportance * 0.35 + emotionalRelevance * 0.30;
-        // Deprioritize memories that have been distilled into a summary
-        if (memory.metadata?.distilledInto) effectiveScore -= 0.3;
-        results.push({ memory, similarity, effectiveScore });
-      }
+      if (similarity < minSimilarity) continue;
+      const effectiveImportance = calculateEffectiveImportance(memory);
+      const daysSinceCreated = (Date.now() - memory.createdAt) / (1000 * 60 * 60 * 24);
+      const recencyFactor = Math.max(0.4, 1 - daysSinceCreated / 730);
+      const emotionalRelevance = (memory.emotionalWeight ?? 0) * recencyFactor;
+      let effectiveScore = similarity * 0.35 + effectiveImportance * 0.35 + emotionalRelevance * 0.30;
+      if (memory.metadata?.distilledInto) effectiveScore -= 0.3;
+      results.push({ memory, similarity, effectiveScore });
     }
   }
 
@@ -589,9 +688,9 @@ export function getAssociations(memoryId: string, limit = 20): Association[] {
 export function strengthenAssociation(sourceId: string, targetId: string, boost = 0.1): void {
   execute(
     `UPDATE memory_associations
-     SET strength = CASE WHEN strength + ? > 1.0 THEN 1.0 ELSE strength + ? END
+     SET strength = MIN(1.0, strength + ?)
      WHERE source_id = ? AND target_id = ?`,
-    [boost, boost, sourceId, targetId]
+    [boost, sourceId, targetId]
   );
 }
 
@@ -726,7 +825,7 @@ const BACKGROUND_PREFIXES = [
   'diary', 'dream', 'commune', 'curiosity', 'self-concept', 'selfconcept',
   'narrative', 'letter', 'wired', 'bibliomancy', 'alien', 'peer',
   'therapy', 'proactive', 'doctor', 'movement', 'move', 'note', 'document', 'gift',
-  'research', 'townlife',
+  'research', 'townlife', 'object',
 ];
 
 const BACKGROUND_SQL_FILTER = BACKGROUND_PREFIXES.map(() => `session_key LIKE ?`).join(' OR ');
@@ -812,6 +911,11 @@ function rowToMemory(row: MemoryRow): Memory {
     lifecycleState: (row.lifecycle_state as LifecycleState) ?? 'mature',
     lifecycleChangedAt: row.lifecycle_changed_at ?? null,
     phase: row.phase ?? null,
+    wingId: row.wing_id ?? null,
+    roomId: row.room_id ?? null,
+    hall: row.hall ?? null,
+    aaakContent: row.aaak_content ?? null,
+    aaakCompressedAt: row.aaak_compressed_at ?? null,
   };
 }
 
@@ -1079,6 +1183,69 @@ export function getDocumentsByAuthor(authorId?: string, limit = 20): CharacterDo
       writtenAt: (meta.writtenAt as number) || row.created_at,
     };
   });
+}
+
+// --- Postboard operations (admin → all inhabitants direct line) ---
+
+export interface PostboardMessage {
+  id: string;
+  author: string;
+  content: string;
+  pinned: boolean;
+  createdAt: number;
+}
+
+interface PostboardRow {
+  id: string;
+  author: string;
+  content: string;
+  pinned: number;
+  created_at: number;
+}
+
+function rowToPostboardMessage(row: PostboardRow): PostboardMessage {
+  return {
+    id: row.id,
+    author: row.author,
+    content: row.content,
+    pinned: row.pinned === 1,
+    createdAt: row.created_at,
+  };
+}
+
+export function savePostboardMessage(content: string, author = 'admin', pinned = false): string {
+  const id = nanoid(16);
+  execute(
+    `INSERT INTO postboard_messages (id, author, content, pinned, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+    [id, author, content, pinned ? 1 : 0, Date.now()]
+  );
+  return id;
+}
+
+export function getPostboardMessages(since?: number, limit = 20): PostboardMessage[] {
+  const sinceTs = since ?? 0;
+  const rows = query<PostboardRow>(
+    `SELECT * FROM postboard_messages
+     WHERE created_at > ?
+     ORDER BY pinned DESC, created_at DESC
+     LIMIT ?`,
+    [sinceTs, limit]
+  );
+  return rows.map(rowToPostboardMessage);
+}
+
+export function deletePostboardMessage(id: string): boolean {
+  const result = execute(`DELETE FROM postboard_messages WHERE id = ?`, [id]);
+  return result.changes > 0;
+}
+
+export function togglePostboardPin(id: string): boolean {
+  const result = execute(
+    `UPDATE postboard_messages SET pinned = CASE WHEN pinned = 1 THEN 0 ELSE 1 END WHERE id = ?`,
+    [id]
+  );
+  return result.changes > 0;
 }
 
 // --- Unassigned memories query (for topology formation) ---

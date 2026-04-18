@@ -78,7 +78,7 @@ export function generateSampleConfig(): string {
   // Gateway settings
   "gateway": {
     // Unix socket path for local communication
-    // "socketPath": "~/.lain/gateway.sock",
+    // "socketPath": "~/.newtown/newtown.sock",
 
     // Socket file permissions (octal)
     // "socketPermissions": 384, // 0600
@@ -109,7 +109,7 @@ export function generateSampleConfig(): string {
       "id": "default",
       "name": "Newtown Guide",
       "enabled": true,
-      // "workspace": "~/.lain/workspace",
+      // "workspace": "~/.newtown/workspace",
       // Providers by tier: [0]=personality, [1]=memory, [2]=light
       "providers": [
         {
@@ -138,7 +138,7 @@ export function generateSampleConfig(): string {
   "logging": {
     "level": "info",
     "prettyPrint": true
-    // "file": "~/.lain/newtown.log"
+    // "file": "~/.newtown/newtown.log"
   }
 }
 `;

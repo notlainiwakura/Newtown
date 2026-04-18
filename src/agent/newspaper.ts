@@ -33,7 +33,7 @@ interface Newspaper {
   activity_count: number;
 }
 
-const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const DEFAULT_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 /**
  * Start the newspaper reading loop.
@@ -185,7 +185,7 @@ Write a brief, natural reaction to what you read. What caught your attention? Wh
 
   const result = await provider.complete({
     messages: [{ role: 'user', content: prompt }],
-    maxTokens: 256,
+    maxTokens: 512,
     temperature: 0.8,
   });
 

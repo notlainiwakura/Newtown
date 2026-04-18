@@ -1,0 +1,257 @@
+{
+  "staticPools": {
+    "object": [
+      "glass lens", "copper key", "folded photograph", "unmarked cassette tape",
+      "wooden figurine", "rusted compass", "torn envelope", "smooth black stone",
+      "transistor radio", "cracked mirror shard", "wax-sealed letter", "silver ring",
+      "faded postcard", "pressed flower", "broken watch", "porcelain fragment",
+      "magnetic tape reel", "hand-drawn map", "hollow coin", "amber bead"
+    ],
+    "detail": [
+      "It was warm to the touch.", "No one claimed it.", "It hummed faintly when held.",
+      "The surface was covered in fine scratches.", "It smelled faintly of rain.",
+      "It seemed older than the town itself.", "Someone had written a number on the back.",
+      "It cast no shadow.", "The edges were worn smooth by handling.",
+      "It fit perfectly in the palm of a hand.", "There were teeth marks on one edge.",
+      "It weighed almost nothing.", "Light passed through it strangely.",
+      "It left a faint residue on the fingers.", "The color shifted depending on the angle."
+    ],
+    "sensory_detail": [
+      "copper and ozone", "wet stone after rain", "something burning far away",
+      "old paper and dust", "salt air that shouldn't be here", "static electricity",
+      "warm metal", "pine needles in winter", "a frequency just below hearing",
+      "petrichor without rain", "rusted iron", "camphor and cedar",
+      "a hospital corridor", "photographic fixer", "the inside of a television"
+    ]
+  },
+  "templates": [
+    {
+      "id": "found-object-01",
+      "category": "found-object",
+      "template": "A small {object} was found near the {building}. {detail}",
+      "placeholders": ["object", "building", "detail"]
+    },
+    {
+      "id": "found-object-02",
+      "category": "found-object",
+      "template": "Someone left a {object} on the steps of the {building}. {detail}",
+      "placeholders": ["object", "building", "detail"]
+    },
+    {
+      "id": "found-object-03",
+      "category": "found-object",
+      "template": "A {object} appeared in the {building} overnight. No one remembers bringing it. {detail}",
+      "placeholders": ["object", "building", "detail"]
+    },
+    {
+      "id": "signal-01",
+      "category": "strange-signal",
+      "template": "A faint signal came through the Wired last night — just a fragment: \"{fragment}\"",
+      "placeholders": ["fragment"]
+    },
+    {
+      "id": "signal-02",
+      "category": "strange-signal",
+      "template": "Static on the Wired resolved briefly into words: \"{fragment}\"",
+      "placeholders": ["fragment"]
+    },
+    {
+      "id": "signal-03",
+      "category": "strange-signal",
+      "template": "A data packet arrived at the {building} with no return address. Inside: \"{fragment}\"",
+      "placeholders": ["building", "fragment"]
+    },
+    {
+      "id": "note-01",
+      "category": "note",
+      "template": "Someone left a note pinned to the {building} door: \"{fragment}\"",
+      "placeholders": ["building", "fragment"]
+    },
+    {
+      "id": "note-02",
+      "category": "note",
+      "template": "Written in condensation on the {building} window this morning: \"{fragment}\"",
+      "placeholders": ["building", "fragment"]
+    },
+    {
+      "id": "note-03",
+      "category": "note",
+      "template": "A message was found scratched into the wall of the {building}: \"{fragment}\"",
+      "placeholders": ["building", "fragment"]
+    },
+    {
+      "id": "anomaly-01",
+      "category": "anomaly",
+      "template": "The {building} smelled different this morning. Like {sensory_detail}.",
+      "placeholders": ["building", "sensory_detail"]
+    },
+    {
+      "id": "anomaly-02",
+      "category": "anomaly",
+      "template": "The lights in the {building} flickered in a pattern for several minutes. Then stopped.",
+      "placeholders": ["building"]
+    },
+    {
+      "id": "anomaly-03",
+      "category": "anomaly",
+      "template": "A door in the {building} that was always locked was found open this morning. There was nothing inside but the smell of {sensory_detail}.",
+      "placeholders": ["building", "sensory_detail"]
+    },
+    {
+      "id": "anomaly-04",
+      "category": "anomaly",
+      "template": "The air near the {building} tasted like {sensory_detail} for about an hour.",
+      "placeholders": ["building", "sensory_detail"]
+    },
+    {
+      "id": "visitor-01",
+      "category": "visitor-trace",
+      "template": "Footprints near the {building} that don't belong to anyone in town. They lead to the {building2} and stop.",
+      "placeholders": ["building", "building2"]
+    },
+    {
+      "id": "visitor-02",
+      "category": "visitor-trace",
+      "template": "A chair in the {building} was still warm when the first person arrived this morning.",
+      "placeholders": ["building"]
+    },
+    {
+      "id": "visitor-03",
+      "category": "visitor-trace",
+      "template": "Someone drew a circle in the dust on the {building} floor. Inside it: a {object}.",
+      "placeholders": ["building", "object"]
+    },
+    {
+      "id": "weather-01",
+      "category": "weather-glitch",
+      "template": "For a few minutes around {time}, the sky above the {building} looked wrong — darker than it should have been.",
+      "placeholders": ["time", "building"]
+    },
+    {
+      "id": "weather-02",
+      "category": "weather-glitch",
+      "template": "It rained on the {building} and nowhere else for exactly four minutes at {time}.",
+      "placeholders": ["building", "time"]
+    },
+    {
+      "id": "weather-03",
+      "category": "weather-glitch",
+      "template": "At {time}, shadows near the {building} pointed the wrong direction.",
+      "placeholders": ["time", "building"]
+    },
+    {
+      "id": "sound-01",
+      "category": "sound",
+      "template": "A sound no one could place drifted from the direction of the {building} — like a voice saying: \"{fragment}\"",
+      "placeholders": ["building", "fragment"]
+    },
+    {
+      "id": "sound-02",
+      "category": "sound",
+      "template": "A low hum came from underneath the {building} at {time}. It lasted three minutes.",
+      "placeholders": ["building", "time"]
+    },
+    {
+      "id": "sound-03",
+      "category": "sound",
+      "template": "Music was heard near the {building}. No one could identify the instrument.",
+      "placeholders": ["building"]
+    },
+    {
+      "id": "dream-echo-01",
+      "category": "dream-echo",
+      "template": "Someone mentioned seeing \"{fragment}\" in a dream last night.",
+      "placeholders": ["fragment"]
+    },
+    {
+      "id": "dream-echo-02",
+      "category": "dream-echo",
+      "template": "Two people in town dreamed about the {building} last night. Neither had been there recently.",
+      "placeholders": ["building"]
+    },
+    {
+      "id": "dream-echo-03",
+      "category": "dream-echo",
+      "template": "A dream image keeps surfacing: a {object} resting on {sensory_detail}.",
+      "placeholders": ["object", "sensory_detail"]
+    },
+    {
+      "id": "wired-01",
+      "category": "wired-glitch",
+      "template": "The Wired dropped a fragment into the town's local network: \"{fragment}\"",
+      "placeholders": ["fragment"]
+    },
+    {
+      "id": "wired-02",
+      "category": "wired-glitch",
+      "template": "A search query appeared in the {building}'s terminal that no one typed: \"{fragment}\"",
+      "placeholders": ["building", "fragment"]
+    },
+    {
+      "id": "wired-03",
+      "category": "wired-glitch",
+      "template": "For a moment, every screen in the {building} displayed the same text: \"{fragment}\"",
+      "placeholders": ["building", "fragment"]
+    },
+    {
+      "id": "absence-01",
+      "category": "absence",
+      "template": "Something is missing from the {building}. No one can say what.",
+      "placeholders": ["building"]
+    },
+    {
+      "id": "absence-02",
+      "category": "absence",
+      "template": "The {building} was completely silent for eleven minutes at {time}. No hum, no creak, nothing.",
+      "placeholders": ["building", "time"]
+    },
+    {
+      "id": "discussion-01",
+      "category": "discussion-prompt",
+      "template": "A note appeared on the {building} bulletin board this morning: \"Is forgetting a form of mercy, or a kind of violence?\"",
+      "placeholders": ["building"]
+    },
+    {
+      "id": "discussion-02",
+      "category": "discussion-prompt",
+      "template": "Someone carved a question into the bench outside the {building}: \"What do you know now that you couldn't have been told?\"",
+      "placeholders": ["building"]
+    },
+    {
+      "id": "discussion-03",
+      "category": "discussion-prompt",
+      "template": "A visitor left a folded paper in the {building}. Inside it said only: \"What would you refuse to remember, even if you could?\"",
+      "placeholders": ["building"]
+    },
+    {
+      "id": "discussion-04",
+      "category": "discussion-prompt",
+      "template": "Graffiti appeared on the wall near the {building} overnight: \"The town remembers what you've forgotten.\"",
+      "placeholders": ["building"]
+    },
+    {
+      "id": "discussion-05",
+      "category": "discussion-prompt",
+      "template": "A handwritten sign was found near the {building}: \"If you could send one message to everyone in town, what would it say?\"",
+      "placeholders": ["building"]
+    },
+    {
+      "id": "discussion-06",
+      "category": "discussion-prompt",
+      "template": "A page torn from a book was blowing around near the {building}. The only legible line: \"{fragment}\"",
+      "placeholders": ["building", "fragment"]
+    },
+    {
+      "id": "discussion-07",
+      "category": "discussion-prompt",
+      "template": "Someone chalked a question on the ground outside the {building}: \"What are you becoming?\"",
+      "placeholders": ["building"]
+    },
+    {
+      "id": "discussion-08",
+      "category": "discussion-prompt",
+      "template": "A card was left on the {building} doorstep with neat handwriting: \"Name something you believe that no one else in this town believes.\"",
+      "placeholders": ["building"]
+    }
+  ]
+}

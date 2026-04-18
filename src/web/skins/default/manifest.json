@@ -1,0 +1,23 @@
+{
+  "id": "default",
+  "name": "Wired Protocol",
+  "description": "Dark navy, blue/cyan glows, tech-noir atmosphere",
+  "fonts": {
+    "heading": "Orbitron",
+    "body": "Share Tech Mono",
+    "mono": "Share Tech Mono"
+  },
+  "buildingIcons": {
+    "library": "📚",
+    "bar": "🍺",
+    "field": "🌾",
+    "windmill": "🏗",
+    "lighthouse": "🗼",
+    "school": "🏫",
+    "market": "🏪",
+    "locksmith": "🔐",
+    "threshold": "🚪"
+  },
+  "googleFontsUrl": "https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Share+Tech+Mono&display=swap",
+  "previewColors": ["#4080ff", "#80c0ff", "#40e0ff"]
+}

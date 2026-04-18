@@ -1,16 +1,24 @@
 [Unit]
 Description=Lain Telegram Bot
-After=network.target
+After=network.target lain-main.service
+PartOf=lain.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/wired-lain
+WorkingDirectory=/opt/local-lain
 ExecStart=/usr/bin/node dist/index.js telegram
 Restart=on-failure
 RestartSec=5
+
+# Telegram bot connects to Lain's database
 Environment=NODE_ENV=production
-EnvironmentFile=/opt/wired-lain/.env
+Environment=LAIN_HOME=/root/.lain
+
+EnvironmentFile=/opt/local-lain/.env
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=lain-telegram

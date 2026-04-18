@@ -12,10 +12,35 @@ const imagePreview = document.getElementById('image-preview');
 const previewImg = document.getElementById('preview-img');
 const removeImageBtn = document.getElementById('remove-image');
 
-let sessionId = localStorage.getItem('lain-session') || null;
 let pendingImage = null; // { base64: string, mimeType: string }
-const apiKey = document.querySelector('meta[name="lain-api-key"]')?.content || null;
-const basePath = window.location.pathname.replace(/\/+$/, '');
+const IS_OWNER = document.querySelector('meta[name="lain-owner"]')?.content === 'true';
+
+// Derive API base from the current path so resident pages route through the proxy.
+const apiBase = location.pathname.replace(/\/[^/]*$/, '');
+const characterId = apiBase.replace(/^\/+/, '');
+const CHARACTER_LABELS = {
+  neo: 'NEO',
+  plato: 'PLATO',
+  joe: 'JOE',
+};
+
+// Character identity — residents keep their own labels, root falls back to the town guide.
+let characterLabel = CHARACTER_LABELS[characterId] || 'NEWTOWN';
+const sessionStorageKey = `${characterId || 'newtown'}-session`;
+
+let sessionId = localStorage.getItem(sessionStorageKey) || null;
+
+// Visitor identity — used for display and sent to the server so inhabitants know who they're talking to
+window.LAIN_SENDER_NAME = localStorage.getItem('lain-sender-name') || 'SHRAII';
+const visitorName = window.LAIN_SENDER_NAME;
+
+fetch((apiBase || '') + '/api/meta/identity')
+  .then((response) => response.ok ? response.json() : null)
+  .then((identity) => {
+    if (!identity?.name) return;
+    characterLabel = String(identity.name).toUpperCase();
+  })
+  .catch(() => {});
 
 // Scroll to bottom of messages
 function scrollToBottom() {
@@ -34,12 +59,12 @@ function createMessage(type, content, _sender = null) {
     `;
   } else if (type === 'user') {
     div.innerHTML = `
-      <span class="sender">SHRAII</span>
+      <span class="sender">${escapeHtml(visitorName)}</span>
       <span class="text">${escapeHtml(content)}</span>
     `;
   } else if (type === 'lain') {
     div.innerHTML = `
-      <span class="sender">LAIN</span>
+      <span class="sender">${characterLabel}</span>
       <span class="text">${formatLainResponse(content)}</span>
     `;
   } else if (type === 'error') {
@@ -79,19 +104,23 @@ function escapeHtml(text) {
 
 // Format Lain's response (preserve line breaks, handle special formatting)
 function formatLainResponse(text) {
+  // First, extract and protect image tags before escaping HTML
   const imagePattern = /\[IMAGE:\s*([^\]]*)\]\(([^)]+)\)/g;
   const images = [];
   let imageIndex = 0;
 
+  // Replace images with placeholders
   let processed = text.replace(imagePattern, (match, desc, url) => {
     images.push({ desc: desc.trim(), url: url.trim() });
     return `__IMAGE_PLACEHOLDER_${imageIndex++}__`;
   });
 
+  // Now escape HTML and apply formatting
   processed = escapeHtml(processed)
     .replace(/\n/g, '<br>')
     .replace(/\.{3}/g, '<span class="ellipsis">...</span>');
 
+  // Restore images as actual img tags
   images.forEach((img, i) => {
     const imgHtml = `<div class="response-image-container">
       <img src="${escapeHtml(img.url)}" alt="${escapeHtml(img.desc)}" class="response-image"
@@ -114,10 +143,13 @@ function processImageFile(file) {
   const reader = new FileReader();
   reader.onload = (e) => {
     const dataUrl = e.target.result;
+    // Extract base64 data (remove "data:image/...;base64," prefix)
     const base64 = dataUrl.split(',')[1];
     const mimeType = file.type;
 
     pendingImage = { base64, mimeType };
+
+    // Show preview
     previewImg.src = dataUrl;
     imagePreview.style.display = 'flex';
   };
@@ -132,17 +164,21 @@ function clearPendingImage() {
   imageInput.value = '';
 }
 
+// Image button click
 imageBtn.addEventListener('click', () => {
   imageInput.click();
 });
 
+// Image file selected
 imageInput.addEventListener('change', (e) => {
   const file = e.target.files[0];
   processImageFile(file);
 });
 
+// Remove image button
 removeImageBtn.addEventListener('click', clearPendingImage);
 
+// Handle paste event for images
 document.addEventListener('paste', (e) => {
   const items = e.clipboardData?.items;
   if (!items) return;
@@ -157,6 +193,7 @@ document.addEventListener('paste', (e) => {
   }
 });
 
+// Handle drag and drop
 let dragOverlay = null;
 
 function showDragOverlay() {
@@ -197,6 +234,7 @@ document.addEventListener('drop', (e) => {
   }
 });
 
+// Create a message element that can be updated (for streaming)
 function createStreamingMessage() {
   const div = document.createElement('div');
   div.className = 'lain-message';
@@ -207,13 +245,16 @@ function createStreamingMessage() {
   return div;
 }
 
+// Send message to server with streaming
 async function sendMessageStream(message, image, onChunk, onDone, onError) {
   try {
     const payload = {
       message,
       sessionId,
+      senderName: window.LAIN_SENDER_NAME || null,
     };
 
+    // Include image if present
     if (image) {
       payload.image = {
         base64: image.base64,
@@ -222,9 +263,8 @@ async function sendMessageStream(message, image, onChunk, onDone, onError) {
     }
 
     const headers = { 'Content-Type': 'application/json' };
-    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
 
-    const response = await fetch(basePath + '/api/chat/stream', {
+    const response = await fetch(apiBase + '/api/chat/stream', {
       method: 'POST',
       headers,
       body: JSON.stringify(payload),
@@ -257,7 +297,7 @@ async function sendMessageStream(message, image, onChunk, onDone, onError) {
 
             if (data.type === 'session' && data.sessionId) {
               sessionId = data.sessionId;
-              localStorage.setItem('lain-session', sessionId);
+              localStorage.setItem(sessionStorageKey, sessionId);
             } else if (data.type === 'chunk') {
               onChunk(data.content);
             } else if (data.type === 'done') {
@@ -282,14 +322,14 @@ async function sendMessageStream(message, image, onChunk, onDone, onError) {
 async function sendMessage(message) {
   try {
     const headers = { 'Content-Type': 'application/json' };
-    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
 
-    const response = await fetch(basePath + '/api/chat', {
+    const response = await fetch(apiBase + '/api/chat', {
       method: 'POST',
       headers,
       body: JSON.stringify({
         message,
         sessionId,
+        senderName: window.LAIN_SENDER_NAME || null,
       }),
     });
 
@@ -299,9 +339,10 @@ async function sendMessage(message) {
 
     const data = await response.json();
 
+    // Store session ID
     if (data.sessionId) {
       sessionId = data.sessionId;
-      localStorage.setItem('lain-session', sessionId);
+      localStorage.setItem(sessionStorageKey, sessionId);
     }
 
     return data.response;
@@ -311,18 +352,36 @@ async function sendMessage(message) {
   }
 }
 
+// --- Spectator mode: visitors cannot chat ---
+if (!IS_OWNER) {
+  // Hide the chat input entirely
+  chatForm.style.display = 'none';
+  if (imageBtn) imageBtn.style.display = 'none';
+
+  // Show a spectator notice
+  const notice = document.createElement('div');
+  notice.className = 'system-message';
+  notice.innerHTML = '<span class="timestamp">[SYSTEM]</span> <span class="text">you are observing the wired. inhabitants are alive but cannot hear you.</span>';
+  messagesContainer.appendChild(notice);
+}
+
+// Handle form submission with streaming (owner only — form is hidden for visitors)
 chatForm.addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (!IS_OWNER) return;
 
   const message = messageInput.value.trim();
   const image = pendingImage;
 
+  // Need either a message or an image
   if (!message && !image) return;
 
+  // Clear input and image
   messageInput.value = '';
-  const sentImage = image;
+  const sentImage = image; // Save for display
   clearPendingImage();
 
+  // Add user message (with image if present)
   const userMsg = createMessage('user', message || '(image)');
   if (sentImage) {
     const img = document.createElement('img');
@@ -334,6 +393,7 @@ chatForm.addEventListener('submit', async (e) => {
   messagesContainer.appendChild(userMsg);
   scrollToBottom();
 
+  // Create streaming message element
   const streamingMsg = createStreamingMessage();
   messagesContainer.appendChild(streamingMsg);
   const textSpan = streamingMsg.querySelector('#streaming-text');
@@ -341,25 +401,32 @@ chatForm.addEventListener('submit', async (e) => {
 
   scrollToBottom();
 
+  // Stream the response
   await sendMessageStream(
     message,
     sentImage,
+    // onChunk
     (chunk) => {
       fullText += chunk;
       textSpan.innerHTML = formatLainResponse(fullText);
       scrollToBottom();
     },
+    // onDone
     () => {
+      // Remove the id so it's no longer "streaming"
       textSpan.removeAttribute('id');
     },
-    () => {
+    // onError
+    (_errorMsg) => {
       if (!fullText) {
+        // Only show error if we got nothing
         textSpan.innerHTML = formatLainResponse('...connection to the wired failed. try again.');
       }
     }
   );
 });
 
+// Handle Enter key
 messageInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
@@ -367,8 +434,10 @@ messageInput.addEventListener('keydown', (e) => {
   }
 });
 
-messageInput.focus();
+// Focus input on load (only for owner)
+if (IS_OWNER) messageInput.focus();
 
+// Add some ambient effects
 function addGlitchEffect() {
   const logo = document.querySelector('.logo-title');
   if (logo && Math.random() > 0.95) {
@@ -381,8 +450,10 @@ function addGlitchEffect() {
   }
 }
 
+// Random glitch effect
 setInterval(addGlitchEffect, 100);
 
+// Add system messages periodically
 const ambientMessages = [
   'signal strength: optimal',
   'layer 07 stable',
@@ -404,6 +475,7 @@ function addAmbientMessage() {
 
 setInterval(addAmbientMessage, 10000);
 
+// Console easter egg
 console.log(`
 %c
   ╔═══════════════════════════════════════════╗

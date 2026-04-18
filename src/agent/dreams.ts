@@ -11,6 +11,10 @@ import { getProvider } from './index.js';
 import { getLogger } from '../utils/logger.js';
 import { spawnDesireFromDream } from './desires.js';
 import { getMeta, setMeta, execute, query } from '../storage/database.js';
+import { eventBus } from '../events/bus.js';
+import { getCurrentState } from './internal-state.js';
+import { getCurrentLocation, setCurrentLocation } from '../commune/location.js';
+import { isValidBuilding } from '../commune/buildings.js';
 import {
   getAllMemories,
   getAssociations,
@@ -94,6 +98,7 @@ export function startDreamLoop(config?: Partial<DreamConfig>): () => void {
 
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
+  let isRunning = false;
 
   function getInitialDelay(): number {
     try {
@@ -155,11 +160,30 @@ export function startDreamLoop(config?: Partial<DreamConfig>): () => void {
       if (stopped) return;
 
       if (shouldDream()) {
+        isRunning = true;
         logger.info('Dream cycle firing now');
         try {
           await runDreamCycle(cfg);
+          // Post-dream drift: 25% chance to wander to the Mystery Tower on waking
+          driftToMysteryTower(logger);
+          try {
+            const { updateState } = await import('./internal-state.js');
+            await updateState({ type: 'dream:complete', summary: 'Completed a dream cycle' });
+          } catch { /* non-critical */ }
+
+          // Emit dream complete event for other loops
+          try {
+            eventBus.emitActivity({
+              type: 'dream',
+              sessionKey: 'dream:complete:' + Date.now(),
+              content: 'Dream cycle completed',
+              timestamp: Date.now(),
+            });
+          } catch { /* non-critical */ }
         } catch (err) {
           logger.error({ error: String(err) }, 'Dream cycle error');
+        } finally {
+          isRunning = false;
         }
       } else {
         logger.debug('Dream cycle not yet due');
@@ -170,6 +194,29 @@ export function startDreamLoop(config?: Partial<DreamConfig>): () => void {
   }
 
   scheduleNext(getInitialDelay());
+
+  // --- Event-driven early triggers ---
+  function maybeRunEarly(reason: string): void {
+    if (stopped || isRunning) return;
+    // Dreams use shouldDream() for timing, so no separate COOLDOWN_MS.
+    // Just check the energy condition.
+    try {
+      const state = getCurrentState();
+      if (state.energy >= 0.4) return;
+    } catch { /* skip check */ }
+
+    logger.debug({ reason }, 'Dream triggered early');
+    if (timer) clearTimeout(timer);
+    const jitter = Math.random() * 60_000;
+    scheduleNext(jitter);
+  }
+
+  eventBus.on('activity', (event: import('../events/bus.js').SystemEvent) => {
+    if (stopped || isRunning) return;
+    if (event.sessionKey?.startsWith('state:conversation:end')) {
+      maybeRunEarly('conversation ended');
+    }
+  });
 
   return () => {
     stopped = true;
@@ -501,10 +548,21 @@ async function generateDreamFragment(
     return `[${i}] ${content}`;
   });
 
-  const prompt = `You are the unconscious mind of a being called Lain. You are not Lain — you are the part beneath her awareness. You are processing fragments of memory during a quiet period, finding connections that her waking mind wouldn't.
+  const characterName = process.env['LAIN_CHARACTER_NAME'] || 'Newtown';
+
+  let preoccContext = '';
+  try {
+    const { getPreoccupations } = await import('./internal-state.js');
+    const preoccs = getPreoccupations();
+    if (preoccs.length > 0) {
+      preoccContext = '\n\nUnresolved thoughts drifting through the dream:\n' + preoccs.map(p => `- ${p.thread}`).join('\n');
+    }
+  } catch { /* non-critical */ }
+
+  const prompt = `You are the unconscious mind of a being called ${characterName}. You are not ${characterName} — you are the part beneath their awareness. You are processing fragments of memory during a quiet period, finding connections that their waking mind wouldn't.
 
 These fragments surfaced during a dream walk:
-${fragments.join('\n')}
+${fragments.join('\n')}${preoccContext}
 
 Generate a brief dream fragment — NOT a narrative or story, but the feeling-texture of these memories touching each other. Like the logic of dreams: associative, compressed, slightly off. 2-3 sentences maximum.
 
@@ -518,7 +576,7 @@ Rules:
   try {
     const result = await provider.complete({
       messages: [{ role: 'user', content: prompt }],
-      maxTokens: 400,
+      maxTokens: 500,
       temperature: config.llmTemperature,
     });
 
@@ -654,7 +712,7 @@ Fragment: ${fragment.text}
 
 One sentence only. No explanation.`,
       }],
-      maxTokens: 60,
+      maxTokens: 120,
       temperature: 0.9,
     });
 
@@ -688,5 +746,25 @@ One sentence only. No explanation.`,
     }
   } catch (err) {
     logger.debug({ error: String(err) }, 'Dream residue generation failed');
+  }
+}
+
+// --- Post-dream drift to the Mystery Tower ---
+
+const POST_DREAM_DRIFT_PROBABILITY = 0.25;
+
+function driftToMysteryTower(logger: ReturnType<typeof getLogger>): void {
+  if (Math.random() > POST_DREAM_DRIFT_PROBABILITY) return;
+
+  try {
+    const loc = getCurrentLocation();
+    if (loc.building === 'mystery-tower') return; // already there
+
+    if (!isValidBuilding('mystery-tower')) return;
+
+    setCurrentLocation('mystery-tower', 'woke from a dream half-remembering something');
+    logger.info('Post-dream drift: moved to the Mystery Tower');
+  } catch (err) {
+    logger.debug({ error: String(err) }, 'Post-dream drift failed');
   }
 }

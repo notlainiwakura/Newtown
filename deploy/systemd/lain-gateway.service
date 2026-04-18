@@ -1,16 +1,21 @@
 [Unit]
 Description=Lain Gateway Server
 After=network.target
+PartOf=lain.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/wired-lain
+WorkingDirectory=/opt/local-lain
 ExecStart=/usr/bin/node dist/index.js gateway
 Restart=on-failure
 RestartSec=5
+
 Environment=NODE_ENV=production
-EnvironmentFile=/opt/wired-lain/.env
+EnvironmentFile=/opt/local-lain/.env
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=lain-gateway

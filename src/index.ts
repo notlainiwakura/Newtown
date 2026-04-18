@@ -40,11 +40,17 @@ export {
 // Providers
 export * from './providers/index.js';
 
+// Channels
+export * from './channels/index.js';
+
 // Memory
 export * from './memory/index.js';
 
 // Security
 export * from './security/index.js';
+
+// Browser
+export * from './browser/index.js';
 
 // Plugins
 export * from './plugins/index.js';
@@ -58,13 +64,9 @@ import { run } from './cli/index.js';
 // Run CLI if this is the main module
 const isMain =
   process.argv[1]?.endsWith('newtown.js') ||
-  process.argv[1]?.endsWith('lain.js') ||
   process.argv[1]?.endsWith('newtown') ||
-  process.argv[1]?.endsWith('lain') ||
-  process.argv[1]?.endsWith('index.js') ||
-  process.argv[1]?.endsWith('index.ts') ||
-  process.argv[1]?.includes('dist/index') ||
-  process.argv[1]?.includes('src/index');
+  process.argv[1]?.includes('dist/index.js') ||
+  process.argv[1]?.includes('src/index.ts');
 
 if (isMain) {
   run().catch((error) => {

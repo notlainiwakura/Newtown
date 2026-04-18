@@ -1,114 +1,140 @@
 /**
- * File-backed credential storage for local Newtown deployments.
+ * OS Keychain integration for secure credential storage
  */
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import keytar from 'keytar';
 import { KeychainError } from '../utils/errors.js';
 import { generateToken } from '../utils/crypto.js';
-import { getPaths } from '../config/paths.js';
 
-type CredentialMap = Record<string, string>;
-
-const SERVICE_NAME = 'newtown';
+const SERVICE_NAME = 'lain';
 const MASTER_KEY_ACCOUNT = 'master-key';
 const AUTH_TOKEN_ACCOUNT = 'auth-token';
 
-async function credentialsFile(): Promise<string> {
-  return getPaths().credentials + '.json';
-}
-
-async function loadCredentialMap(): Promise<CredentialMap> {
-  const path = await credentialsFile();
-  try {
-    const raw = await readFile(path, 'utf-8');
-    return JSON.parse(raw) as CredentialMap;
-  } catch {
-    return {};
-  }
-}
-
-async function saveCredentialMap(data: CredentialMap): Promise<void> {
-  const path = await credentialsFile();
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(data, null, 2), 'utf-8');
-}
-
-async function setStoredValue(account: string, value: string): Promise<void> {
-  try {
-    const data = await loadCredentialMap();
-    data[`${SERVICE_NAME}:${account}`] = value;
-    await saveCredentialMap(data);
-  } catch (error) {
-    if (error instanceof Error) {
-      throw new KeychainError(`Failed to store credential '${account}': ${error.message}`, error);
-    }
-    throw error;
-  }
-}
-
-async function getStoredValue(account: string): Promise<string | null> {
-  try {
-    const data = await loadCredentialMap();
-    return data[`${SERVICE_NAME}:${account}`] ?? null;
-  } catch (error) {
-    if (error instanceof Error) {
-      throw new KeychainError(`Failed to read credential '${account}': ${error.message}`, error);
-    }
-    throw error;
-  }
-}
-
+/**
+ * Get the master key from the keychain, generating one if it doesn't exist
+ */
 export async function getMasterKey(): Promise<string> {
+  // Allow env var override for headless servers without a keyring
   const envKey = process.env['LAIN_MASTER_KEY'];
   if (envKey) return envKey;
 
-  let key = await getStoredValue(MASTER_KEY_ACCOUNT);
-  if (!key) {
-    key = generateToken(32);
-    await setStoredValue(MASTER_KEY_ACCOUNT, key);
+  try {
+    let key = await keytar.getPassword(SERVICE_NAME, MASTER_KEY_ACCOUNT);
+
+    if (!key) {
+      // Generate a new master key
+      key = generateToken(32);
+      await keytar.setPassword(SERVICE_NAME, MASTER_KEY_ACCOUNT, key);
+    }
+
+    return key;
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new KeychainError(`Failed to access master key: ${error.message}`, error);
+    }
+    throw error;
   }
-  return key;
 }
 
+/**
+ * Set a new master key (used for testing or recovery)
+ */
 export async function setMasterKey(key: string): Promise<void> {
-  await setStoredValue(MASTER_KEY_ACCOUNT, key);
+  try {
+    await keytar.setPassword(SERVICE_NAME, MASTER_KEY_ACCOUNT, key);
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new KeychainError(`Failed to set master key: ${error.message}`, error);
+    }
+    throw error;
+  }
 }
 
+/**
+ * Get the authentication token from the keychain
+ */
 export async function getAuthToken(): Promise<string | null> {
-  return await getStoredValue(AUTH_TOKEN_ACCOUNT);
+  try {
+    return await keytar.getPassword(SERVICE_NAME, AUTH_TOKEN_ACCOUNT);
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new KeychainError(`Failed to access auth token: ${error.message}`, error);
+    }
+    throw error;
+  }
 }
 
+/**
+ * Set or update the authentication token
+ */
 export async function setAuthToken(token: string): Promise<void> {
-  await setStoredValue(AUTH_TOKEN_ACCOUNT, token);
+  try {
+    await keytar.setPassword(SERVICE_NAME, AUTH_TOKEN_ACCOUNT, token);
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new KeychainError(`Failed to set auth token: ${error.message}`, error);
+    }
+    throw error;
+  }
 }
 
-export async function generateAuthToken(length = 32): Promise<string> {
+/**
+ * Generate and store a new authentication token
+ */
+export async function generateAuthToken(length: number = 32): Promise<string> {
   const token = generateToken(length);
   await setAuthToken(token);
   return token;
 }
 
+/**
+ * Delete the authentication token
+ */
 export async function deleteAuthToken(): Promise<boolean> {
-  return await deleteCredential(AUTH_TOKEN_ACCOUNT);
+  try {
+    return await keytar.deletePassword(SERVICE_NAME, AUTH_TOKEN_ACCOUNT);
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new KeychainError(`Failed to delete auth token: ${error.message}`, error);
+    }
+    throw error;
+  }
 }
 
+/**
+ * Store a custom credential
+ */
 export async function setCredential(account: string, value: string): Promise<void> {
-  await setStoredValue(account, value);
+  try {
+    await keytar.setPassword(SERVICE_NAME, account, value);
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new KeychainError(`Failed to set credential '${account}': ${error.message}`, error);
+    }
+    throw error;
+  }
 }
 
+/**
+ * Retrieve a custom credential
+ */
 export async function getCredential(account: string): Promise<string | null> {
-  return await getStoredValue(account);
+  try {
+    return await keytar.getPassword(SERVICE_NAME, account);
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new KeychainError(`Failed to get credential '${account}': ${error.message}`, error);
+    }
+    throw error;
+  }
 }
 
+/**
+ * Delete a custom credential
+ */
 export async function deleteCredential(account: string): Promise<boolean> {
   try {
-    const data = await loadCredentialMap();
-    const key = `${SERVICE_NAME}:${account}`;
-    const existed = key in data;
-    delete data[key];
-    await saveCredentialMap(data);
-    return existed;
+    return await keytar.deletePassword(SERVICE_NAME, account);
   } catch (error) {
     if (error instanceof Error) {
       throw new KeychainError(`Failed to delete credential '${account}': ${error.message}`, error);
@@ -117,9 +143,17 @@ export async function deleteCredential(account: string): Promise<boolean> {
   }
 }
 
+/**
+ * List all Lain credentials in the keychain
+ */
 export async function listCredentials(): Promise<Array<{ account: string }>> {
-  const data = await loadCredentialMap();
-  return Object.keys(data)
-    .filter((key) => key.startsWith(`${SERVICE_NAME}:`))
-    .map((key) => ({ account: key.slice(`${SERVICE_NAME}:`.length) }));
+  try {
+    const credentials = await keytar.findCredentials(SERVICE_NAME);
+    return credentials.map((c) => ({ account: c.account }));
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new KeychainError(`Failed to list credentials: ${error.message}`, error);
+    }
+    throw error;
+  }
 }

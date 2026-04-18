@@ -14,7 +14,9 @@ import 'dotenv/config';
 import { createServer } from 'node:http';
 import type { ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { join, extname } from 'node:path';
+import { existsSync } from 'node:fs';
+import { join, extname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { nanoid } from 'nanoid';
 import {
   initAgent,
@@ -23,8 +25,10 @@ import {
   unregisterTool,
 } from '../agent/index.js';
 import { registerCharacterTools, type PeerConfig } from '../agent/character-tools.js';
+import { startOfflineCuriosityLoop } from '../agent/curiosity-offline.js';
 import { startCommuneLoop } from '../agent/commune-loop.js';
 import { startTownLifeLoop } from '../agent/town-life.js';
+import { startStateDecayLoop } from '../agent/internal-state.js';
 import { startDiaryLoop } from '../agent/diary.js';
 import { startSelfConceptLoop } from '../agent/self-concept.js';
 import { startDreamLoop } from '../agent/dreams.js';
@@ -32,18 +36,21 @@ import { startNarrativeLoop } from '../agent/narratives.js';
 import { startMemoryMaintenanceLoop } from '../memory/organic.js';
 import { startDesireLoop } from '../agent/desires.js';
 import { paraphraseLetter, type WiredLetter } from '../agent/membrane.js';
-import { saveMemory, getActivity, getNotesByBuilding, getDocumentsByAuthor } from '../memory/store.js';
+import { saveMemory, getActivity, getNotesByBuilding, getDocumentsByAuthor, getPostboardMessages, countMemories, countMessages } from '../memory/store.js';
 import { eventBus, isBackgroundEvent, type SystemEvent } from '../events/bus.js';
 import { sanitize } from '../security/sanitizer.js';
 import { secureCompare } from '../utils/crypto.js';
-import { initDatabase } from '../storage/database.js';
+import { isOwner } from './owner-auth.js';
+import { initDatabase, getMeta, query } from '../storage/database.js';
 import { getPaths } from '../config/index.js';
+import { getBasePath } from '../config/paths.js';
 import { getDefaultConfig } from '../config/defaults.js';
 import {
   isPossessed,
   getPossessionState,
   startPossession,
   endPossession,
+  touchActivity,
   addPendingPeerMessage,
   getPendingPeerMessages,
   resolvePendingMessage,
@@ -65,6 +72,9 @@ const MIME_TYPES: Record<string, string> = {
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
 };
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
+const SKINS_DIR = join(__dirname, '..', '..', 'src', 'web', 'skins');
 
 const TOOLS_TO_REMOVE = [
   'web_search', 'fetch_webpage',
@@ -141,8 +151,13 @@ async function serveStatic(
  * Start all background loops and return stop + restarter functions.
  */
 function startBackgroundLoops(config: CharacterConfig): BackgroundLoops {
+  const wiredLainUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
+  const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
+  const researchEnabled = process.env['ENABLE_RESEARCH'] === '1';
+
   // Each entry: [factory function that starts the loop and returns a stop fn]
   const loopFactories: (() => (() => void))[] = [
+    () => startStateDecayLoop(),
     () => startDiaryLoop(),
     () => startSelfConceptLoop(),
     () => startDreamLoop(),
@@ -168,6 +183,15 @@ function startBackgroundLoops(config: CharacterConfig): BackgroundLoops {
   const stops: (() => void)[] = [];
   const restarters: (() => (() => void))[] = [];
 
+  if (researchEnabled) {
+    loopFactories.splice(7, 0, () => startOfflineCuriosityLoop({
+      characterId: config.id,
+      characterName: config.name,
+      wiredLainUrl,
+      interlinkToken,
+    }));
+  }
+
   for (const factory of loopFactories) {
     const stop = factory();
     stops.push(stop);
@@ -189,15 +213,25 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
   const apiKeyEnv = process.env['CHARACTER_API_KEY_ENV'] || 'OPENAI_API_KEY';
   const baseURL = process.env['CHARACTER_BASE_URL'] || process.env['OPENAI_BASE_URL'];
 
+  // Model fallback chains — if primary model gets deprecated, try these in order
+  const DEFAULT_FALLBACKS: Record<string, string[]> = {
+    'gpt-4o-mini': ['gpt-4o-mini-2024-07-18', 'gpt-4.1-mini', 'gpt-4.1-nano'],
+    'gpt-4o': ['gpt-4o-2024-08-06', 'gpt-4.1', 'gpt-4.1-mini'],
+  };
+  const fallbackEnv = process.env['CHARACTER_FALLBACK_MODELS'];
+  const fallbackModels = fallbackEnv
+    ? fallbackEnv.split(',').map(s => s.trim()).filter(Boolean)
+    : DEFAULT_FALLBACKS[characterModel] ?? [];
+
   const agentConfig: AgentConfig = {
     id: 'default',
     name: config.name,
     enabled: true,
     workspace: paths.workspace,
     providers: [
-      { type: providerType, model: characterModel, apiKeyEnv, ...(baseURL ? { baseURL } : {}) },
-      { type: providerType, model: characterModel, apiKeyEnv, ...(baseURL ? { baseURL } : {}) },
-      { type: providerType, model: characterModel, apiKeyEnv, ...(baseURL ? { baseURL } : {}) },
+      { type: providerType, model: characterModel, apiKeyEnv, fallbackModels, ...(baseURL ? { baseURL } : {}) },
+      { type: providerType, model: characterModel, apiKeyEnv, fallbackModels, ...(baseURL ? { baseURL } : {}) },
+      { type: providerType, model: characterModel, apiKeyEnv, fallbackModels, ...(baseURL ? { baseURL } : {}) },
     ],
   };
 
@@ -212,7 +246,16 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
   }
 
   // Register character-specific tools
-  registerCharacterTools(config.id, config.name, '', '', config.peers);
+  const wiredLainUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
+  const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
+  registerCharacterTools(config.id, config.name, wiredLainUrl, interlinkToken, config.peers);
+
+  // Register doctor-specific diagnostic tools for Dr. Claude
+  if (config.id === 'dr-claude') {
+    const { registerDoctorTools } = await import('../agent/doctor-tools.js');
+    registerDoctorTools();
+    console.log(`[${config.name}] Doctor diagnostic tools registered`);
+  }
 
   // Start background loops
   let loops = startBackgroundLoops(config);
@@ -262,6 +305,20 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
       return;
     }
 
+    // Internal state (interlink auth — used by ambient awareness)
+    if (url.pathname === '/api/internal-state' && req.method === 'GET') {
+      if (!verifyInterlinkAuth(req, res)) return;
+      try {
+        const { getCurrentState, getStateSummary } = await import('../agent/internal-state.js');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ characterId: config.id, summary: getStateSummary(), state: getCurrentState() }));
+      } catch {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ characterId: config.id, summary: '', state: null }));
+      }
+      return;
+    }
+
     // Identity (no auth)
     if (url.pathname === '/api/meta/identity' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -269,17 +326,160 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
       return;
     }
 
-    // SSE event stream
-    if (url.pathname === '/api/events' && req.method === 'GET') {
-      const apiKey = process.env['LAIN_WEB_API_KEY'];
-      if (apiKey) {
-        const keyParam = url.searchParams.get('key');
-        if (!keyParam || !secureCompare(keyParam, apiKey)) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Unauthorized' }));
-          return;
-        }
+    // Commune conversation history — used by /api/relationships aggregator
+    if (url.pathname === '/api/commune-history' && req.method === 'GET') {
+      try {
+        const raw = getMeta('commune:conversation_history');
+        const records = raw ? JSON.parse(raw) : [];
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(records));
+      } catch {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('[]');
       }
+      return;
+    }
+
+    // Integrity check — reports actual data paths for isolation verification (auth required)
+    if (url.pathname === '/api/meta/integrity' && req.method === 'GET') {
+      if (!isOwner(req)) { if (!verifyInterlinkAuth(req, res)) return; }
+      const basePath = getBasePath();
+      const dbPath = join(basePath, 'lain.db');
+      const journalPath = join(basePath, '.private_journal', 'thoughts.json');
+      const selfConceptPath = join(basePath, '.private_journal', 'self-concept.md');
+      const lainHome = process.env['LAIN_HOME'] || '(not set — using default)';
+
+      const checks: Array<{ check: string; ok: boolean; detail: string }> = [];
+
+      checks.push({
+        check: 'LAIN_HOME',
+        ok: !!process.env['LAIN_HOME'],
+        detail: lainHome,
+      });
+
+      checks.push({
+        check: 'basePath_not_cwd',
+        ok: basePath !== process.cwd(),
+        detail: `basePath=${basePath}, cwd=${process.cwd()}`,
+      });
+
+      checks.push({
+        check: 'db_exists',
+        ok: existsSync(dbPath),
+        detail: dbPath,
+      });
+
+      const journalInHome = existsSync(journalPath);
+      const journalInCwd = existsSync(join(process.cwd(), '.private_journal', 'thoughts.json'));
+      checks.push({
+        check: 'journal_in_home',
+        ok: journalInHome || !journalInCwd,
+        detail: journalInHome ? journalPath : journalInCwd ? `WRONG: writing to ${process.cwd()}/.private_journal/` : 'no journal yet',
+      });
+
+      const allOk = checks.every(c => c.ok);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        characterId: config.id,
+        characterName: config.name,
+        basePath,
+        dbPath,
+        journalPath,
+        selfConceptPath,
+        allOk,
+        checks,
+      }));
+      return;
+    }
+
+    // Meta key read — used by evolution system to fetch self-concept etc.
+    if (url.pathname.startsWith('/api/meta/') && req.method === 'GET') {
+      if (!verifyInterlinkAuth(req, res)) return;
+      const key = decodeURIComponent(url.pathname.slice('/api/meta/'.length));
+      if (!key) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing key' }));
+        return;
+      }
+      const value = getMeta(key);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ key, value: value ?? null }));
+      return;
+    }
+
+    // Telemetry — exposes key stats for Dr. Claude's town-wide monitoring (auth required)
+    if (url.pathname === '/api/telemetry' && req.method === 'GET') {
+      if (!isOwner(req)) { if (!verifyInterlinkAuth(req, res)) return; }
+      const sinceMs = Date.now() - 24 * 60 * 60 * 1000;
+      try {
+        const totalMemories = countMemories();
+        const totalMessages = countMessages();
+
+        // Memory types in last 24h
+        const memoryTypes = query<{ memory_type: string; count: number }>(
+          'SELECT memory_type, COUNT(*) as count FROM memories WHERE created_at > ? GROUP BY memory_type',
+          [sinceMs]
+        );
+
+        // Average emotional weight (last 24h)
+        const avgRow = query<{ avg_ew: number }>(
+          'SELECT AVG(emotional_weight) as avg_ew FROM memories WHERE created_at > ?',
+          [sinceMs]
+        );
+
+        // Session activity counts (last 24h) — grouped by session prefix
+        const sessionCounts = query<{ prefix: string; count: number }>(
+          `SELECT substr(session_key, 1, instr(session_key || ':', ':') - 1) as prefix, COUNT(*) as count
+           FROM messages WHERE timestamp > ? GROUP BY prefix ORDER BY count DESC`,
+          [sinceMs]
+        );
+
+        // High emotional weight memories (last 24h)
+        const hotMemories = query<{ content: string; emotional_weight: number }>(
+          'SELECT content, emotional_weight FROM memories WHERE created_at > ? AND emotional_weight > 0.3 ORDER BY emotional_weight DESC LIMIT 5',
+          [sinceMs]
+        );
+
+        // Loop health from meta table
+        const loopKeys = [
+          'dream:cycle_count', 'dream:last_cycle_at',
+          'curiosity:last_cycle_at', 'curiosity-offline:last_cycle_at', 'commune:last_cycle_at',
+          'diary:last_entry_at', 'self-concept:last_synthesis_at',
+          'narrative:weekly:last_synthesis_at', 'narrative:monthly:last_synthesis_at', 'letter:last_sent_at',
+          'letter:blocked', 'desire:last_action_at',
+          'townlife:last_cycle_at', 'memory:last_maintenance_at',
+        ];
+        const loopHealth: Record<string, string | null> = {};
+        for (const key of loopKeys) {
+          loopHealth[key] = getMeta(key) ?? null;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          characterId: config.id,
+          characterName: config.name,
+          timestamp: Date.now(),
+          totalMemories,
+          totalMessages,
+          memoryTypes: Object.fromEntries(memoryTypes.map(r => [r.memory_type, r.count])),
+          avgEmotionalWeight: avgRow[0]?.avg_ew ?? 0,
+          sessionActivity: Object.fromEntries(sessionCounts.map(r => [r.prefix, r.count])),
+          hotMemories: hotMemories.map(m => ({
+            content: m.content.slice(0, 500),
+            emotionalWeight: m.emotional_weight,
+          })),
+          loopHealth,
+        }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Telemetry query failed', detail: String(err) }));
+      }
+      return;
+    }
+
+    // SSE event stream (public — visitors can watch)
+    if (url.pathname === '/api/events' && req.method === 'GET') {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -301,17 +501,8 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
       return;
     }
 
-    // Activity history
+    // Activity history (public — visitors can read)
     if (url.pathname === '/api/activity' && req.method === 'GET') {
-      const apiKey = process.env['LAIN_WEB_API_KEY'];
-      if (apiKey) {
-        const keyParam = url.searchParams.get('key');
-        if (!keyParam || !secureCompare(keyParam, apiKey)) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Unauthorized' }));
-          return;
-        }
-      }
       const fromParam = url.searchParams.get('from');
       const toParam = url.searchParams.get('to');
       const now = Date.now();
@@ -354,6 +545,16 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
       return;
     }
 
+    // Postboard messages (no auth — for character discovery)
+    if (url.pathname === '/api/postboard' && req.method === 'GET') {
+      const sinceParam = url.searchParams.get('since');
+      const since = sinceParam ? Number(sinceParam) : undefined;
+      const messages = getPostboardMessages(since);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(messages));
+      return;
+    }
+
     // === Possession endpoints (only if possessable) ===
     if (config.possessable) {
       const possessionHandled = await handlePossessionRoutes(config, req, res, url, loops);
@@ -361,8 +562,13 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
     }
 
     try {
-      // Streaming chat (SSE) — block during possession
+      // Streaming chat (SSE) — owner auth required, block during possession
       if (url.pathname === '/api/chat/stream' && req.method === 'POST') {
+        if (!isOwner(req)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Unauthorized' }));
+          return;
+        }
         if (config.possessable && isPossessed()) {
           res.writeHead(503, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'unavailable' }));
@@ -373,8 +579,13 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
         return;
       }
 
-      // Non-streaming chat — block during possession
+      // Non-streaming chat — owner auth required, block during possession
       if (url.pathname === '/api/chat' && req.method === 'POST') {
+        if (!isOwner(req)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Unauthorized' }));
+          return;
+        }
         if (config.possessable && isPossessed()) {
           res.writeHead(503, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'unavailable' }));
@@ -401,8 +612,66 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
         return;
       }
 
-      // Peer message (direct, no membrane) — intercept during possession
+      // Dream stats — counts of pending/consumed seeds + last dream cycle
+      if (url.pathname === '/api/dreams/stats' && req.method === 'GET') {
+        if (!verifyInterlinkAuth(req, res)) return;
+        const rows = query<{ pending: number; consumed: number }>(
+          `SELECT
+             SUM(CASE WHEN json_extract(metadata, '$.consumed') != 1 THEN 1 ELSE 0 END) as pending,
+             SUM(CASE WHEN json_extract(metadata, '$.consumed') = 1 THEN 1 ELSE 0 END) as consumed
+           FROM memories WHERE session_key = 'alien:dream-seed'`,
+          []
+        );
+        const stats = rows[0] ?? { pending: 0, consumed: 0 };
+        const lastCycle = getMeta('dream:last_cycle_at');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          characterId: config.id,
+          pending: stats.pending ?? 0,
+          consumed: stats.consumed ?? 0,
+          lastDreamCycle: lastCycle ? parseInt(lastCycle, 10) : null,
+        }));
+        return;
+      }
+
+      // Dream seeds — paginated list of alien dream seed memories
+      if (url.pathname === '/api/dreams/seeds' && req.method === 'GET') {
+        if (!verifyInterlinkAuth(req, res)) return;
+        const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
+        const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+        const seeds = query<{ id: string; content: string; metadata: string; created_at: number; emotional_weight: number }>(
+          `SELECT id, content, metadata, created_at, emotional_weight FROM memories
+           WHERE session_key = 'alien:dream-seed'
+           ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+          [limit, offset]
+        );
+        const totalRows = query<{ cnt: number }>(
+          `SELECT COUNT(*) as cnt FROM memories WHERE session_key = 'alien:dream-seed'`,
+          []
+        );
+        const total = totalRows[0]?.cnt ?? 0;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          characterId: config.id,
+          seeds: seeds.map(s => {
+            const meta = JSON.parse(s.metadata || '{}') as Record<string, unknown>;
+            return {
+              id: s.id,
+              content: s.content,
+              status: meta.consumed === true ? 'consumed' : 'pending',
+              depositedAt: (meta.depositedAt as number) ?? s.created_at,
+              consumedAt: (meta.consumedAt as number) ?? null,
+              emotionalWeight: s.emotional_weight,
+            };
+          }),
+          total,
+        }));
+        return;
+      }
+
+      // Peer message (direct, no membrane) — intercept during possession (interlink auth required)
       if (url.pathname === '/api/peer/message' && req.method === 'POST') {
+        if (!verifyInterlinkAuth(req, res)) return;
         const body = await readBody(req);
         if (config.possessable && isPossessed()) {
           await handlePeerMessagePossessed(body, res);
@@ -412,16 +681,65 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
         return;
       }
 
-      // Static files
+      // Serve skins directory
+      const skinsMatch = url.pathname.match(/^(?:\/[^/]+)?\/skins\/(.+)$/);
+      if (url.pathname.startsWith('/skins/') || skinsMatch) {
+        const skinPath = url.pathname.startsWith('/skins/')
+          ? url.pathname.slice('/skins/'.length)
+          : (skinsMatch?.[1] ?? '');
+        const safePath = skinPath.replace(/^\/+/, '');
+        if (safePath) {
+          const filePath = resolve(SKINS_DIR, safePath);
+          if (filePath.startsWith(resolve(SKINS_DIR))) {
+            try {
+              const content = await readFile(filePath);
+              const ext = extname(filePath);
+              const type = MIME_TYPES[ext] || 'application/octet-stream';
+              res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache' });
+              res.end(content);
+              return;
+            } catch { /* fall through to 404 */ }
+          }
+        }
+        res.writeHead(404);
+        res.end('Not found');
+        return;
+      }
+
+      // Static files — owner auth required for HTML pages (chat UI)
       const file = await serveStatic(config.publicDir, url.pathname);
       if (file) {
-        res.writeHead(200, { 'Content-Type': file.type });
-        res.end(file.content);
+        if (file.type === 'text/html') {
+          if (!isOwner(req)) {
+            res.writeHead(302, { Location: '/commune-map.html' });
+            res.end();
+            return;
+          }
+          const html = file.content.toString().replace(
+            '</head>',
+            `  <meta name="lain-owner" content="true">\n</head>`
+          );
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end(html);
+        } else {
+          res.writeHead(200, { 'Content-Type': file.type });
+          res.end(file.content);
+        }
       } else {
+        // SPA fallback — owner auth required
+        if (!isOwner(req)) {
+          res.writeHead(302, { Location: '/commune-map.html' });
+          res.end();
+          return;
+        }
         const index = await serveStatic(config.publicDir, 'index.html');
         if (index) {
+          const html = index.content.toString().replace(
+            '</head>',
+            `  <meta name="lain-owner" content="true">\n</head>`
+          );
           res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end(index.content);
+          res.end(html);
         } else {
           res.writeHead(404);
           res.end('Not found');
@@ -490,7 +808,7 @@ async function handlePossessionRoutes(
 
   if (!possessionPaths.includes(url.pathname)) return false;
 
-  if (!verifyPossessionAuth(req.headers['authorization'])) {
+  if (!verifyPossessionAuth(req.headers['authorization']) && !isOwner(req)) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Invalid or missing possession token' }));
     return true;
@@ -544,6 +862,7 @@ async function handlePossessionRoutes(
       res.end(JSON.stringify({ error: 'Not possessed' }));
       return true;
     }
+    touchActivity();
 
     const body = await readBody(req);
     const { peerId, message } = JSON.parse(body) as { peerId: string; message: string };
@@ -592,9 +911,10 @@ async function handlePossessionRoutes(
 
     // Send peer message (as Hiru, controlled by player)
     try {
+      const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
       const peerResp = await fetch(`${peer.url}/api/peer/message`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${interlinkToken}` },
         body: JSON.stringify({
           fromId: config.id,
           fromName: config.name,
@@ -626,6 +946,7 @@ async function handlePossessionRoutes(
       res.end(JSON.stringify({ error: 'Not possessed' }));
       return true;
     }
+    touchActivity();
 
     const body = await readBody(req);
     const { building } = JSON.parse(body) as { building: string };
@@ -648,6 +969,7 @@ async function handlePossessionRoutes(
 
   // GET /api/possession/look
   if (url.pathname === '/api/possession/look' && req.method === 'GET') {
+    touchActivity();
     const { getCurrentLocation } = await import('../commune/location.js');
     const { BUILDING_MAP } = await import('../commune/buildings.js');
     const hiruLoc = getCurrentLocation(config.id);
@@ -696,6 +1018,7 @@ async function handlePossessionRoutes(
       res.end(JSON.stringify({ error: 'Not possessed' }));
       return true;
     }
+    touchActivity();
 
     const body = await readBody(req);
     const { fromId, message } = JSON.parse(body) as { fromId: string; message: string };
@@ -894,7 +1217,7 @@ async function handleDreamSeed(
   res: ServerResponse,
   body: string
 ): Promise<void> {
-  if (!verifyInterlinkAuth(req, res)) return;
+  if (!isOwner(req) && !verifyInterlinkAuth(req, res)) return;
 
   const { content, emotionalWeight } = JSON.parse(body) as {
     content: string;
@@ -964,7 +1287,7 @@ async function handlePeerMessage(
     peerKind: 'user',
     peerId: sessionId,
     senderId: fromName,
-    content: { type: 'text', text: message } satisfies TextContent,
+    content: { type: 'text', text: `[${fromName}]: ${message}` } satisfies TextContent,
     timestamp: Date.now(),
   };
 

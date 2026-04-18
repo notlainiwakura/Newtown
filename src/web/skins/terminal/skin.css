@@ -1,0 +1,257 @@
+/* Terminal Skin: CRT green-on-black, scanlines, retro terminal */
+
+:root {
+  /* Backgrounds */
+  --bg-deep: #000800;
+  --bg-primary: #001200;
+  --bg-panel: rgba(0, 30, 0, 0.7);
+  --bg-window: rgba(0, 40, 0, 0.5);
+
+  /* Text */
+  --text-primary: #00cc44;
+  --text-secondary: #008833;
+  --text-dim: #005522;
+
+  /* Accents */
+  --accent-primary: #00ff55;
+  --accent-secondary: #00cc44;
+  --accent-tertiary: #008833;
+  --accent-hover: rgba(0, 255, 85, 0.6);
+  --accent-hover-mid: rgba(0, 255, 85, 0.5);
+  --accent-hover-faint: rgba(0, 255, 85, 0.1);
+  --accent-btn-bg: rgba(0, 255, 85, 0.08);
+  --accent-btn-bg-active: rgba(0, 255, 85, 0.2);
+  --accent-btn-bg-strong: rgba(0, 255, 85, 0.12);
+  --accent-btn-bg-strong-active: rgba(0, 255, 85, 0.25);
+  --accent-subtle: rgba(0, 255, 85, 0.04);
+  --accent-msg-bg: rgba(0, 255, 85, 0.08);
+  --accent-msg-border: rgba(0, 255, 85, 0.2);
+
+  /* Border / glow */
+  --border-glow: rgba(0, 255, 85, 0.3);
+  --glow-primary: 0 0 20px rgba(0, 255, 85, 0.3), 0 0 40px rgba(0, 204, 68, 0.1);
+  --hologram: linear-gradient(135deg, rgba(0, 255, 85, 0.06), rgba(0, 204, 68, 0.03), rgba(0, 136, 51, 0.06));
+
+  /* Grid */
+  --grid-line-color: rgba(0, 255, 85, 0.04);
+
+  /* Fonts */
+  --font-heading: 'VT323', monospace;
+  --font-body: 'VT323', monospace;
+  --font-mono: 'VT323', monospace;
+
+  /* Shapes */
+  --border-radius: 0px;
+  --border-radius-sm: 0px;
+  --border-radius-lg: 0px;
+
+  /* Effects */
+  --scanline-opacity: 0.08;
+  --particle-color: rgba(0, 255, 85, 0.4);
+  --particle-opacity: 0.6;
+
+  /* Messages */
+  --msg-user-bg: rgba(0, 40, 0, 0.7);
+  --msg-user-border: rgba(0, 204, 68, 0.3);
+  --msg-assistant-bg: rgba(0, 255, 85, 0.06);
+  --msg-assistant-border: rgba(0, 255, 85, 0.25);
+  --msg-assistant-glow: 0 0 20px rgba(0, 255, 85, 0.1);
+
+  /* Status */
+  --status-online: #00ff55;
+  --status-error: #ff4400;
+  --error-text: #ff6600;
+  --error-bg: rgba(255, 68, 0, 0.1);
+  --error-border: rgba(255, 68, 0, 0.3);
+
+  /* Character colors */
+  --color-wired-lain: #00ff55;
+  --color-lain: #00cc44;
+  --color-dr-claude: #00ff88;
+  --color-pkd: #00bb33;
+  --color-mckenna: #00ffaa;
+  --color-john: #44ff66;
+  --color-hiru: #00cc77;
+
+  /* Event types */
+  --type-diary: #00cc44;
+  --type-dream: #008833;
+  --type-commune: #00ff88;
+  --type-curiosity: #00ffaa;
+  --type-chat: #00cc44;
+  --type-memory: #00aa33;
+  --type-letter: #00ff55;
+  --type-narrative: #00cc44;
+  --type-self-concept: #008833;
+  --type-doctor: #00ff88;
+  --type-peer: #00ffaa;
+  --type-movement: #88ff00;
+  --type-research: #00ffcc;
+  --type-note: #88cc44;
+  --type-document: #66cc88;
+  --type-gift: #00ff88;
+  --type-default: #448844;
+
+  /* Newspaper */
+  --newspaper-bg: #000500;
+  --newspaper-text: #007722;
+  --newspaper-heading: #00ff55;
+  --newspaper-quote-border: #003311;
+  --newspaper-em: #009933;
+  --newspaper-strong: #00bb33;
+  --newspaper-blockquote: #006622;
+  --newspaper-loading: #002200;
+
+  /* Extended text */
+  --text-bright: #00ee44;
+  --text-muted: #005522;
+  --text-subtle: #006633;
+  --text-placeholder: #003311;
+  --text-dim2: #006622;
+
+  /* Extended accents */
+  --accent-danger: #ff4400;
+  --accent-success: #00ff55;
+  --accent-warn: #88ff00;
+  --accent-liminal: #00ffcc;
+
+  /* Extended borders */
+  --border-dark: #001a00;
+  --border-dark2: #002a00;
+  --border-hover: #004422;
+  --border-panel: #001400;
+  --border-focus: #006633;
+
+  /* Commune Chronicles controls */
+  --controls-border: #001c00;
+  --filter-btn-border: #003311;
+  --filter-btn-color: #007722;
+  --filter-btn-hover-border: #005522;
+  --filter-btn-hover-color: #009933;
+  --masthead-tagline: #003311;
+  --masthead-edition: #005522;
+
+  /* Chronicle entry cards */
+  --entry-bg: #000800;
+  --entry-border: #001c00;
+  --entry-hover-border: #004422;
+  --entry-hover-bg: #000a00;
+  --entry-time: #003311;
+  --entry-body: #006622;
+  --entry-body-expanded: #009933;
+  --loading-color: #003311;
+  --empty-color: #002200;
+
+  /* Postboard */
+  --post-label-color: #007722;
+  --post-status-ok: #1a2a1a;
+  --post-pin-border: #003311;
+
+  /* Town events tag colors */
+  --tag-narrative-color: #00ff55;
+  --tag-narrative-border: #003a1a;
+  --tag-mechanical-color: #88ff00;
+  --tag-mechanical-border: #2a3a00;
+  --tag-instant-color: #888888;
+  --tag-instant-border: #222;
+  --tag-persistent-color: #00ffaa;
+  --tag-persistent-border: #003a22;
+  --tag-natural-color: #66cc44;
+  --tag-natural-border: #1a3010;
+  --tag-liminal-color: #00ffcc;
+  --tag-liminal-border: #003a30;
+
+  /* Nav bar */
+  --nav-game-bg: rgba(0, 8, 0, 0.7);
+  --nav-game-border: rgba(0, 51, 17, 0.5);
+
+  /* Misc */
+  --white-fill: #00cc44;
+  --white-border: rgba(0, 255, 85, 0.3);
+  --white-hover: rgba(0, 255, 85, 0.2);
+  --inset-highlight: rgba(0, 255, 85, 0.08);
+  --glow-primary-strong: 0 0 30px rgba(0, 255, 85, 0.5), 0 0 50px rgba(0, 204, 68, 0.2);
+  --logo-text-shadow: rgba(0, 255, 85, 0.5);
+  --scanline-color: rgba(0, 255, 85, 0.08);
+
+  /* Input / button */
+  --input-bg: rgba(0, 30, 0, 0.8);
+  --input-bg-subtle: rgba(0, 30, 0, 0.5);
+  --focus-glow: 0 0 15px rgba(0, 255, 85, 0.3);
+  --btn-dark: #006622;
+  --btn-light: #00ff55;
+  --btn-shadow: rgba(0, 255, 85, 0.3);
+  --btn-shadow-hover: rgba(0, 255, 85, 0.5);
+  --titlebar-gradient: rgba(0, 255, 85, 0.15);
+  --scrollbar-track: rgba(0, 255, 85, 0.08);
+  --system-msg-bg: rgba(0, 255, 85, 0.04);
+  --user-msg-gradient-end: rgba(0, 40, 0, 0.7);
+  --assistant-msg-gradient-end: rgba(0, 255, 85, 0.05);
+  --input-area-gradient: rgba(0, 255, 85, 0.06);
+  --footer-border: rgba(0, 255, 85, 0.15);
+  --image-shadow: rgba(0, 255, 85, 0.15);
+  --image-shadow-hover: rgba(0, 255, 85, 0.35);
+  --image-btn-hover-shadow: rgba(0, 255, 85, 0.25);
+  --drag-overlay-bg: rgba(0, 5, 0, 0.95);
+
+  /* Error extras */
+  --error-bg-gradient: rgba(255, 68, 0, 0.2);
+  --error-bg-gradient-end: rgba(200, 50, 0, 0.1);
+  --remove-img-bg: rgba(255, 68, 0, 0.3);
+  --remove-img-hover-bg: rgba(255, 68, 0, 0.5);
+  --remove-img-hover-shadow: rgba(255, 100, 40, 0.3);
+
+  /* Commune map surfaces */
+  --header-bg: rgba(0, 8, 0, 0.95);
+  --panel-bg: rgba(0, 12, 0, 0.95);
+  --panel-bg-dark: rgba(0, 8, 0, 0.98);
+  --panel-bg-input: rgba(0, 12, 0, 0.92);
+  --building-bg: rgba(0, 18, 0, 0.85);
+  --chat-modal-bg: rgba(0, 5, 0, 0.98);
+  --chat-modal-titlebar-bg: rgba(0, 18, 0, 0.95);
+  --chat-modal-shadow: -4px 0 24px rgba(0, 0, 0, 0.8);
+  --chat-input-bg: rgba(0, 30, 0, 0.4);
+  --char-msg-bg: rgba(0, 255, 85, 0.03);
+  --entry-kind-bg: rgba(0, 255, 85, 0.05);
+  --notif-bg: rgba(0, 8, 0, 0.85);
+  --text-shadow-dark: rgba(0, 0, 0, 0.9);
+  --node-highlight: rgba(0, 255, 85, 0.2);
+  --status-connected: #00ff55;
+  --cell-pulse-color: rgba(0, 255, 85, 0.4);
+  --cell-pulse-mid: rgba(0, 255, 85, 0.3);
+
+  /* Game view */
+  --game-panel-bg: #001200;
+  --game-ui-border: #00cc44;
+  --game-ui-border-dim: #005522;
+  --game-ui-header: #001a00;
+  --game-input-bg: #001800;
+  --game-input-stroke: #003311;
+  --game-input-text: #00cc44;
+  --game-input-prompt: #008833;
+  --game-input-cursor: #00ff55;
+  --game-hud-location: #008833;
+  --game-hud-prompt: #00ff55;
+  --game-hud-notif: #88ff00;
+  --game-hud-overlay: rgba(0, 8, 0, 0.85);
+  --game-speech-text: #00cc44;
+  --game-speech-bg: rgba(0, 10, 0, 0.93);
+  --game-speech-tail: #000a00;
+  --game-building-label: #006622;
+  --game-grass: #001a08;
+  --game-grass-light: #002010;
+  --game-grass-dark: #001406;
+  --game-grass-outline: #003314;
+  --game-path: #0a1a0a;
+  --game-path-light: #102010;
+  --game-floor: #001008;
+  --game-floor-grid: #001c0e;
+  --game-wall-top: #002010;
+  --game-wall-highlight: #003318;
+  --game-wall-side: #001808;
+  --game-wall-dark: #001006;
+  --game-forest: #000800;
+  --game-water: #000818;
+  --game-water-detail: #000e22;
+  --game-object-label: #00aa33;
+}

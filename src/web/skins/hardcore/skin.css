@@ -1,0 +1,257 @@
+/* Hardcore Skin: Black, red, white. No gradients, no mercy. */
+
+:root {
+  /* Backgrounds */
+  --bg-deep: #000000;
+  --bg-primary: #080808;
+  --bg-panel: rgba(20, 0, 0, 0.9);
+  --bg-window: rgba(30, 0, 0, 0.8);
+
+  /* Text */
+  --text-primary: #ffffff;
+  --text-secondary: #cc0030;
+  --text-dim: #880020;
+
+  /* Accents */
+  --accent-primary: #ff0040;
+  --accent-secondary: #ffffff;
+  --accent-tertiary: #cc0030;
+  --accent-hover: rgba(255, 0, 64, 0.6);
+  --accent-hover-mid: rgba(255, 0, 64, 0.5);
+  --accent-hover-faint: rgba(255, 0, 64, 0.1);
+  --accent-btn-bg: rgba(255, 0, 64, 0.1);
+  --accent-btn-bg-active: rgba(255, 0, 64, 0.3);
+  --accent-btn-bg-strong: rgba(255, 0, 64, 0.15);
+  --accent-btn-bg-strong-active: rgba(255, 0, 64, 0.4);
+  --accent-subtle: rgba(255, 0, 64, 0.05);
+  --accent-msg-bg: rgba(255, 0, 64, 0.08);
+  --accent-msg-border: rgba(255, 0, 64, 0.4);
+
+  /* Border / glow */
+  --border-glow: rgba(255, 0, 64, 0.5);
+  --glow-primary: none;
+  --hologram: none;
+
+  /* Grid */
+  --grid-line-color: rgba(255, 0, 64, 0.05);
+
+  /* Fonts */
+  --font-heading: 'Space Mono', monospace;
+  --font-body: 'Space Mono', monospace;
+  --font-mono: 'Space Mono', monospace;
+
+  /* Shapes */
+  --border-radius: 0px;
+  --border-radius-sm: 0px;
+  --border-radius-lg: 0px;
+
+  /* Effects */
+  --scanline-opacity: 0;
+  --particle-color: rgba(255, 0, 64, 0.5);
+  --particle-opacity: 0.8;
+
+  /* Messages */
+  --msg-user-bg: rgba(255, 0, 64, 0.1);
+  --msg-user-border: rgba(255, 0, 64, 0.5);
+  --msg-assistant-bg: rgba(255, 255, 255, 0.05);
+  --msg-assistant-border: rgba(255, 255, 255, 0.3);
+  --msg-assistant-glow: none;
+
+  /* Status */
+  --status-online: #ffffff;
+  --status-error: #ff0040;
+  --error-text: #ff0040;
+  --error-bg: rgba(255, 0, 64, 0.1);
+  --error-border: rgba(255, 0, 64, 0.5);
+
+  /* Character colors */
+  --color-wired-lain: #ff0040;
+  --color-lain: #ffffff;
+  --color-dr-claude: #ff0040;
+  --color-pkd: #cc0030;
+  --color-mckenna: #ffffff;
+  --color-john: #ff0040;
+  --color-hiru: #ffffff;
+
+  /* Event types */
+  --type-diary: #ff0040;
+  --type-dream: #cc0030;
+  --type-commune: #ffffff;
+  --type-curiosity: #ff0040;
+  --type-chat: #ffffff;
+  --type-memory: #cc0030;
+  --type-letter: #ff0040;
+  --type-narrative: #ff0040;
+  --type-self-concept: #ffffff;
+  --type-doctor: #ff0040;
+  --type-peer: #ffffff;
+  --type-movement: #ff0040;
+  --type-research: #ffffff;
+  --type-note: #aaaaaa;
+  --type-document: #cccccc;
+  --type-gift: #ff0040;
+  --type-default: #888888;
+
+  /* Newspaper */
+  --newspaper-bg: #000000;
+  --newspaper-text: #aaaaaa;
+  --newspaper-heading: #ff0040;
+  --newspaper-quote-border: #440010;
+  --newspaper-em: #cccccc;
+  --newspaper-strong: #ffffff;
+  --newspaper-blockquote: #880020;
+  --newspaper-loading: #220008;
+
+  /* Extended text */
+  --text-bright: #ffffff;
+  --text-muted: #660010;
+  --text-subtle: #880020;
+  --text-placeholder: #330008;
+  --text-dim2: #880020;
+
+  /* Extended accents */
+  --accent-danger: #ff0040;
+  --accent-success: #ffffff;
+  --accent-warn: #ff4000;
+  --accent-liminal: #ff00ff;
+
+  /* Extended borders */
+  --border-dark: #0a0000;
+  --border-dark2: #180004;
+  --border-hover: #440010;
+  --border-panel: #110000;
+  --border-focus: #660010;
+
+  /* Commune Chronicles controls */
+  --controls-border: #1a0004;
+  --filter-btn-border: #440010;
+  --filter-btn-color: #880020;
+  --filter-btn-hover-border: #880020;
+  --filter-btn-hover-color: #cc0030;
+  --masthead-tagline: #440010;
+  --masthead-edition: #660010;
+
+  /* Chronicle entry cards */
+  --entry-bg: #080000;
+  --entry-border: #1a0004;
+  --entry-hover-border: #440010;
+  --entry-hover-bg: #0c0000;
+  --entry-time: #330008;
+  --entry-body: #888888;
+  --entry-body-expanded: #aaaaaa;
+  --loading-color: #330008;
+  --empty-color: #220004;
+
+  /* Postboard */
+  --post-label-color: #880020;
+  --post-status-ok: #1a1a1a;
+  --post-pin-border: #440010;
+
+  /* Town events tag colors */
+  --tag-narrative-color: #ff4060;
+  --tag-narrative-border: #440010;
+  --tag-mechanical-color: #ff8000;
+  --tag-mechanical-border: #441800;
+  --tag-instant-color: #aaaaaa;
+  --tag-instant-border: #333;
+  --tag-persistent-color: #ffffff;
+  --tag-persistent-border: #333;
+  --tag-natural-color: #888888;
+  --tag-natural-border: #222;
+  --tag-liminal-color: #ff00ff;
+  --tag-liminal-border: #440040;
+
+  /* Nav bar */
+  --nav-game-bg: rgba(0, 0, 0, 0.8);
+  --nav-game-border: rgba(68, 0, 16, 0.5);
+
+  /* Misc */
+  --white-fill: #ffffff;
+  --white-border: rgba(255, 0, 64, 0.5);
+  --white-hover: rgba(255, 0, 64, 0.3);
+  --inset-highlight: rgba(255, 0, 64, 0.05);
+  --glow-primary-strong: none;
+  --logo-text-shadow: rgba(255, 0, 64, 0.5);
+  --scanline-color: rgba(255, 0, 64, 0.0);
+
+  /* Input / button */
+  --input-bg: rgba(20, 0, 0, 0.9);
+  --input-bg-subtle: rgba(20, 0, 0, 0.7);
+  --focus-glow: 0 0 10px rgba(255, 0, 64, 0.5);
+  --btn-dark: #990020;
+  --btn-light: #ff4060;
+  --btn-shadow: rgba(255, 0, 64, 0.4);
+  --btn-shadow-hover: rgba(255, 0, 64, 0.6);
+  --titlebar-gradient: rgba(255, 0, 64, 0.15);
+  --scrollbar-track: rgba(255, 0, 64, 0.08);
+  --system-msg-bg: rgba(255, 0, 64, 0.05);
+  --user-msg-gradient-end: rgba(30, 0, 0, 0.8);
+  --assistant-msg-gradient-end: rgba(255, 255, 255, 0.04);
+  --input-area-gradient: rgba(255, 0, 64, 0.05);
+  --footer-border: rgba(255, 0, 64, 0.2);
+  --image-shadow: rgba(255, 0, 64, 0.2);
+  --image-shadow-hover: rgba(255, 0, 64, 0.4);
+  --image-btn-hover-shadow: rgba(255, 0, 64, 0.3);
+  --drag-overlay-bg: rgba(0, 0, 0, 0.95);
+
+  /* Error extras */
+  --error-bg-gradient: rgba(255, 0, 64, 0.2);
+  --error-bg-gradient-end: rgba(200, 0, 40, 0.1);
+  --remove-img-bg: rgba(255, 0, 64, 0.3);
+  --remove-img-hover-bg: rgba(255, 0, 64, 0.5);
+  --remove-img-hover-shadow: rgba(255, 64, 80, 0.3);
+
+  /* Commune map surfaces */
+  --header-bg: rgba(0, 0, 0, 0.95);
+  --panel-bg: rgba(8, 0, 0, 0.98);
+  --panel-bg-dark: rgba(0, 0, 0, 0.98);
+  --panel-bg-input: rgba(8, 0, 0, 0.95);
+  --building-bg: rgba(15, 0, 0, 0.9);
+  --chat-modal-bg: rgba(0, 0, 0, 0.99);
+  --chat-modal-titlebar-bg: rgba(15, 0, 0, 0.95);
+  --chat-modal-shadow: -4px 0 24px rgba(255, 0, 64, 0.1);
+  --chat-input-bg: rgba(20, 0, 0, 0.5);
+  --char-msg-bg: rgba(255, 255, 255, 0.03);
+  --entry-kind-bg: rgba(255, 0, 64, 0.05);
+  --notif-bg: rgba(0, 0, 0, 0.9);
+  --text-shadow-dark: rgba(0, 0, 0, 1.0);
+  --node-highlight: rgba(255, 255, 255, 0.1);
+  --status-connected: #ffffff;
+  --cell-pulse-color: rgba(255, 0, 64, 0.4);
+  --cell-pulse-mid: rgba(255, 0, 64, 0.3);
+
+  /* Game view */
+  --game-panel-bg: #050000;
+  --game-ui-border: #ff0040;
+  --game-ui-border-dim: #660010;
+  --game-ui-header: #0e0000;
+  --game-input-bg: #0a0000;
+  --game-input-stroke: #440010;
+  --game-input-text: #ffffff;
+  --game-input-prompt: #cc0030;
+  --game-input-cursor: #ff0040;
+  --game-hud-location: #cc0030;
+  --game-hud-prompt: #ff0040;
+  --game-hud-notif: #ff0040;
+  --game-hud-overlay: rgba(0, 0, 0, 0.9);
+  --game-speech-text: #ffffff;
+  --game-speech-bg: rgba(8, 0, 0, 0.95);
+  --game-speech-tail: #080000;
+  --game-building-label: #880020;
+  --game-grass: #0a0a0a;
+  --game-grass-light: #0f0f0f;
+  --game-grass-dark: #060606;
+  --game-grass-outline: #1a0008;
+  --game-path: #141010;
+  --game-path-light: #1e1414;
+  --game-floor: #0a0000;
+  --game-floor-grid: #140408;
+  --game-wall-top: #1a0008;
+  --game-wall-highlight: #280010;
+  --game-wall-side: #120004;
+  --game-wall-dark: #0a0002;
+  --game-forest: #030000;
+  --game-water: #000008;
+  --game-water-detail: #08000e;
+  --game-object-label: #aaaaaa;
+}

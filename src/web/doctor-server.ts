@@ -15,7 +15,6 @@ import { nanoid } from 'nanoid';
 import { createProvider } from '../providers/index.js';
 import { getActivity } from '../memory/store.js';
 import { eventBus, isBackgroundEvent, type SystemEvent } from '../events/bus.js';
-import { secureCompare } from '../utils/crypto.js';
 import { loadPersona } from '../agent/persona.js';
 import { initDatabase } from '../storage/database.js';
 import { getPaths } from '../config/index.js';
@@ -24,6 +23,7 @@ import {
   getDoctorToolDefinitions,
   executeDoctorTools,
 } from '../agent/doctor-tools.js';
+import { isOwner } from './owner-auth.js';
 import type {
   Provider,
   Message,
@@ -348,17 +348,8 @@ ${persona.identity}`;
       return;
     }
 
-    // SSE event stream
+    // SSE event stream (public — visitors can watch)
     if (url.pathname === '/api/events' && req.method === 'GET') {
-      const apiKey = process.env['LAIN_WEB_API_KEY'];
-      if (apiKey) {
-        const keyParam = url.searchParams.get('key');
-        if (!keyParam || !secureCompare(keyParam, apiKey)) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Unauthorized' }));
-          return;
-        }
-      }
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -380,17 +371,8 @@ ${persona.identity}`;
       return;
     }
 
-    // Activity history
+    // Activity history (public — visitors can read)
     if (url.pathname === '/api/activity' && req.method === 'GET') {
-      const apiKey = process.env['LAIN_WEB_API_KEY'];
-      if (apiKey) {
-        const keyParam = url.searchParams.get('key');
-        if (!keyParam || !secureCompare(keyParam, apiKey)) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Unauthorized' }));
-          return;
-        }
-      }
       const fromParam = url.searchParams.get('from');
       const toParam = url.searchParams.get('to');
       const now = Date.now();
@@ -402,8 +384,13 @@ ${persona.identity}`;
       return;
     }
 
-    // Streaming chat (SSE)
+    // Streaming chat (SSE) — owner auth required
     if (url.pathname === '/api/chat/stream' && req.method === 'POST') {
+      if (!isOwner(req)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
       let body = '';
       req.on('data', (chunk) => {
         body += chunk.toString();
@@ -420,8 +407,13 @@ ${persona.identity}`;
       return;
     }
 
-    // Non-streaming chat
+    // Non-streaming chat — owner auth required
     if (url.pathname === '/api/chat' && req.method === 'POST') {
+      if (!isOwner(req)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
       let body = '';
       req.on('data', (chunk) => {
         body += chunk.toString();
@@ -440,16 +432,39 @@ ${persona.identity}`;
       return;
     }
 
-    // Static files
+    // Static files — owner auth required for HTML pages (chat UI)
     const file = await serveStatic(url.pathname);
     if (file) {
-      res.writeHead(200, { 'Content-Type': file.type });
-      res.end(file.content);
+      if (file.type === 'text/html') {
+        if (!isOwner(req)) {
+          res.writeHead(302, { Location: '/commune-map.html' });
+          res.end();
+          return;
+        }
+        const html = file.content.toString().replace(
+          '</head>',
+          `  <meta name="lain-owner" content="true">\n</head>`
+        );
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(html);
+      } else {
+        res.writeHead(200, { 'Content-Type': file.type });
+        res.end(file.content);
+      }
     } else {
+      if (!isOwner(req)) {
+        res.writeHead(302, { Location: '/commune-map.html' });
+        res.end();
+        return;
+      }
       const index = await serveStatic('index.html');
       if (index) {
+        const html = index.content.toString().replace(
+          '</head>',
+          `  <meta name="lain-owner" content="true">\n</head>`
+        );
         res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(index.content);
+        res.end(html);
       } else {
         res.writeHead(404);
         res.end('Not found');

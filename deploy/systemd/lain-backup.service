@@ -1,0 +1,14 @@
+[Unit]
+Description=Laintown Database Backup
+After=lain.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/local-lain
+ExecStart=/bin/bash deploy/backup-dbs.sh
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lain-backup

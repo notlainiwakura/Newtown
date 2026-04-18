@@ -1,0 +1,12 @@
+{
+  "id": "vaporwave",
+  "name": "Aesthetic",
+  "description": "Magenta/cyan retrofuturism, 80s digital nostalgia",
+  "fonts": { "heading": "Audiowide", "body": "VT323", "mono": "VT323" },
+  "buildingIcons": {
+    "library": "📼", "bar": "🍸", "field": "🌴", "windmill": "💿",
+    "lighthouse": "📡", "school": "💾", "market": "🏬", "locksmith": "🔮", "threshold": "🌀"
+  },
+  "googleFontsUrl": "https://fonts.googleapis.com/css2?family=Audiowide&family=VT323&display=swap",
+  "previewColors": ["#ff40ff", "#40ffff", "#ff8040"]
+}

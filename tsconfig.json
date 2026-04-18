@@ -23,13 +23,5 @@
     "isolatedModules": true
   },
   "include": ["src/**/*"],
-  "exclude": [
-    "node_modules",
-    "dist",
-    "test",
-    "src/browser/**/*",
-    "src/channels/discord.ts",
-    "src/channels/slack.ts",
-    "src/channels/whatsapp.ts"
-  ]
+  "exclude": ["node_modules", "dist", "test"]
 }

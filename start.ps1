@@ -160,6 +160,8 @@ $sharedEnv = @{
   CHARACTER_BASE_URL = if ($env:CHARACTER_BASE_URL) { $env:CHARACTER_BASE_URL } else { (if ($env:OPENAI_BASE_URL) { $env:OPENAI_BASE_URL } else { 'http://192.168.68.69:8080/v1' }) }
   CHARACTER_MODEL    = if ($env:CHARACTER_MODEL) { $env:CHARACTER_MODEL } else { (if ($env:OPENAI_MODEL) { $env:OPENAI_MODEL } else { 'MiniMax-M2.7' }) }
   CHARACTER_PROVIDER = if ($env:CHARACTER_PROVIDER) { $env:CHARACTER_PROVIDER } else { 'openai' }
+  LAIN_INTERLINK_TOKEN = if ($env:LAIN_INTERLINK_TOKEN) { $env:LAIN_INTERLINK_TOKEN } else { 'newtown-interlink' }
+  ENABLE_RESEARCH      = if ($env:ENABLE_RESEARCH) { $env:ENABLE_RESEARCH } else { '0' }
 }
 
 $peerNeo = '[{"id":"plato","name":"Plato","url":"http://127.0.0.1:3004"},{"id":"joe","name":"Joe","url":"http://127.0.0.1:3005"}]'
@@ -168,11 +170,11 @@ $peerJoe = '[{"id":"neo","name":"Neo","url":"http://127.0.0.1:3003"},{"id":"plat
 
 Write-Host 'Starting services...'
 $processes = @()
-$processes += Start-LoggedProcess -Name 'web' -NodeExe $nodeExe -WorkingDirectory $root -Arguments @('dist\index.js', 'web', '--port', "$webPort") -LogPath (Join-Path $logDir 'web.log') -Environment (Merge-Environment -Base $sharedEnv -Override @{ LAIN_HOME = $webHome })
-$processes += Start-LoggedProcess -Name 'gateway' -NodeExe $nodeExe -WorkingDirectory $root -Arguments @('dist\index.js', 'gateway') -LogPath (Join-Path $logDir 'gateway.log') -Environment (Merge-Environment -Base $sharedEnv -Override @{ LAIN_HOME = $webHome })
-$processes += Start-LoggedProcess -Name 'neo' -NodeExe $nodeExe -WorkingDirectory $root -Arguments @('dist\index.js', 'neo', '--port', '3003') -LogPath (Join-Path $logDir 'neo.log') -Environment (Merge-Environment -Base $sharedEnv -Override @{ LAIN_HOME = $neoHome; PORT = '3003'; PEER_CONFIG = $peerNeo })
-$processes += Start-LoggedProcess -Name 'plato' -NodeExe $nodeExe -WorkingDirectory $root -Arguments @('dist\index.js', 'plato', '--port', '3004') -LogPath (Join-Path $logDir 'plato.log') -Environment (Merge-Environment -Base $sharedEnv -Override @{ LAIN_HOME = $platoHome; PORT = '3004'; PEER_CONFIG = $peerPlato })
-$processes += Start-LoggedProcess -Name 'joe' -NodeExe $nodeExe -WorkingDirectory $root -Arguments @('dist\index.js', 'joe', '--port', '3005') -LogPath (Join-Path $logDir 'joe.log') -Environment (Merge-Environment -Base $sharedEnv -Override @{ LAIN_HOME = $joeHome; PORT = '3005'; PEER_CONFIG = $peerJoe })
+$processes += Start-LoggedProcess -Name 'web' -NodeExe $nodeExe -WorkingDirectory $root -Arguments @('dist\scripts\run-service.js', 'web', "$webPort") -LogPath (Join-Path $logDir 'web.log') -Environment (Merge-Environment -Base $sharedEnv -Override @{ LAIN_HOME = $webHome })
+$processes += Start-LoggedProcess -Name 'gateway' -NodeExe $nodeExe -WorkingDirectory $root -Arguments @('dist\scripts\run-service.js', 'gateway') -LogPath (Join-Path $logDir 'gateway.log') -Environment (Merge-Environment -Base $sharedEnv -Override @{ LAIN_HOME = $webHome })
+$processes += Start-LoggedProcess -Name 'neo' -NodeExe $nodeExe -WorkingDirectory $root -Arguments @('dist\scripts\run-service.js', 'neo', '3003') -LogPath (Join-Path $logDir 'neo.log') -Environment (Merge-Environment -Base $sharedEnv -Override @{ LAIN_HOME = $neoHome; PORT = '3003'; PEER_CONFIG = $peerNeo })
+$processes += Start-LoggedProcess -Name 'plato' -NodeExe $nodeExe -WorkingDirectory $root -Arguments @('dist\scripts\run-service.js', 'plato', '3004') -LogPath (Join-Path $logDir 'plato.log') -Environment (Merge-Environment -Base $sharedEnv -Override @{ LAIN_HOME = $platoHome; PORT = '3004'; PEER_CONFIG = $peerPlato })
+$processes += Start-LoggedProcess -Name 'joe' -NodeExe $nodeExe -WorkingDirectory $root -Arguments @('dist\scripts\run-service.js', 'joe', '3005') -LogPath (Join-Path $logDir 'joe.log') -Environment (Merge-Environment -Base $sharedEnv -Override @{ LAIN_HOME = $joeHome; PORT = '3005'; PEER_CONFIG = $peerJoe })
 
 Start-Sleep -Seconds 5
 

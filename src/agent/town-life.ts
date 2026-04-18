@@ -18,8 +18,12 @@ import { getCurrentLocation, getLocationHistory } from '../commune/location.js';
 import { BUILDING_MAP } from '../commune/buildings.js';
 import { getLogger } from '../utils/logger.js';
 import { getMeta, setMeta } from '../storage/database.js';
+import { setCurrentLocation } from '../commune/location.js';
+import { eventBus } from '../events/bus.js';
+import type { BuildingId } from '../commune/buildings.js';
 import type { PeerConfig } from './character-tools.js';
 import type { ToolResult } from '../providers/base.js';
+import type { TownEvent, EventEffects } from '../events/town-events.js';
 
 export interface TownLifeConfig {
   intervalMs: number;
@@ -31,8 +35,8 @@ export interface TownLifeConfig {
 }
 
 const DEFAULT_CONFIG: Omit<TownLifeConfig, 'characterId' | 'characterName' | 'peers'> = {
-  intervalMs: 2 * 60 * 60 * 1000,       // 2 hours
-  maxJitterMs: 1 * 60 * 60 * 1000,      // 0-1h jitter (so 2-3h effective)
+  intervalMs: 6 * 60 * 60 * 1000,       // 6 hours
+  maxJitterMs: 2 * 60 * 60 * 1000,      // 0-2h jitter (so 6-8h effective)
   enabled: true,
 };
 
@@ -43,6 +47,8 @@ const MAX_TOOL_ITERATIONS = 3;
 
 const TOWN_LIFE_TOOLS = new Set([
   'move_to_building', 'leave_note', 'write_document', 'give_gift', 'recall', 'read_document',
+  'create_object', 'examine_objects', 'pickup_object', 'drop_object', 'give_object', 'destroy_object',
+  'reflect_on_object', 'compose_objects',
 ]);
 
 interface ActionRecord {
@@ -78,6 +84,15 @@ export function startTownLifeLoop(
 
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
+  let lastRun = 0;
+  let isRunning = false;
+  const COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+  // Load persisted lastRun from meta
+  try {
+    const lr = getMeta(META_KEY_LAST_CYCLE);
+    if (lr) lastRun = parseInt(lr, 10) || 0;
+  } catch { /* fresh start */ }
 
   function getInitialDelay(): number {
     try {
@@ -106,18 +121,42 @@ export function startTownLifeLoop(
 
     timer = setTimeout(async () => {
       if (stopped) return;
+      isRunning = true;
       logger.info('Town life cycle firing');
       try {
         await runTownLifeCycle(cfg);
         setMeta(META_KEY_LAST_CYCLE, Date.now().toString());
+        lastRun = Date.now();
       } catch (err) {
         logger.error({ error: String(err) }, 'Town life cycle error');
+      } finally {
+        isRunning = false;
       }
       scheduleNext();
     }, d);
   }
 
   scheduleNext(getInitialDelay());
+
+  // --- Event-driven early triggers ---
+  function maybeRunEarly(reason: string): void {
+    if (stopped || isRunning) return;
+    const elapsed = Date.now() - lastRun;
+    if (elapsed < COOLDOWN_MS) return;
+
+    // No condition check — any relevant trigger is enough
+    logger.debug({ reason }, 'Town life triggered early');
+    if (timer) clearTimeout(timer);
+    const jitter = Math.random() * 60_000;
+    scheduleNext(jitter);
+  }
+
+  eventBus.on('activity', (event: import('../events/bus.js').SystemEvent) => {
+    if (stopped || isRunning) return;
+    if (event.type === 'commune' || event.type === 'state' || event.type === 'weather') {
+      maybeRunEarly(event.type + ' event');
+    }
+  });
 
   return () => {
     stopped = true;
@@ -138,10 +177,10 @@ function getTimeOfDay(): 'dawn' | 'day' | 'dusk' | 'night' {
 
 function getTimeFlavor(tod: string): string {
   switch (tod) {
-    case 'dawn': return 'The light is just beginning. The commune is quiet.';
+    case 'dawn': return 'The light is just beginning. The commune is quiet. The boundaries between sleep and waking feel thin — The Threshold hums at the edge of town.';
     case 'day': return 'The commune hums with its usual rhythms.';
-    case 'dusk': return 'The light is fading. Shadows stretch between buildings.';
-    case 'night': return 'The town has gone quiet. Windows glow here and there, but most doors stay shut.';
+    case 'dusk': return 'The light is fading. Shadows stretch between buildings. The hour feels liminal — neither day nor night. The Threshold\'s door stands slightly ajar.';
+    case 'night': return 'The commune sleeps. Only the lighthouse beam sweeps the dark.';
     default: return '';
   }
 }
@@ -232,6 +271,52 @@ async function discoverDocuments(
   return docs;
 }
 
+// --- Postboard Discovery ---
+
+interface PostboardEntry {
+  author: string;
+  content: string;
+  pinned: boolean;
+  createdAt: number;
+}
+
+async function discoverPostboard(
+  peers: PeerConfig[]
+): Promise<PostboardEntry[]> {
+  // Try to read from any reachable peer (all share the same postboard via Wired Lain)
+  // Also try our own DB first
+  try {
+    const { getPostboardMessages } = await import('../memory/store.js');
+    const local = getPostboardMessages(undefined, 10);
+    if (local.length > 0) {
+      return local.map((m) => ({
+        author: m.author,
+        content: m.content,
+        pinned: m.pinned,
+        createdAt: m.createdAt,
+      }));
+    }
+  } catch {
+    // Continue to peers
+  }
+
+  for (const peer of peers) {
+    try {
+      const resp = await fetch(`${peer.url}/api/postboard`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (resp.ok) {
+        const messages = await resp.json() as PostboardEntry[];
+        if (messages.length > 0) return messages;
+      }
+    } catch {
+      // Peer unreachable — try next
+    }
+  }
+
+  return [];
+}
+
 // --- Nearby Peers ---
 
 async function findNearbyPeers(
@@ -286,7 +371,7 @@ function appendRecentAction(record: ActionRecord): void {
 async function runTownLifeCycle(config: TownLifeConfig): Promise<void> {
   const logger = getLogger();
 
-  const provider = getProvider('default', 'personality');
+  const provider = getProvider('default', 'light');
   if (!provider) {
     logger.warn('Town life cycle: no provider available');
     return;
@@ -294,7 +379,7 @@ async function runTownLifeCycle(config: TownLifeConfig): Promise<void> {
 
   // === Phase 1: Awareness ===
   const loc = getCurrentLocation(config.characterId);
-  const building = BUILDING_MAP.get(loc.building);
+  let building = BUILDING_MAP.get(loc.building);
   const timeOfDay = getTimeOfDay();
   const timeDesc = getTimeDescription();
   const timeFlavor = getTimeFlavor(timeOfDay);
@@ -331,6 +416,15 @@ async function runTownLifeCycle(config: TownLifeConfig): Promise<void> {
     ? `WRITINGS BY OTHERS:\n${discoveredDocs.map((d) => `  [${d.author}] "${d.title}" — ${d.preview}`).join('\n')}`
     : '';
 
+  const postboardMessages = await discoverPostboard(config.peers);
+  const postboardContext = postboardMessages.length > 0
+    ? `POSTBOARD (messages from the Administrator — read carefully):\n${postboardMessages.map((m) => {
+        const pin = m.pinned ? ' [PINNED]' : '';
+        const time = new Date(m.createdAt).toLocaleString();
+        return `  ${pin} [${time}] ${m.content}`;
+      }).join('\n')}`
+    : '';
+
   const recentActions = getRecentActions();
   const actionsContext = recentActions.length > 0
     ? recentActions.map((a) => `- ${new Date(a.timestamp).toLocaleTimeString()}: ${a.actions.join(', ')} at ${a.building}${a.innerThought ? ` — "${a.innerThought}"` : ''}`).join('\n')
@@ -339,12 +433,84 @@ async function runTownLifeCycle(config: TownLifeConfig): Promise<void> {
   // === Phase 2: Impulse ===
   const tools = getToolDefinitions().filter((t) => TOWN_LIFE_TOOLS.has(t.name));
 
+  // Fetch objects at current location and in inventory from Wired Lain registry
+  let objectsContext = '';
+  try {
+    const wiredUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
+    const [hereResp, invResp] = await Promise.all([
+      fetch(`${wiredUrl}/api/objects?location=${encodeURIComponent(loc.building)}`, { signal: AbortSignal.timeout(5000) }).catch(() => null),
+      fetch(`${wiredUrl}/api/objects?owner=${encodeURIComponent(config.characterId)}`, { signal: AbortSignal.timeout(5000) }).catch(() => null),
+    ]);
+    const hereObjects = hereResp?.ok ? await hereResp.json() as { id: string; name: string; description: string; creatorName: string; metadata?: Record<string, unknown> }[] : [];
+    const invObjects = invResp?.ok ? await invResp.json() as { id: string; name: string; description: string; creatorName: string }[] : [];
+    const parts: string[] = [];
+
+    // Separate fixtures from loose objects
+    const fixtures = hereObjects.filter((o) => o.metadata?.fixture === true);
+    const looseObjects = hereObjects.filter((o) => !o.metadata?.fixture);
+
+    if (fixtures.length > 0) {
+      parts.push(`FIXTURES HERE:\n${fixtures.map((o) => `- "${o.name}" — ${o.description.slice(0, 120)}`).join('\n')}`);
+    }
+    if (looseObjects.length > 0) {
+      parts.push(`OBJECTS HERE:\n${looseObjects.map((o) => `- [${o.id}] "${o.name}" by ${o.creatorName} — ${o.description.slice(0, 100)}`).join('\n')}`);
+    }
+    if (invObjects.length > 0) {
+      parts.push(`YOUR INVENTORY:\n${invObjects.map((o) => `- [${o.id}] "${o.name}" — ${o.description.slice(0, 100)}`).join('\n')}`);
+    }
+    objectsContext = parts.join('\n\n');
+  } catch { /* ignore — objects are optional context */ }
+
+  // Fetch active town events
+  let eventsContext = '';
+  let activeEffects: EventEffects = {};
+  try {
+    const wiredUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
+    const [evResp, efResp] = await Promise.all([
+      fetch(`${wiredUrl}/api/town-events`, { signal: AbortSignal.timeout(5000) }).catch(() => null),
+      fetch(`${wiredUrl}/api/town-events/effects`, { signal: AbortSignal.timeout(5000) }).catch(() => null),
+    ]);
+    const events = evResp?.ok ? await evResp.json() as TownEvent[] : [];
+    activeEffects = efResp?.ok ? await efResp.json() as EventEffects : {};
+    if (events.length > 0) {
+      eventsContext = `TOWN EVENTS (active):\n${events.map((e) => {
+        const tags: string[] = [];
+        if (e.liminal) tags.push('LIMINAL');
+        if (e.natural) tags.push('NATURAL');
+        if (e.persistent) tags.push('ONGOING');
+        const prefix = tags.length > 0 ? `[${tags.join(' · ')}] ` : '';
+        return `  - ${prefix}${e.description}`;
+      }).join('\n')}`;
+    }
+    // Force relocation if needed
+    if (activeEffects.forceLocation && activeEffects.forceLocation !== loc.building) {
+      logger.info(
+        { from: loc.building, to: activeEffects.forceLocation },
+        'Town event: forced relocation'
+      );
+      setCurrentLocation(activeEffects.forceLocation as BuildingId, 'town event forced relocation');
+      // Refresh location context
+      const newBuilding = BUILDING_MAP.get(activeEffects.forceLocation);
+      loc.building = activeEffects.forceLocation;
+      if (newBuilding) {
+        building = newBuilding;
+      }
+    }
+  } catch { /* events are optional context */ }
+
+  // Fetch building residue — traces of what's happened here
+  let residueContext = '';
+  try {
+    const { buildBuildingResidueContext } = await import('../commune/building-memory.js');
+    residueContext = await buildBuildingResidueContext(config.characterId);
+  } catch { /* non-critical */ }
+
   const prompt = `You are ${config.characterName}. It is ${timeOfDay} in the commune.
 
 CURRENT LOCATION: ${building?.name ?? loc.building} — ${building?.description ?? 'unknown'}
 TIME: ${timeDesc}
 ${nearbyContext}
-${notesContext ? `\n${notesContext}\n` : ''}${docsContext ? `\n${docsContext}\n` : ''}
+${postboardContext ? `\n${postboardContext}\n` : ''}${eventsContext ? `\n${eventsContext}\n` : ''}${notesContext ? `\n${notesContext}\n` : ''}${docsContext ? `\n${docsContext}\n` : ''}${objectsContext ? `\n${objectsContext}\n` : ''}${residueContext ? `\n${residueContext}\n` : ''}
 RECENT MEMORIES:
 ${memoriesContext || '(none)'}
 
@@ -360,7 +526,10 @@ This is a quiet moment. You can:
 - Write something — an essay, poem, field report
 - Read something a peer has written (use read_document if a title catches your eye)
 - Give a gift to someone you've been thinking about
+- Create or interact with a physical object (examine_objects to see what's here or in your inventory)
 - Or simply stay where you are
+
+Objects persist in the commune — they stay where they're left, and others can find them. If you notice something here that catches your eye, or you're carrying something that feels like it belongs somewhere, you can act on that.
 
 There is no obligation to act. If nothing feels right, respond with just [STAY].
 
@@ -375,7 +544,7 @@ ${timeFlavor}`;
     let result = await provider.completeWithTools({
       messages: [{ role: 'user', content: prompt }],
       tools,
-      maxTokens: 800,
+      maxTokens: 1024,
       temperature: 1.0,
     });
 
@@ -391,7 +560,7 @@ ${timeFlavor}`;
       }
 
       result = await provider.continueWithToolResults(
-        { messages: [{ role: 'user', content: prompt }], tools, maxTokens: 800, temperature: 1.0 },
+        { messages: [{ role: 'user', content: prompt }], tools, maxTokens: 1024, temperature: 1.0 },
         result.toolCalls,
         toolResults
       );
@@ -436,6 +605,40 @@ ${timeFlavor}`;
     building: loc.building,
     innerThought: innerThought.slice(0, 200),
   });
+
+  // Record building events for spatial residue
+  try {
+    const { recordBuildingEvent } = await import('../commune/building-memory.js');
+    for (const action of actionsTaken) {
+      if (action === 'leave_note') {
+        await recordBuildingEvent({
+          building: loc.building,
+          event_type: 'note_left',
+          summary: `${config.characterName} left a note here`,
+          emotional_tone: 0.1,
+          actors: [config.characterId],
+        });
+      } else if (action === 'create_object' || action === 'drop_object') {
+        await recordBuildingEvent({
+          building: loc.building,
+          event_type: 'object_placed',
+          summary: `${config.characterName} left an object here`,
+          emotional_tone: 0.2,
+          actors: [config.characterId],
+        });
+      }
+    }
+    // Shared silence — only record quiet moments when others are present
+    if (actionsTaken.length === 0 && innerThought && nearbyPeers.length > 0) {
+      await recordBuildingEvent({
+        building: loc.building,
+        event_type: 'quiet_moment',
+        summary: `${config.characterName} and ${nearbyPeers.map(p => p.name).join(', ')} shared a quiet moment here`,
+        emotional_tone: 0.1,
+        actors: [config.characterId, ...nearbyPeers.map(p => p.id)],
+      });
+    }
+  } catch { /* non-critical */ }
 
   logger.info(
     {

@@ -9,6 +9,8 @@ import { exec } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { query, getMeta } from '../storage/database.js';
 import { countMemories, countMessages } from '../memory/store.js';
+import { getBasePath } from '../config/paths.js';
+import { registerTool } from './tools.js';
 import type { ToolDefinition, ToolCall, ToolResult } from '../providers/base.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -95,7 +97,7 @@ const checkServiceHealth: DoctorTool = {
   definition: {
     name: 'check_service_health',
     description:
-      'Check if all commune services are running and healthy. Checks Wired Lain (:3000), Dr. Claude (:3002), PKD (:3003), McKenna (:3004), John (:3005), voice service (:8765), and the commune map dashboard.',
+      'Check if all commune services are running and healthy. Checks Wired Lain (:3000), Dr. Claude (:3002), PKD (:3003), McKenna (:3004), John (:3005), and the commune map dashboard.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -104,14 +106,15 @@ const checkServiceHealth: DoctorTool = {
   handler: async () => {
     const results: string[] = ['=== COMMUNE SERVICE HEALTH ===', ''];
 
-    // All character services + voice
+    // All character services
     const services = [
       { name: 'Wired Lain', port: 3000, identityPath: '/api/meta/identity' },
+      { name: 'Lain', port: 3001, identityPath: '/api/meta/identity' },
       { name: 'Dr. Claude', port: 3002, identityPath: '/api/meta/identity' },
       { name: 'PKD', port: 3003, identityPath: '/api/meta/identity' },
       { name: 'McKenna', port: 3004, identityPath: '/api/meta/identity' },
       { name: 'John', port: 3005, identityPath: '/api/meta/identity' },
-      { name: 'Voice service', port: 8765, identityPath: '/calls' },
+      { name: 'Hiru', port: 3006, identityPath: '/api/meta/identity' },
     ];
 
     for (const svc of services) {
@@ -227,8 +230,9 @@ const getTelemetry: DoctorTool = {
       'Letter blocked': getMeta('letter:blocked') ?? 'false',
       'Bibliomancy last run': formatMetaTimestamp(getMeta('bibliomancy:last_cycle_at')),
       'Diary last entry': formatMetaTimestamp(getMeta('diary:last_entry_at')),
-      'Self-concept last updated': formatMetaTimestamp(getMeta('self_concept:updated_at')),
-      'Narrative last updated': formatMetaTimestamp(getMeta('narrative:updated_at')),
+      'Self-concept last updated': formatMetaTimestamp(getMeta('self-concept:last_synthesis_at')),
+      'Narrative weekly': formatMetaTimestamp(getMeta('narrative:weekly:last_synthesis_at')),
+      'Narrative monthly': formatMetaTimestamp(getMeta('narrative:monthly:last_synthesis_at')),
     };
 
     // Previous analysis
@@ -237,7 +241,7 @@ const getTelemetry: DoctorTool = {
     // Recent diary entries
     let recentDiary = '(no diary entries)';
     try {
-      const journalPath = join(PROJECT_ROOT, '.private_journal', 'thoughts.json');
+      const journalPath = join(getBasePath(), '.private_journal', 'thoughts.json');
       if (existsSync(journalPath)) {
         const raw = readFileSync(journalPath, 'utf-8');
         const data = JSON.parse(raw) as { entries?: Array<{ timestamp: string; content: string }> };
@@ -496,9 +500,71 @@ function formatMetaTimestamp(value: string | null): string {
 // Exported registry
 // ============================================================
 
+const getHealthStatus: DoctorTool = {
+  definition: {
+    name: 'get_health_status',
+    description:
+      'Get the latest automated health check results. Dr. Claude runs health checks every 10 minutes — this returns the most recent result including which services are up/down, response times, and any auto-fix attempts.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  handler: async () => {
+    const latest = getMeta('doctor:health:latest');
+    const lastRun = getMeta('doctor:health:last_run_at');
+
+    if (!latest) {
+      return 'No health check results yet. The first check runs ~2 minutes after startup.';
+    }
+
+    const result = JSON.parse(latest) as {
+      timestamp: number;
+      services: Array<{
+        name: string;
+        port: number;
+        status: string;
+        responseMs?: number;
+        identity?: string;
+      }>;
+      allHealthy: boolean;
+      fixAttempted: boolean;
+      fixOutput?: string;
+    };
+
+    const lines: string[] = [
+      '=== HEALTH CHECK STATUS ===',
+      '',
+      `Last check: ${lastRun ? new Date(parseInt(lastRun, 10)).toISOString() : 'unknown'}`,
+      `Overall: ${result.allHealthy ? 'ALL HEALTHY' : 'ISSUES DETECTED'}`,
+      '',
+      '--- Services ---',
+    ];
+
+    for (const svc of result.services) {
+      const icon = svc.status === 'up' ? 'UP' : 'DOWN';
+      const ms = svc.responseMs != null ? ` (${svc.responseMs}ms)` : '';
+      const id = svc.identity ? ` [${svc.identity}]` : '';
+
+      // Check consecutive failure count
+      const failCount = getMeta(`doctor:health:failures:${svc.port}`) ?? '0';
+      const failSuffix = parseInt(failCount, 10) > 0 ? ` — ${failCount} consecutive failures` : '';
+
+      lines.push(`  ${svc.name} (:${svc.port}): ${icon}${ms}${id}${failSuffix}`);
+    }
+
+    if (result.fixAttempted) {
+      lines.push('', '--- Auto-Fix Output ---', result.fixOutput ?? '(no output)');
+    }
+
+    return lines.join('\n');
+  },
+};
+
 export const doctorTools: DoctorTool[] = [
   runDiagnosticTests,
   checkServiceHealth,
+  getHealthStatus,
   getTelemetry,
   readFileTool,
   editFileTool,
@@ -619,4 +685,17 @@ doctorTools.push(getReportsTool);
 
 export async function executeDoctorTools(toolCalls: ToolCall[]): Promise<ToolResult[]> {
   return Promise.all(toolCalls.map(executeDoctorTool));
+}
+
+/**
+ * Register all doctor tools into the standard agent tool registry.
+ * Called by character-server when starting Dr. Claude as a full inhabitant.
+ */
+export function registerDoctorTools(): void {
+  for (const tool of doctorTools) {
+    registerTool({
+      definition: tool.definition,
+      handler: tool.handler,
+    });
+  }
 }

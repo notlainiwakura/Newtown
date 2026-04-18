@@ -1,6 +1,6 @@
 /**
- * Town location state management.
- * Persists each resident's location separately via the meta store
+ * Commune Town — Location state management.
+ * Persists character locations via the meta key-value store
  * and emits movement events through the event bus.
  */
 
@@ -22,23 +22,15 @@ interface LocationHistoryEntry {
 
 const MAX_HISTORY = 20;
 
-function currentLocationKey(characterId: string): string {
-  return `town:${characterId}:current_location`;
-}
-
-function locationHistoryKey(characterId: string): string {
-  return `town:${characterId}:location_history`;
-}
-
 /**
- * Get the current location for a resident.
+ * Get the current location for a character.
  * Falls back to DEFAULT_LOCATIONS if nothing is persisted.
  */
 export function getCurrentLocation(characterId?: string): LocationRecord {
-  const charId = characterId || eventBus.characterId || 'default';
+  const charId = characterId || eventBus.characterId;
 
   try {
-    const raw = getMeta(currentLocationKey(charId));
+    const raw = getMeta('town:current_location');
     if (raw) {
       const record = JSON.parse(raw) as LocationRecord;
       if (record.building && BUILDING_MAP.has(record.building)) {
@@ -46,7 +38,7 @@ export function getCurrentLocation(characterId?: string): LocationRecord {
       }
     }
   } catch {
-    // Fall through to default.
+    // Fall through to default
   }
 
   const defaultBuilding = DEFAULT_LOCATIONS[charId] || 'square';
@@ -55,43 +47,64 @@ export function getCurrentLocation(characterId?: string): LocationRecord {
 
 /**
  * Set the current location, append to history, and emit a movement event.
- * No-op if from === to.
+ * No-op if from === to (staying in place).
  */
 export function setCurrentLocation(building: BuildingId, reason: string): void {
-  const charId = eventBus.characterId || 'default';
-  const current = getCurrentLocation(charId);
+  const current = getCurrentLocation();
   const from = current.building;
 
+  // No-op if staying in place
   if (from === building) return;
 
   const now = Date.now();
 
+  // Update current location
   const record: LocationRecord = { building, timestamp: now };
-  setMeta(currentLocationKey(charId), JSON.stringify(record));
+  setMeta('town:current_location', JSON.stringify(record));
 
-  const history = getLocationHistory(MAX_HISTORY, charId);
+  // Append to history
+  const history = getLocationHistory(MAX_HISTORY);
   history.unshift({ from, to: building, reason, timestamp: now });
-  setMeta(locationHistoryKey(charId), JSON.stringify(history.slice(0, MAX_HISTORY)));
+  const capped = history.slice(0, MAX_HISTORY);
+  setMeta('town:location_history', JSON.stringify(capped));
 
+  // Emit movement event
   const fromName = BUILDING_MAP.get(from)?.name || from;
   const toName = BUILDING_MAP.get(building)?.name || building;
 
   eventBus.emitActivity({
     type: 'movement',
-    sessionKey: `movement:${charId}:${from}:${building}`,
-    content: `moved from ${fromName} to ${toName} - ${reason}`,
+    sessionKey: `movement:${from}:${building}`,
+    content: `moved from ${fromName} to ${toName} — ${reason}`,
     timestamp: now,
   });
+
+  // Record building events for spatial residue
+  const charId = eventBus.characterId || 'unknown';
+  import('./building-memory.js').then(({ recordBuildingEvent }) => {
+    recordBuildingEvent({
+      building: from,
+      event_type: 'departure',
+      summary: `${charId} left for ${toName}`,
+      emotional_tone: 0,
+      actors: [charId],
+    }).catch(() => {});
+    recordBuildingEvent({
+      building,
+      event_type: 'arrival',
+      summary: `${charId} arrived — ${reason}`,
+      emotional_tone: 0,
+      actors: [charId],
+    }).catch(() => {});
+  }).catch(() => {});
 }
 
 /**
  * Get recent location history entries.
  */
-export function getLocationHistory(limit = 20, characterId?: string): LocationHistoryEntry[] {
-  const charId = characterId || eventBus.characterId || 'default';
-
+export function getLocationHistory(limit = 20): LocationHistoryEntry[] {
   try {
-    const raw = getMeta(locationHistoryKey(charId));
+    const raw = getMeta('town:location_history');
     if (!raw) return [];
     const entries = JSON.parse(raw) as LocationHistoryEntry[];
     return entries.slice(0, limit);

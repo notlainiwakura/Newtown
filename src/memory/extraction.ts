@@ -172,7 +172,7 @@ export async function summarizeConversation(
     const result = await withTimeout(
       provider.complete({
         messages: [{ role: 'user', content: prompt }],
-        maxTokens: 512,
+        maxTokens: 1024,
         temperature: 0.3,
         enableCaching: true,
       }),

@@ -96,22 +96,20 @@ function advanceLifecycles(): number {
     }
   }
 
-  // complete -> composting: complete for 30+ days (only if explicitly timestamped)
+  // complete -> composting: complete for 30+ days
   const complete = getMemoriesByLifecycle('complete', 500);
   for (const m of complete) {
-    if (!m.lifecycleChangedAt) continue; // Skip pre-migration memories without explicit timestamp
-    const timeSinceComplete = now - m.lifecycleChangedAt;
+    const timeSinceComplete = now - (m.lifecycleChangedAt ?? m.createdAt);
     if (timeSinceComplete > 30 * ONE_DAY) {
       setLifecycleState(m.id, 'composting');
       changes++;
     }
   }
 
-  // composting: delete after 14 days (only if explicitly timestamped)
+  // composting: delete after 14 days
   const composting = getMemoriesByLifecycle('composting', 500);
   for (const m of composting) {
-    if (!m.lifecycleChangedAt) continue; // Skip pre-migration memories
-    const timeSinceCompost = now - m.lifecycleChangedAt;
+    const timeSinceCompost = now - (m.lifecycleChangedAt ?? m.createdAt);
     if (timeSinceCompost > 14 * ONE_DAY) {
       deleteMemory(m.id);
       changes++;
@@ -224,41 +222,26 @@ function pruneIncoherentMembers(): number {
   const groups = getAllCoherenceGroups(100);
   let prunedCount = 0;
 
-  // Pre-load a memory cache to avoid N+1 queries
-  const memoryCache = new Map<string, Memory>();
-  const loadMemory = (id: string): Memory | undefined => {
-    if (memoryCache.has(id)) return memoryCache.get(id);
-    const mem = getMemory(id);
-    if (mem) memoryCache.set(id, mem);
-    return mem;
-  };
-
   for (const group of groups) {
     if (!group.signature) continue;
 
     const memberIds = getGroupMembers(group.id);
-    const toRemove: string[] = [];
-
     for (const memId of memberIds) {
-      const memory = loadMemory(memId);
+      const memory = getMemory(memId);
       if (!memory?.embedding) continue;
 
       const sim = cosineSimilarity(memory.embedding, group.signature);
       if (sim < 0.4) {
-        toRemove.push(memId);
+        removeFromCoherenceGroup(memId, group.id);
+        prunedCount++;
       }
     }
 
-    for (const memId of toRemove) {
-      removeFromCoherenceGroup(memId, group.id);
-      prunedCount++;
-    }
-
     // Check if group is too small after pruning
-    const remaining = memberIds.length - toRemove.length;
-    if (remaining < 2) {
+    const remainingMembers = getGroupMembers(group.id);
+    if (remainingMembers.length < 2) {
       deleteCoherenceGroup(group.id);
-    } else if (toRemove.length > 0) {
+    } else {
       recomputeGroupCentroid(group.id);
     }
   }

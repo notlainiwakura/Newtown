@@ -1,0 +1,263 @@
+/* Default Skin — Canonical reference for all skinnable CSS properties.
+ * This is a no-op skin: it sets every variable to its current default value.
+ * Other skins override these values.
+ */
+
+:root {
+  /* Backgrounds */
+  --bg-deep: #0a0a1a;
+  --bg-primary: #0d1525;
+  --bg-panel: rgba(20, 40, 80, 0.6);
+  --bg-window: rgba(30, 60, 120, 0.4);
+
+  /* Text */
+  --text-primary: #c0d8ff;
+  --text-secondary: #6090c0;
+  --text-dim: #405880;
+
+  /* Accents */
+  --accent-primary: #4080ff;
+  --accent-secondary: #80c0ff;
+  --accent-tertiary: #40e0ff;
+  --accent-hover: rgba(100, 160, 255, 0.6);
+  --accent-hover-mid: rgba(100, 160, 255, 0.5);
+  --accent-hover-faint: rgba(100, 160, 255, 0.1);
+  --accent-btn-bg: rgba(64, 128, 255, 0.1);
+  --accent-btn-bg-active: rgba(64, 128, 255, 0.25);
+  --accent-btn-bg-strong: rgba(64, 128, 255, 0.15);
+  --accent-btn-bg-strong-active: rgba(64, 128, 255, 0.3);
+  --accent-subtle: rgba(64, 128, 255, 0.05);
+  --accent-msg-bg: rgba(100, 160, 255, 0.12);
+  --accent-msg-border: rgba(100, 160, 255, 0.2);
+
+  /* Border / glow */
+  --border-glow: rgba(100, 160, 255, 0.3);
+  --glow-primary: 0 0 20px rgba(64, 128, 255, 0.4), 0 0 40px rgba(64, 128, 255, 0.2);
+  --hologram: linear-gradient(135deg, rgba(64, 128, 255, 0.1), rgba(128, 192, 255, 0.05), rgba(64, 200, 255, 0.1));
+
+  /* Grid */
+  --grid-line-color: rgba(64, 128, 255, 0.03);
+
+  /* Fonts */
+  --font-heading: 'Orbitron', sans-serif;
+  --font-body: 'Share Tech Mono';
+  --font-mono: 'Share Tech Mono', monospace;
+
+  /* Shapes */
+  --border-radius: 4px;
+  --border-radius-sm: 2px;
+  --border-radius-lg: 8px;
+
+  /* Effects */
+  --scanline-opacity: 0.02;
+  --particle-color: rgba(64, 128, 255, 0.3);
+  --particle-opacity: 0.6;
+
+  /* Messages */
+  --msg-user-bg: rgba(40, 80, 140, 0.6);
+  --msg-user-border: rgba(100, 160, 255, 0.3);
+  --msg-assistant-bg: rgba(64, 128, 255, 0.15);
+  --msg-assistant-border: rgba(64, 200, 255, 0.3);
+  --msg-assistant-glow: 0 0 20px rgba(64, 200, 255, 0.1);
+
+  /* Status */
+  --status-online: #40ff80;
+  --status-error: #ff6060;
+  --error-text: #ff8080;
+  --error-bg: rgba(255, 80, 80, 0.1);
+  --error-border: rgba(255, 80, 80, 0.3);
+
+  /* Character colors */
+  --color-wired-lain: #4080ff;
+  --color-lain: #80c0ff;
+  --color-dr-claude: #ff6060;
+  --color-pkd: #c060ff;
+  --color-mckenna: #40e080;
+  --color-john: #ffb040;
+  --color-hiru: #60d0a0;
+
+  /* Event types */
+  --type-diary: #e0a020;
+  --type-dream: #a040e0;
+  --type-commune: #40d0e0;
+  --type-curiosity: #40c060;
+  --type-chat: #c0d0e0;
+  --type-memory: #4080e0;
+  --type-letter: #e060a0;
+  --type-narrative: #e08030;
+  --type-self-concept: #8080e0;
+  --type-doctor: #ff6060;
+  --type-peer: #60c0c0;
+  --type-movement: #e0d040;
+  --type-research: #60e0e0;
+  --type-note: #c0a060;
+  --type-document: #a0c0e0;
+  --type-gift: #e080c0;
+  --type-default: #6090c0;
+
+  /* Newspaper */
+  --newspaper-bg: #05050a;
+  --newspaper-text: #8a9ab0;
+  --newspaper-heading: #4a9eff;
+  --newspaper-quote-border: #2a3a4e;
+  --newspaper-em: #a0b8d0;
+  --newspaper-strong: #b0c8e0;
+  --newspaper-blockquote: #6a7a8a;
+  --newspaper-loading: #334;
+
+  /* Extended text */
+  --text-bright: #c8d8e8;
+  --text-muted: #3a5070;
+  --text-subtle: #506878;
+  --text-placeholder: #2a3a4a;
+  --text-dim2: #506070;
+
+  /* Extended accents */
+  --accent-danger: #ff4a4a;
+  --accent-success: #4aff8a;
+  --accent-warn: #ff6a4a;
+  --accent-liminal: #b464ff;
+
+  /* Extended borders */
+  --border-dark: #111;
+  --border-dark2: #1a1a2e;
+  --border-hover: #2a3a4a;
+  --border-panel: #151525;
+  --border-focus: #2a3a5a;
+
+  /* Commune Chronicles controls */
+  --controls-border: #111825;
+  --filter-btn-border: #1a2a3a;
+  --filter-btn-color: #4a6a8a;
+  --filter-btn-hover-border: #2a4a6a;
+  --filter-btn-hover-color: #6a9abf;
+  --masthead-tagline: #334;
+  --masthead-edition: #2a4a6a;
+
+  /* Chronicle entry cards */
+  --entry-bg: #070710;
+  --entry-border: #111825;
+  --entry-hover-border: #1a3050;
+  --entry-hover-bg: #090912;
+  --entry-time: #2a4050;
+  --entry-body: #7a8a9a;
+  --entry-body-expanded: #9aaaba;
+  --loading-color: #2a4050;
+  --empty-color: #1a2a3a;
+
+  /* Postboard */
+  --post-label-color: #4a6a8a;
+  --post-status-ok: #2a4a2a;
+  --post-pin-border: #1a2a3a;
+
+  /* Town events tag colors */
+  --tag-narrative-color: #6aafff;
+  --tag-narrative-border: #1a3a5a;
+  --tag-mechanical-color: #ff8a4a;
+  --tag-mechanical-border: #4a2a1a;
+  --tag-instant-color: #aaa;
+  --tag-instant-border: #333;
+  --tag-persistent-color: #4aff8a;
+  --tag-persistent-border: #1a4a2a;
+  --tag-natural-color: #8acf6a;
+  --tag-natural-border: #2a3a1a;
+  --tag-liminal-color: #b464ff;
+  --tag-liminal-border: #3a1a5a;
+
+  /* Nav bar */
+  --nav-game-bg: rgba(10, 10, 15, 0.6);
+  --nav-game-border: rgba(26, 26, 46, 0.4);
+
+  /* Misc */
+  --white-fill: white;
+  --white-border: rgba(255, 255, 255, 0.3);
+  --white-hover: rgba(255, 255, 255, 0.2);
+  --inset-highlight: rgba(255, 255, 255, 0.1);
+  --glow-primary-strong: 0 0 30px rgba(64, 128, 255, 0.8), 0 0 50px rgba(64, 200, 255, 0.3);
+  --logo-text-shadow: rgba(128, 192, 255, 0.5);
+
+  /* Grid */
+  --grid-line-color: rgba(64, 128, 255, 0.03);
+  --scanline-color: rgba(64, 128, 255, 0.02);
+
+  /* Input / button */
+  --input-bg: rgba(20, 40, 80, 0.8);
+  --input-bg-subtle: rgba(20, 40, 80, 0.5);
+  --focus-glow: 0 0 15px rgba(64, 200, 255, 0.3);
+  --btn-dark: #3060c0;
+  --btn-light: #5090ff;
+  --btn-shadow: rgba(64, 128, 255, 0.3);
+  --btn-shadow-hover: rgba(64, 128, 255, 0.5);
+  --titlebar-gradient: rgba(64, 128, 255, 0.2);
+  --scrollbar-track: rgba(64, 128, 255, 0.1);
+  --system-msg-bg: rgba(64, 128, 255, 0.05);
+  --user-msg-gradient-end: rgba(30, 60, 100, 0.6);
+  --assistant-msg-gradient-end: rgba(64, 200, 255, 0.1);
+  --input-area-gradient: rgba(64, 128, 255, 0.1);
+  --footer-border: rgba(64, 128, 255, 0.2);
+  --image-shadow: rgba(64, 128, 255, 0.2);
+  --image-shadow-hover: rgba(64, 200, 255, 0.4);
+  --image-btn-hover-shadow: rgba(64, 200, 255, 0.3);
+  --drag-overlay-bg: rgba(10, 20, 40, 0.9);
+
+  /* Error extras */
+  --error-bg-gradient: rgba(255, 60, 60, 0.2);
+  --error-bg-gradient-end: rgba(200, 40, 40, 0.1);
+  --remove-img-bg: rgba(255, 60, 60, 0.3);
+  --remove-img-hover-bg: rgba(255, 60, 60, 0.5);
+  --remove-img-hover-shadow: rgba(255, 100, 100, 0.3);
+
+  /* Commune map surfaces */
+  --header-bg: rgba(10, 10, 26, 0.9);
+  --panel-bg: rgba(10, 15, 30, 0.95);
+  --panel-bg-dark: rgba(10, 10, 26, 0.95);
+  --panel-bg-input: rgba(10, 15, 30, 0.9);
+  --building-bg: rgba(15, 25, 50, 0.8);
+  --chat-modal-bg: rgba(8, 12, 24, 0.97);
+  --chat-modal-titlebar-bg: rgba(15, 25, 50, 0.9);
+  --chat-modal-shadow: -4px 0 24px rgba(0, 0, 0, 0.6);
+  --chat-input-bg: rgba(20, 40, 80, 0.4);
+  --char-msg-bg: rgba(255, 255, 255, 0.04);
+  --entry-kind-bg: rgba(255, 255, 255, 0.05);
+  --notif-bg: rgba(10, 10, 26, 0.8);
+  --text-shadow-dark: rgba(0, 0, 0, 0.8);
+  --node-highlight: rgba(255, 255, 255, 0.15);
+  --status-connected: #40e080;
+  --cell-pulse-color: rgba(224, 208, 64, 0.4);
+  --cell-pulse-mid: rgba(224, 208, 64, 0.3);
+
+  /* Game view */
+  --game-panel-bg: #0a0c14;
+  --game-ui-border: #406080;
+  --game-ui-border-dim: #203040;
+  --game-ui-header: #182030;
+  --game-input-bg: #1a2030;
+  --game-input-stroke: #2a3040;
+  --game-input-text: #c0e0e0;
+  --game-input-prompt: #60a0a0;
+  --game-input-cursor: #80c0ff;
+  --game-hud-location: #60a0a0;
+  --game-hud-prompt: #80c0ff;
+  --game-hud-notif: #ffb040;
+  --game-hud-overlay: rgba(10, 12, 20, 0.8);
+  --game-speech-text: #e0e0f0;
+  --game-speech-bg: rgba(15, 15, 30, 0.9);
+  --game-speech-tail: #0f0f1e;
+  --game-building-label: #607080;
+  --game-grass: #1a2a1a;
+  --game-grass-light: #1c2c1c;
+  --game-grass-dark: #182818;
+  --game-grass-outline: #2a3a2a;
+  --game-path: #2a2520;
+  --game-path-light: #352f28;
+  --game-floor: #20202a;
+  --game-floor-grid: #282838;
+  --game-wall-top: #303040;
+  --game-wall-highlight: #3c3c50;
+  --game-wall-side: #252535;
+  --game-wall-dark: #1e1e2e;
+  --game-forest: #0a150a;
+  --game-water: #0a0a20;
+  --game-water-detail: #101030;
+  --game-object-label: #a0a0b0;
+}

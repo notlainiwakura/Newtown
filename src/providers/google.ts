@@ -267,6 +267,10 @@ export class GoogleProvider extends BaseProvider {
     const config: Record<string, unknown> = {
       maxOutputTokens: options.maxTokens ?? this.defaultMaxTokens,
       temperature: options.temperature ?? 1,
+      // Disable Gemini 2.5 Flash thinking — thinking tokens count toward maxOutputTokens,
+      // causing nearly all the budget to be consumed internally, leaving only scraps for
+      // visible output (e.g. "Ah, John," instead of a full message).
+      thinkingConfig: { thinkingBudget: 0 },
     };
     if (options.stopSequences) {
       config.stopSequences = options.stopSequences;

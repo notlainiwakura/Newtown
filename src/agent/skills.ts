@@ -8,11 +8,12 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { registerTool, unregisterTool, type Tool } from './tools.js';
 import { getLogger } from '../utils/logger.js';
+import { getBasePath } from '../config/paths.js';
 
 // Provide require() to custom tools so they can use Node.js built-in modules (e.g. fs)
 const toolRequire = createRequire(import.meta.url);
 
-const SKILLS_DIR = join(process.env['HOME'] || '~', '.lain', 'skills', 'tools');
+const SKILLS_DIR = join(getBasePath(), 'skills', 'tools');
 
 interface SkillDefinition {
   name: string;

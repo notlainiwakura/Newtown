@@ -8,7 +8,7 @@ import { getLogger } from '../utils/logger.js';
 import {
   saveMessage,
   getRecentMessages,
-  getAllRecentMessages,
+  getRecentVisitorMessages,
   getMessagesForUser,
   searchMemories,
   countMemories,
@@ -22,10 +22,13 @@ import {
   getGroupsForMemory,
   type Memory,
   type MemorySortBy,
+  type StoredMessage,
 } from './store.js';
 import { extractMemories, summarizeConversation } from './extraction.js';
 import { autoAssignToGroups } from './topology.js';
 import { getWeeklyNarrative, getMonthlyNarrative } from '../agent/narratives.js';
+import { detectContradictions } from './knowledge-graph.js';
+import { listWings } from './palace.js';
 
 export {
   saveMessage,
@@ -53,6 +56,8 @@ export {
 } from './store.js';
 export type { StoredMessage, Memory, MemorySortBy, Association, CoherenceGroup, LifecycleState, CausalType } from './store.js';
 export { runTopologyMaintenance, autoAssignToGroups } from './topology.js';
+export { addTriple, queryTriples, addEntity, getEntity, detectContradictions, getEntityTimeline, listEntities } from './knowledge-graph.js';
+export { listWings, listRooms, getWing, getWingByName } from './palace.js';
 
 /**
  * Extract user ID from session key or metadata
@@ -311,18 +316,7 @@ export async function processConversationEnd(
       }
     }
 
-    // Check for high-signal extractions and trigger proactive reflection
-    if (extractedIds.length > 0) {
-      const hasHighSignal = extractedIds.some((id) => {
-        const mem = getMemory(id);
-        return mem && mem.importance >= 0.8;
-      });
-      if (hasHighSignal) {
-        import('../agent/proactive.js')
-          .then((mod) => mod.onHighSignalExtraction())
-          .catch((err) => logger.warn({ err }, 'Failed to trigger proactive reflection'));
-      }
-    }
+    // Proactive outreach disabled — high-signal hook skipped
 
     // Reset per-session extraction state
     resetExtractionState(sessionKey);
@@ -341,6 +335,11 @@ export async function processConversationEnd(
         logger.info({ linkedCount, userId }, 'Consolidated similar memories');
       }
     }
+
+    try {
+      const { updateState } = await import('../agent/internal-state.js');
+      await updateState({ type: 'conversation:end', summary: `Conversation ended after ${messages.length} messages` });
+    } catch { /* non-critical */ }
   } catch (error) {
     logger.error({ error, sessionKey }, 'Failed to process conversation end');
   } finally {
@@ -363,6 +362,21 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+// Lightweight wing-name cache (rebuilt each context call, avoids N+1 queries)
+let wingNameCache = new Map<string, string>();
+
+function refreshWingNameCache(): void {
+  wingNameCache = new Map();
+  try {
+    const wings = listWings();
+    for (const w of wings) {
+      wingNameCache.set(w.id, w.name);
+    }
+  } catch {
+    // non-critical — fall back to 'general'
+  }
+}
+
 
 /**
  * Build system prompt addition with memory context
@@ -383,7 +397,11 @@ export async function buildMemoryContext(
 
   const MAX_CONTEXT_TOKENS = 7000;
 
+  // Refresh wing name lookup for palace-aware labels
+  refreshWingNameCache();
+
   // ── Layer 1: Identity (~500 tokens) ──
+  // Groups by palace wing for structured awareness.
   try {
     const facts = getMemoriesByType('fact');
     const preferences = getMemoriesByType('preference');
@@ -395,11 +413,24 @@ export async function buildMemoryContext(
     const identityItems = [...topFacts, ...topPrefs];
 
     if (identityItems.length > 0) {
-      const lines = identityItems.map((m) => {
+      // Group by wing for structured display
+      const byWing = new Map<string, string[]>();
+      for (const m of identityItems) {
+        const wingLabel = m.wingId ? (wingNameCache.get(m.wingId) ?? 'general') : 'general';
         const content = m.content.length > 400 ? m.content.slice(0, 400) + '...' : m.content;
-        return `- ${content}`;
-      });
-      const identityText = '\n\n[Core knowledge]\n' + lines.join('\n') + '\n';
+        const list = byWing.get(wingLabel) ?? [];
+        list.push(`- ${content}`);
+        byWing.set(wingLabel, list);
+      }
+
+      let identityText = '\n\n[Core knowledge]\n';
+      for (const [wing, lines] of byWing) {
+        if (byWing.size > 1 && wing !== 'general') {
+          identityText += `  ${wing}:\n`;
+        }
+        identityText += lines.join('\n') + '\n';
+      }
+
       const tokens = estimateTokens(identityText);
       if (tokens <= 1200) {
         context += identityText;
@@ -453,38 +484,62 @@ export async function buildMemoryContext(
     let layerText = '';
     let layerTokens = 0;
 
-    // 3a. Recent conversation (cross-channel)
+    // 3a. Recent conversation — split current session from other sessions
+    //     so the LLM knows which messages are from THIS visitor vs. others
     try {
-      const allRecent = getAllRecentMessages(20);
-      const seen = new Set<string>();
-      const merged: typeof allRecent = [];
+      const formatMsg = (m: StoredMessage, prefix: string) => {
+        const content = m.content.length > 400 ? m.content.slice(0, 400) + '...' : m.content;
+        return `${prefix}: ${content}`;
+      };
 
+      // Current user's messages — this is the active conversation
       if (userId) {
         const userMessages = getMessagesForUser(userId, 12);
-        for (const m of userMessages) {
-          if (!seen.has(m.id)) { seen.add(m.id); merged.push(m); }
+        if (userMessages.length > 0) {
+          // Try to find the visitor's name from message metadata
+          const visitorName = userMessages
+            .filter((m) => m.role === 'user' && m.metadata?.senderName)
+            .map((m) => m.metadata.senderName as string)
+            .pop() || 'Visitor';
+
+          const historyText = userMessages
+            .map((m) => formatMsg(m, m.role === 'user' ? visitorName : 'You'))
+            .join('\n');
+          const header = visitorName !== 'Visitor'
+            ? `[Your current conversation with ${visitorName}]`
+            : '[Your current conversation with this visitor]';
+          const section = '\n\n' + header + '\n' + historyText + '\n';
+          const tokens = estimateTokens(section);
+          if (layerTokens + tokens < relevanceBudget) {
+            layerText += section;
+            layerTokens += tokens;
+          }
         }
       }
-      for (const m of allRecent) {
-        if (!seen.has(m.id)) { seen.add(m.id); merged.push(m); }
-      }
 
-      merged.sort((a, b) => a.timestamp - b.timestamp);
-      const limitedMessages = merged.slice(-12);
+      // Other recent messages — conversations with OTHER visitors (not the current one)
+      // These provide ambient awareness but must be clearly separated
+      // Use getRecentVisitorMessages to exclude inter-character traffic (commune, letters, peer chats)
+      const allRecent = getRecentVisitorMessages(20);
+      const currentUserIds = new Set<string>();
+      if (userId) currentUserIds.add(userId);
 
-      if (limitedMessages.length > 0) {
-        const historyText = limitedMessages
+      const otherMessages = allRecent
+        .filter((m) => m.role === 'user' && m.userId && !currentUserIds.has(m.userId))
+        .slice(-6);
+
+      if (otherMessages.length > 0 && layerTokens < relevanceBudget - 200) {
+        const otherText = otherMessages
           .map((m) => {
-            const prefix = m.role === 'user' ? 'User' : 'Lain';
-            const content = m.content.length > 400 ? m.content.slice(0, 400) + '...' : m.content;
-            return prefix + ': ' + content;
+            const who = m.sessionKey?.split(':')[0] ?? 'someone';
+            const content = m.content.length > 200 ? m.content.slice(0, 200) + '...' : m.content;
+            return `- A visitor (via ${who}) said: ${content}`;
           })
           .join('\n');
-
-        const historySection = '\n\n[Recent conversation]\n' + historyText + '\n';
-        const tokens = estimateTokens(historySection);
+        const section = '\n\n[Recent conversations with other visitors — NOT the person you are talking to now]\n' + otherText + '\n';
+        const tokens = estimateTokens(section);
         if (layerTokens + tokens < relevanceBudget) {
-          layerText += historySection;
+          layerText += section;
           layerTokens += tokens;
         }
       }
@@ -503,14 +558,18 @@ export async function buildMemoryContext(
             const mem = getMemory(id);
             if (!mem) return null;
             const typeLabel = getTypeLabel(mem.memoryType).toLowerCase();
-            // Annotate with coherence group name if available
+            // Annotate with palace wing and coherence group
+            const wingLabel = mem.wingId ? (wingNameCache.get(mem.wingId) ?? '') : '';
+            const hallLabel = mem.hall ?? '';
+            const palaceTag = wingLabel ? ` [${wingLabel}/${hallLabel}]` : '';
             let groupTag = '';
             try {
               const groups = getGroupsForMemory(id);
               const namedGroup = groups.find((g) => g.name);
               if (namedGroup) groupTag = ` [pattern: ${namedGroup.name}]`;
             } catch { /* non-critical */ }
-            return `- [mem:${id}] (${typeLabel}, imp:${mem.importance.toFixed(1)}) ${mem.content.slice(0, 80)}${groupTag}`;
+            const content = mem.content.slice(0, 80);
+            return `- [mem:${id}] (${typeLabel}, imp:${mem.importance.toFixed(1)}) ${content}${palaceTag}${groupTag}`;
           }).filter(Boolean);
 
           if (compactLines.length > 0) {
@@ -623,6 +682,26 @@ export async function buildMemoryContext(
       }
     } catch (error) {
       logger.debug({ error }, 'Layer 4 (resonance) failed (non-critical)');
+    }
+  }
+
+  // ── Contradictions (bonus, ~200 tokens) ──
+  if (usedTokens < MAX_CONTEXT_TOKENS - 200) {
+    try {
+      const contradictions = detectContradictions();
+      if (contradictions.length > 0) {
+        const lines = contradictions.slice(0, 3).map((c) => {
+          return `- "${c.subject}" ${c.predicate}: "${c.tripleA.object}" vs "${c.tripleB.object}"`;
+        });
+        const contradictionText = '\n\n[Things that seem contradictory in your memory]\n' + lines.join('\n') + '\n';
+        const tokens = estimateTokens(contradictionText);
+        if (usedTokens + tokens <= MAX_CONTEXT_TOKENS) {
+          context += contradictionText;
+          usedTokens += tokens;
+        }
+      }
+    } catch (error) {
+      logger.debug({ error }, 'Contradiction detection failed (non-critical)');
     }
   }
 

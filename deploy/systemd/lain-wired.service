@@ -1,0 +1,36 @@
+[Unit]
+Description=Wired Lain - Web UI, Interlink Hub, Research Handler
+After=network.target
+PartOf=lain.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/local-lain
+ExecStartPre=/bin/bash -c 'fuser -k 3000/tcp 2>/dev/null || true'
+ExecStartPre=/bin/bash -c 'mkdir -p /root/.lain-wired/workspace && [ -d workspace/characters/wired-lain ] && cp -r workspace/characters/wired-lain/* /root/.lain-wired/workspace/ || true'
+ExecStartPre=/bin/bash -c 'rm -rf /root/.lain-wired/workspace/novelty && cp -r workspace/novelty /root/.lain-wired/workspace/novelty 2>/dev/null || true'
+ExecStart=/usr/bin/node dist/index.js web --port 3000
+Restart=on-failure
+RestartSec=5
+
+# Identity
+Environment=NODE_ENV=production
+Environment=LAIN_HOME=/root/.lain-wired
+Environment=LAIN_CHARACTER_ID=wired-lain
+Environment="LAIN_CHARACTER_NAME=Wired Lain"
+Environment=LAIN_INTERLINK_TARGET=http://localhost:3001/api/interlink/letter
+
+EnvironmentFile=/opt/local-lain/.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lain-wired
+
+# No watchdog — app doesn't implement sd_notify, long LLM calls would trigger false kills
+
+[Install]
+WantedBy=lain.target

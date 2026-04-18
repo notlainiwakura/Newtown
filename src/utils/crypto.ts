@@ -2,7 +2,8 @@
  * Cryptographic utilities
  */
 
-import { randomBytes, createHash, pbkdf2Sync } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
+import argon2 from 'argon2';
 import type { KeyDerivationConfig } from '../types/config.js';
 
 const DEFAULT_TOKEN_LENGTH = 32;
@@ -22,17 +23,23 @@ export function generateRandomBytes(length: number): Buffer {
 }
 
 /**
- * Derive an encryption key from a password.
- * We map the configured cost values onto PBKDF2 so Newtown remains portable
- * on machines where native Argon2 bindings are unavailable.
+ * Derive an encryption key from a password using Argon2id
  */
 export async function deriveKey(
   password: string,
   salt: Buffer,
   config: KeyDerivationConfig
 ): Promise<Buffer> {
-  const iterations = Math.max(100_000, config.timeCost * config.parallelism * 120_000);
-  return pbkdf2Sync(password, salt, iterations, 32, 'sha256');
+  const hash = await argon2.hash(password, {
+    type: argon2.argon2id,
+    salt,
+    memoryCost: config.memoryCost,
+    timeCost: config.timeCost,
+    parallelism: config.parallelism,
+    hashLength: 32,
+    raw: true,
+  });
+  return hash;
 }
 
 /**

@@ -39,10 +39,6 @@ const state: ServerState = {
   maxMessageLength: 100000,
 };
 
-function isNamedPipe(socketPath: string): boolean {
-  return process.platform === 'win32' && socketPath.startsWith('\\\\.\\pipe\\');
-}
-
 /**
  * Start the gateway server
  */
@@ -64,12 +60,10 @@ export async function startServer(
   configureRateLimiter(config.rateLimit);
 
   // Clean up existing socket file if it exists
-  if (!isNamedPipe(config.socketPath)) {
-    try {
-      await unlink(config.socketPath);
-    } catch {
-      // Ignore if doesn't exist
-    }
+  try {
+    await unlink(config.socketPath);
+  } catch {
+    // Ignore if doesn't exist
   }
 
   // Create server
@@ -92,9 +86,7 @@ export async function startServer(
   });
 
   // Set socket permissions
-  if (!isNamedPipe(config.socketPath)) {
-    await chmod(config.socketPath, config.socketPermissions);
-  }
+  await chmod(config.socketPath, config.socketPermissions);
 
   // Write PID file
   await writeFile(config.pidFile, process.pid.toString());
@@ -131,12 +123,10 @@ export async function stopServer(): Promise<void> {
 
   // Clean up socket file
   if (state.config) {
-    if (!isNamedPipe(state.config.socketPath)) {
-      try {
-        await unlink(state.config.socketPath);
-      } catch {
-        // Ignore
-      }
+    try {
+      await unlink(state.config.socketPath);
+    } catch {
+      // Ignore
     }
 
     // Clean up PID file

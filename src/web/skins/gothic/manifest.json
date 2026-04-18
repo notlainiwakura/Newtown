@@ -1,0 +1,12 @@
+{
+  "id": "gothic",
+  "name": "Dark Cathedral",
+  "description": "Victorian darkness meets digital occult",
+  "fonts": { "heading": "Cinzel", "body": "Crimson Text", "mono": "Fira Code" },
+  "buildingIcons": {
+    "library": "🏚", "bar": "🍷", "field": "⚰", "windmill": "🦇",
+    "lighthouse": "🕯", "school": "📜", "market": "🗝", "locksmith": "⛓", "threshold": "🚪"
+  },
+  "googleFontsUrl": "https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700&family=Crimson+Text:ital,wght@0,400;0,600;1,400&family=Fira+Code&display=swap",
+  "previewColors": ["#8b0020", "#600080", "#c0c0c0"]
+}

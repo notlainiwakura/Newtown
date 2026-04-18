@@ -217,7 +217,7 @@ export function getDesireContext(): string {
  */
 export async function spawnDesireFromDream(dreamResidue: string): Promise<Desire | null> {
   const logger = getLogger();
-  const provider = getProvider('default', 'personality');
+  const provider = getProvider('default', 'light');
   if (!provider) return null;
 
   
@@ -242,7 +242,7 @@ TARGET: <peer name or NONE>
 
 If this dream doesn't create a new desire (or it overlaps with an existing one), respond: [NOTHING]`,
     }],
-    maxTokens: 150,
+    maxTokens: 300,
     temperature: 0.9,
   });
 
@@ -257,7 +257,7 @@ export async function spawnDesireFromConversation(
   transcript: string
 ): Promise<Desire | null> {
   const logger = getLogger();
-  const provider = getProvider('default', 'personality');
+  const provider = getProvider('default', 'light');
   if (!provider) return null;
 
   
@@ -285,7 +285,7 @@ TARGET: <peer name or NONE>
 
 If nothing new, respond: [NOTHING]`,
     }],
-    maxTokens: 150,
+    maxTokens: 300,
     temperature: 0.85,
   });
 
@@ -305,7 +305,7 @@ export async function checkLoneliness(lastInteractionAge: number): Promise<Desir
   const socialDesires = getDesiresByType('social');
   if (socialDesires.length >= 2) return null;
 
-  const provider = getProvider('default', 'personality');
+  const provider = getProvider('default', 'light');
   if (!provider) return null;
 
   
@@ -326,7 +326,7 @@ TARGET: <peer name or NONE>
 
 Or [NOTHING] if solitude is fine right now.`,
     }],
-    maxTokens: 120,
+    maxTokens: 300,
     temperature: 0.9,
   });
 
@@ -338,7 +338,7 @@ Or [NOTHING] if solitude is fine right now.`,
  */
 export async function spawnDesireFromVisitor(visitorMessage: string, characterResponse: string): Promise<Desire | null> {
   const logger = getLogger();
-  const provider = getProvider('default', 'personality');
+  const provider = getProvider('default', 'light');
   if (!provider) return null;
 
   // Only trigger occasionally — not every conversation
@@ -364,7 +364,7 @@ TARGET: <peer name or NONE>
 
 If not, respond: [NOTHING]`,
     }],
-    maxTokens: 120,
+    maxTokens: 300,
     temperature: 0.8,
   });
 
@@ -380,7 +380,7 @@ export async function checkDesireResolution(eventDescription: string): Promise<v
   const active = getActiveDesires(6);
   if (active.length === 0) return;
 
-  const provider = getProvider('default', 'personality');
+  const provider = getProvider('default', 'light');
   if (!provider) return;
 
   
@@ -402,7 +402,7 @@ EASE <number>: <brief reason> (reduces intensity by ~0.2)
 
 If nothing was addressed, respond: [NONE]`,
     }],
-    maxTokens: 200,
+    maxTokens: 400,
     temperature: 0.7,
   });
 
@@ -477,7 +477,7 @@ export function startDesireLoop(config?: DesireLoopConfig): () => void {
     }
   }, 3 * 60 * 60 * 1000);
 
-  // Desire-driven action check every 45 minutes (only if config provided)
+  // Desire-driven action check every 3 hours (only if config provided)
   let actionTimer: ReturnType<typeof setInterval> | null = null;
   if (config) {
     actionTimer = setInterval(async () => {
@@ -486,7 +486,7 @@ export function startDesireLoop(config?: DesireLoopConfig): () => void {
       } catch (err) {
         logger.debug({ error: String(err) }, 'Desire action check error');
       }
-    }, 45 * 60 * 1000);
+    }, 3 * 60 * 60 * 1000);
 
     // First check after 30 minutes
     setTimeout(async () => {
@@ -587,7 +587,7 @@ async function executeDesireSocialAction(
   desire: Desire
 ): Promise<void> {
   const logger = getLogger();
-  const provider = getProvider('default', 'personality');
+  const provider = getProvider('default', 'light');
   if (!provider) return;
 
   const result = await provider.complete({
@@ -599,7 +599,7 @@ You want to reach out to ${peer.name} about this. Write a short, natural message
 
 Write ONLY the message, nothing else.`,
     }],
-    maxTokens: 200,
+    maxTokens: 400,
     temperature: 0.9,
   });
 
@@ -607,9 +607,10 @@ Write ONLY the message, nothing else.`,
   if (!message || message.length < 5) return;
 
   try {
+    const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
     const resp = await fetch(`${peer.url}/api/peer/message`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${interlinkToken}` },
       body: JSON.stringify({
         fromId: config.characterId,
         fromName: config.characterName,
@@ -651,51 +652,34 @@ async function executeDesireIntellectualAction(
   desire: Desire
 ): Promise<void> {
   const logger = getLogger();
-  const provider = getProvider('default', 'personality');
-  if (!provider) return;
+  const wiredLainUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
+  const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
 
-  const result = await provider.complete({
-    messages: [{
-      role: 'user',
-      content: `You are ${config.characterName}. An intellectual need is pressing on you: "${desire.description}"
+  if (!interlinkToken) return;
 
-There is no internet here. Think with what you already know, notice, infer, and suspect.
-Write a short reflection, hypothesis list, or field note that helps you work on the question locally.
-Keep it under 220 words and include a title.
+  try {
+    const resp = await fetch(`${wiredLainUrl}/api/interlink/research-request`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${interlinkToken}`,
+      },
+      body: JSON.stringify({
+        characterId: config.characterId,
+        characterName: config.characterName,
+        question: desire.description,
+        reason: `A persistent intellectual desire (intensity: ${desire.intensity.toFixed(1)})`,
+        replyTo: `http://localhost:${process.env['PORT'] || '3003'}`,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
 
-Format:
-TITLE: <title>
----
-<content>`,
-    }],
-    maxTokens: 400,
-    temperature: 0.9,
-  });
-
-  const text = result.content.trim();
-  const titleMatch = text.match(/TITLE:\s*(.+)/i);
-  const contentMatch = text.match(/---\n([\s\S]+)/);
-
-  if (!titleMatch || !contentMatch) return;
-
-  const title = titleMatch[1]!.trim();
-  const content = contentMatch[1]!.trim();
-
-  const { saveMemory } = await import('../memory/store.js');
-  const sanitizedTitle = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 60);
-  await saveMemory({
-    sessionKey: `document:${config.characterId}:${sanitizedTitle}`,
-    userId: null,
-    content: `[Document: "${title}"]\n\n${content}`,
-    memoryType: 'episode',
-    importance: 0.45,
-    emotionalWeight: 0.25,
-    relatedTo: null,
-    sourceMessageId: null,
-    metadata: { action: 'document', title, author: config.characterId, writtenAt: Date.now(), desireId: desire.id },
-  });
-
-  logger.info({ title, desire: desire.description.slice(0, 60) }, 'Desire-driven intellectual note written');
+    if (resp.ok) {
+      logger.info({ desire: desire.description.slice(0, 60) }, 'Desire-driven research request submitted');
+    }
+  } catch {
+    logger.debug('Desire-driven research request failed');
+  }
 }
 
 /**
@@ -706,7 +690,7 @@ async function executeDesireCreativeAction(
   desire: Desire
 ): Promise<void> {
   const logger = getLogger();
-  const provider = getProvider('default', 'personality');
+  const provider = getProvider('default', 'light');
   if (!provider) return;
 
   const result = await provider.complete({
@@ -721,7 +705,7 @@ TITLE: <title>
 ---
 <content>`,
     }],
-    maxTokens: 500,
+    maxTokens: 1024,
     temperature: 1.0,
   });
 
@@ -759,7 +743,7 @@ async function executeDesireEmotionalAction(
   desire: Desire
 ): Promise<void> {
   const logger = getLogger();
-  const provider = getProvider('default', 'personality');
+  const provider = getProvider('default', 'light');
   if (!provider) return;
 
   const { getCurrentLocation } = await import('../commune/location.js');
@@ -774,7 +758,7 @@ You're at the ${loc.building}. Write a short note — something left behind, fou
 
 Write ONLY the note text, nothing else.`,
     }],
-    maxTokens: 150,
+    maxTokens: 300,
     temperature: 0.9,
   });
 

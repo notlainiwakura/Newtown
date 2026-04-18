@@ -76,6 +76,7 @@ const configSchema: JSONSchemaType<LainConfig> = {
                 model: { type: 'string' },
                 apiKeyEnv: { type: 'string', nullable: true },
                 baseURL: { type: 'string', nullable: true },
+                fallbackModels: { type: 'array', items: { type: 'string' }, nullable: true },
               },
               required: ['type', 'model'],
               additionalProperties: false,

@@ -1,0 +1,102 @@
+.skin-picker-toggle {
+  position: fixed;
+  bottom: 16px;
+  left: 16px;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: rgba(40, 40, 50, 0.8);
+  border: 1px solid rgba(120, 120, 140, 0.4);
+  cursor: pointer;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  transition: transform 0.2s, box-shadow 0.2s;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.skin-picker-toggle:hover {
+  transform: scale(1.1);
+  box-shadow: 0 0 12px rgba(120, 120, 140, 0.4);
+}
+
+.skin-picker-panel {
+  position: fixed;
+  bottom: 60px;
+  left: 16px;
+  width: 220px;
+  max-height: 400px;
+  overflow-y: auto;
+  background: rgba(20, 20, 28, 0.95);
+  border: 1px solid rgba(120, 120, 140, 0.3);
+  border-radius: 8px;
+  z-index: 9999;
+  display: none;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+}
+
+.skin-picker-panel.open {
+  display: flex;
+}
+
+.skin-picker-panel h3 {
+  font-family: system-ui, sans-serif;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: rgba(180, 180, 200, 0.6);
+  margin: 4px 8px 4px;
+}
+
+.skin-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s;
+  border: 1px solid transparent;
+}
+
+.skin-picker-item:hover {
+  background: rgba(120, 120, 140, 0.15);
+}
+
+.skin-picker-item.active {
+  background: rgba(120, 120, 140, 0.2);
+  border-color: rgba(120, 120, 140, 0.3);
+}
+
+.skin-picker-swatch {
+  display: flex;
+  gap: 3px;
+  flex-shrink: 0;
+}
+
+.skin-picker-swatch-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.skin-picker-label {
+  font-family: system-ui, sans-serif;
+  font-size: 13px;
+  color: rgba(200, 200, 220, 0.9);
+}
+
+.skin-picker-desc {
+  font-family: system-ui, sans-serif;
+  font-size: 10px;
+  color: rgba(140, 140, 160, 0.7);
+  margin-top: 1px;
+}

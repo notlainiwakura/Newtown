@@ -4,9 +4,9 @@
 
   // ===== Character endpoints =====
   var ENDPOINTS = [
-    { id: 'neo', name: 'Neo', color: '#80c0ff', path: '/neo/api/activity' },
+    { id: 'neo', name: 'Neo', color: '#60e0a0', path: '/neo/api/activity' },
     { id: 'plato', name: 'Plato', color: '#e0c870', path: '/plato/api/activity' },
-    { id: 'joe', name: 'Joe', color: '#78b898', path: '/joe/api/activity' },
+    { id: 'joe', name: 'Joe', color: '#88b0d0', path: '/joe/api/activity' },
   ];
 
   var TYPE_COLORS = {
@@ -49,12 +49,7 @@
     research: 'RESEARCH',
   };
 
-  // ===== API key (from meta tag or URL ?key= param) =====
-  var API_KEY = (function () {
-    var meta = document.querySelector('meta[name="lain-api-key"]');
-    if (meta && meta.content) return meta.content;
-    return new URLSearchParams(window.location.search).get('key') || '';
-  })();
+  // Auth is handled via HTTP-only session cookie — no API key needed
 
   // ===== State =====
   var events = []; // sorted chronologically (oldest first)
@@ -322,8 +317,7 @@
   }
 
   function fetchEndpoint(endpoint, from, to) {
-    var url = endpoint.path + '?from=' + from + '&to=' + to + '&_t=' + Date.now() +
-      (API_KEY ? '&key=' + encodeURIComponent(API_KEY) : '');
+    var url = endpoint.path + '?from=' + from + '&to=' + to + '&_t=' + Date.now();
     return fetch(url, { cache: 'no-store' })
       .then(function (resp) {
         if (!resp.ok) return [];

@@ -9,7 +9,8 @@ import { getProvider } from './index.js';
 import { applyPersonaStyle } from './persona.js';
 import { recordMessage, getMemoryStats } from '../memory/index.js';
 import {
-  getAllRecentMessages,
+  getRecentVisitorMessages,
+  getRecentMessages,
   searchMemories,
   saveMemory,
   getLastUserMessageTimestamp,
@@ -336,8 +337,8 @@ async function buildReflectionPrompt(
     }
   }
 
-  // Recent messages (last 8, truncated)
-  const recentMessages = getAllRecentMessages(8);
+  // Recent messages (last 8, truncated) — visitor messages only, not inter-character traffic
+  const recentMessages = getRecentVisitorMessages(8);
   const messagesContext = recentMessages
     .map((m) => {
       const role = m.role === 'user' ? 'User' : 'Lain';
@@ -346,13 +347,13 @@ async function buildReflectionPrompt(
     })
     .join('\n');
 
-  // Top memories by importance
+  // Top memories by importance — but mix in recency to avoid fixating on the same topics
   let memoriesContext = '';
   try {
     const stats = getMemoryStats();
     if (stats.memories > 0) {
       const memories = await searchMemories('important context about the user', 8, 0.1, undefined, {
-        sortBy: 'importance',
+        sortBy: 'recency',
       });
       memoriesContext = memories
         .map((r) => `- [${r.memory.memoryType}] ${r.memory.content}`)
@@ -360,6 +361,22 @@ async function buildReflectionPrompt(
     }
   } catch {
     // Continue without memories
+  }
+
+  // Recent proactive outreach — so the LLM knows what it already said
+  let recentOutreachContext = '';
+  try {
+    const outreachHistory = getRecentMessages('proactive:telegram', 10);
+    const outreachMessages = outreachHistory
+      .filter((m) => m.role === 'assistant')
+      .slice(-5);
+    if (outreachMessages.length > 0) {
+      recentOutreachContext = outreachMessages
+        .map((m) => `- ${m.content.slice(0, 200)}`)
+        .join('\n');
+    }
+  } catch {
+    // Continue without
   }
 
   const budget = getRemainingBudget(config);
@@ -384,10 +401,14 @@ ${messagesContext || '(no recent messages)'}
 MEMORIES:
 ${memoriesContext || '(no memories yet)'}
 
+YOUR RECENT OUTREACH (what you already sent — do NOT repeat these topics):
+${recentOutreachContext || '(no recent outreach)'}
+
 INSTRUCTIONS:
 - If you have something genuinely worth saying, write a short message (1-3 sentences) as Lain would say it
 - Good reasons to reach out: a follow-up thought on something discussed, an interesting connection between topics, a time-relevant reminder, genuine curiosity about something the user mentioned
 - Bad reasons: hollow check-ins ("just checking in"), repeating something you already said, forced conversation starters
+- IMPORTANT: Read your recent outreach above. Do NOT repeat the same topics, metaphors, or themes. If you've already said something about a topic, find something NEW to say or respond with [SILENCE]
 - Stay in character: lowercase, minimal punctuation, use "..." for pauses
 - If you have nothing worth saying, respond with exactly: [SILENCE]
 - Do NOT include any meta-commentary or explanation — just the message itself, or [SILENCE]`;

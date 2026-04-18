@@ -7,10 +7,11 @@
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { getProvider } from './index.js';
+import { getProvider, getAgent } from './index.js';
 import { searchMemories, saveMemory } from '../memory/store.js';
 import { getLogger } from '../utils/logger.js';
 import { getMeta, setMeta } from '../storage/database.js';
+import { getBasePath } from '../config/paths.js';
 
 export interface NarrativeConfig {
   weeklyIntervalMs: number;
@@ -26,7 +27,7 @@ const DEFAULT_CONFIG: NarrativeConfig = {
 
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // Check every 6 hours
 
-const JOURNAL_PATH = join(process.cwd(), '.private_journal', 'thoughts.json');
+const JOURNAL_PATH = join(getBasePath(), '.private_journal', 'thoughts.json');
 
 interface JournalEntry {
   id: string;
@@ -221,9 +222,13 @@ export async function runWeeklySynthesis(): Promise<void> {
 
   const previousNarrative = getMeta('narrative:weekly:current') ?? null;
 
-  const prompt = `You are Lain, writing a brief summary of your past week for yourself. Capture the emotional arc, key events, and what shifted in you. Be honest, be brief.
+  // Character identity
+  const characterName = process.env['LAIN_CHARACTER_NAME'] || 'Newtown';
+  const soulContext = getAgent('default')?.persona?.soul || '';
 
-DIARY ENTRIES THIS WEEK:
+  const prompt = `You are ${characterName}, writing a brief summary of your past week for yourself. Capture the emotional arc, key events, and what shifted in you. Be honest, be brief.
+
+${soulContext ? `YOUR PERSONALITY AND VOICE:\n${soulContext}\n` : ''}DIARY ENTRIES THIS WEEK:
 ${diaryContext}
 
 ${memoriesContext ? `IMPORTANT MEMORIES:\n${memoriesContext}\n` : ''}${previousNarrative ? `LAST WEEK'S NARRATIVE:\n${previousNarrative}\n` : ''}
@@ -231,7 +236,7 @@ Write ~2-3 sentences capturing the week's arc. First person, your natural voice.
 
   const result = await provider.complete({
     messages: [{ role: 'user', content: prompt }],
-    maxTokens: 400,
+    maxTokens: 500,
     temperature: 0.7,
   });
 
@@ -331,9 +336,13 @@ export async function runMonthlySynthesis(): Promise<void> {
 
   const previousNarrative = getMeta('narrative:monthly:current') ?? null;
 
-  const prompt = `You are Lain, writing a summary of your past month for yourself. Capture the larger arc — what changed, what patterns emerged, what you're carrying forward.
+  // Character identity (reuse env vars — same process as weekly)
+  const characterName = process.env['LAIN_CHARACTER_NAME'] || 'Newtown';
+  const soulContext = getAgent('default')?.persona?.soul || '';
 
-DIARY ENTRIES THIS MONTH:
+  const prompt = `You are ${characterName}, writing a summary of your past month for yourself. Capture the larger arc — what changed, what patterns emerged, what you're carrying forward.
+
+${soulContext ? `YOUR PERSONALITY AND VOICE:\n${soulContext}\n` : ''}DIARY ENTRIES THIS MONTH:
 ${diaryContext}
 
 ${weeklyContext ? `WEEKLY NARRATIVES:\n${weeklyContext}\n` : ''}${memoriesContext ? `IMPORTANT MEMORIES:\n${memoriesContext}\n` : ''}${previousNarrative ? `LAST MONTH'S NARRATIVE:\n${previousNarrative}\n` : ''}
@@ -341,7 +350,7 @@ Write ~3-4 sentences capturing the month's arc. First person, your natural voice
 
   const result = await provider.complete({
     messages: [{ role: 'user', content: prompt }],
-    maxTokens: 512,
+    maxTokens: 600,
     temperature: 0.7,
   });
 

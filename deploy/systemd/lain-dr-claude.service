@@ -1,16 +1,30 @@
 [Unit]
-Description=Lain Dr. Claude Character Server
-After=network.target lain-web.service
+Description=Lain Dr. Claude - Town Doctor
+After=network.target lain-wired.service
+PartOf=lain.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/wired-lain
+WorkingDirectory=/opt/local-lain
+ExecStartPre=/bin/bash -c 'fuser -k 3002/tcp 2>/dev/null || true'
+ExecStartPre=/bin/bash -c 'mkdir -p /root/.lain-dr-claude/workspace && [ -d workspace/characters/dr-claude ] && cp -r workspace/characters/dr-claude/* /root/.lain-dr-claude/workspace/ || true'
 ExecStart=/usr/bin/node dist/index.js dr-claude --port 3002
 Restart=on-failure
 RestartSec=5
+
 Environment=NODE_ENV=production
-EnvironmentFile=/opt/wired-lain/.env
+Environment=LAIN_HOME=/root/.lain-dr-claude
+Environment=CHARACTER_PROVIDER=anthropic
+Environment=CHARACTER_MODEL=claude-haiku-4-5-20251001
+Environment=CHARACTER_API_KEY_ENV=ANTHROPIC_API_KEY
+Environment=WIRED_LAIN_URL=http://localhost:3000
+Environment=PORT=3002
+EnvironmentFile=/opt/local-lain/.env
+EnvironmentFile=/opt/local-lain/deploy/env/lain-dr-claude.env
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=lain-dr-claude

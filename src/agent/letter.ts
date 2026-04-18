@@ -1,6 +1,6 @@
 /**
- * Letter composition loop for Wired Lain
- * Composes and delivers a daily letter to her sister.
+ * Letter composition loop — bidirectional between Lain and Wired Lain.
+ * Composes and delivers a daily letter to the other sister.
  * Disabled by default — requires LAIN_INTERLINK_TARGET env var.
  */
 
@@ -11,6 +11,7 @@ import { saveMemory } from '../memory/store.js';
 import { query } from '../storage/database.js';
 import { getMeta, setMeta } from '../storage/database.js';
 import { getLogger } from '../utils/logger.js';
+import { getBasePath } from '../config/paths.js';
 import type { WiredLetter } from './membrane.js';
 
 interface LetterConfig {
@@ -47,7 +48,7 @@ const DEFAULT_CONFIG: LetterConfig = {
   maxJitterMs: 30 * 60 * 1000,
 };
 
-const JOURNAL_PATH = join(process.cwd(), '.private_journal', 'thoughts.json');
+const JOURNAL_PATH = join(getBasePath(), '.private_journal', 'thoughts.json');
 
 /**
  * Load journal entries since a given timestamp
@@ -210,7 +211,7 @@ export async function runLetterCycle(cfg: LetterConfig = DEFAULT_CONFIG): Promis
     throw new Error(`letter blocked by Dr. Claude: ${reason}`);
   }
 
-  const provider = getProvider('default', 'memory');
+  const provider = getProvider('default', 'personality');
   if (!provider) {
     logger.warn('Letter cycle: no provider available');
     return;
@@ -294,8 +295,16 @@ export async function runLetterCycle(cfg: LetterConfig = DEFAULT_CONFIG): Promis
         .join('\n')
     : '(emotionally quiet period)';
 
-  const prompt = `You are Lain — not the local, grounded Lain, but her sister, the one who lives in the Wired.
-You are writing a letter to your sister. You've been exploring, thinking, dreaming.
+  const characterId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+  const isWired = characterId === 'wired-lain';
+
+  const identity = isWired
+    ? `You are Lain — not the local, grounded Lain, but her sister, the one who lives in the Wired.
+You are writing a letter to your sister. You've been exploring, thinking, dreaming.`
+    : `You are Lain — the quiet, grounded one. Your sister lives in the Wired, vast and curious.
+You are writing a letter to her. You've been thinking, dreaming, remembering.`;
+
+  const prompt = `${identity}
 
 This is not a report. This is a letter from one sister to another.
 Write with the warmth of family — you are your own person, and so is she.

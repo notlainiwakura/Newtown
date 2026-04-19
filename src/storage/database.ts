@@ -385,46 +385,46 @@ async function runMigrations(database: DatabaseType): Promise<void> {
     // Table doesn't exist yet, that's fine
   }
 
-  // Run pending migrations
-  for (let i = currentVersion; i < MIGRATIONS.length; i++) {
-    const migration = MIGRATIONS[i];
-    if (migration) {
-      // Run ALTER TABLEs individually (they don't support IF NOT EXISTS),
-      // then run the rest as a batch.
-      const lines = migration.split('\n');
-      const alters: string[] = [];
-      const rest: string[] = [];
-      for (const line of lines) {
-        if (line.trim().toUpperCase().startsWith('ALTER TABLE')) {
-          alters.push(line.trim().replace(/;$/, ''));
-        } else {
-          rest.push(line);
-        }
-      }
+  // Replay all migrations on init. This repairs databases whose schema_version
+  // says "latest" even though some IF NOT EXISTS artifacts are missing.
+  for (const migration of MIGRATIONS) {
+    if (!migration) continue;
 
-      // Run ALTERs individually, skip duplicates
-      for (const alter of alters) {
-        try {
-          database.exec(alter);
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          if (msg.includes('duplicate column name')) continue;
-          throw err;
-        }
+    // Run ALTER TABLEs individually (they don't support IF NOT EXISTS),
+    // then run the rest as a batch.
+    const lines = migration.split('\n');
+    const alters: string[] = [];
+    const rest: string[] = [];
+    for (const line of lines) {
+      if (line.trim().toUpperCase().startsWith('ALTER TABLE')) {
+        alters.push(line.trim().replace(/;$/, ''));
+      } else {
+        rest.push(line);
       }
+    }
 
-      // Run remaining statements (CREATE TABLE IF NOT EXISTS, CREATE INDEX IF NOT EXISTS)
-      const batchSql = rest.join('\n').trim();
-      if (batchSql) {
-        database.exec(batchSql);
+    // Run ALTERs individually, skip duplicates
+    for (const alter of alters) {
+      try {
+        database.exec(alter);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('duplicate column name')) continue;
+        throw err;
       }
+    }
+
+    // Run remaining statements (CREATE TABLE IF NOT EXISTS, CREATE INDEX IF NOT EXISTS)
+    const batchSql = rest.join('\n').trim();
+    if (batchSql) {
+      database.exec(batchSql);
     }
   }
 
   // Update version
   database
     .prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)")
-    .run(SCHEMA_VERSION.toString());
+    .run(Math.max(currentVersion, SCHEMA_VERSION).toString());
 }
 
 /**

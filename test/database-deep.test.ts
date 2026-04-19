@@ -261,6 +261,22 @@ describe('Database Initialization', () => {
     expect(tables.map((t) => t.name)).toContain('palace_rooms');
   });
 
+  it('repairs missing IF NOT EXISTS tables even when schema_version is already current', async () => {
+    await mkdir(testDir, { recursive: true });
+    const dbPath = join(testDir, 'repair-schema.db');
+    await initDatabase(dbPath);
+
+    execute('DROP TABLE objects');
+    setMeta('schema_version', '11');
+    closeDatabase();
+
+    await initDatabase(dbPath);
+    const tables = query<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type='table'"
+    );
+    expect(tables.map((t) => t.name)).toContain('objects');
+  });
+
   it('creates memory_associations table after init', async () => {
     await mkdir(testDir, { recursive: true });
     const dbPath = join(testDir, 'assoc-schema.db');

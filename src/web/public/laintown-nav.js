@@ -1,4 +1,4 @@
-// Laintown navigation bar — injected into all pages (including proxied character servers)
+// Newtown navigation bar — injected into all pages (including proxied character servers)
 (function () {
   var path = location.pathname;
   var links = [
@@ -47,7 +47,7 @@
     var title = document.createElement('a');
     title.className = 'ltn-title';
     title.href = '/';
-    title.textContent = 'LAINTOWN';
+    title.textContent = 'NEWTOWN';
     nav.appendChild(title);
 
     for (var i = 0; i < links.length; i++) {

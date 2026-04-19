@@ -15,14 +15,14 @@ class TitleScene extends Phaser.Scene {
     window._mobileState = 'title';
 
     // Title
-    this.add.text(cx, 160, 'LAINTOWN', {
+    this.add.text(cx, 160, 'NEWTOWN', {
       fontSize: '72px',
       fontFamily: 'monospace',
       color: GAME_THEME.accentSecondary,
       align: 'center',
     }).setOrigin(0.5);
 
-    this.add.text(cx, 260, 'a place in the wired', {
+    this.add.text(cx, 260, 'a place in the town', {
       fontSize: '28px',
       fontFamily: 'monospace',
       color: GAME_THEME.uiBorder,

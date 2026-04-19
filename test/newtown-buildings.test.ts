@@ -19,6 +19,7 @@ describe('Newtown buildings', () => {
   it('assigns residents to the intended default starting locations', async () => {
     const { DEFAULT_LOCATIONS } = await import('../src/commune/buildings.js');
     expect(DEFAULT_LOCATIONS).toEqual({
+      newtown: 'square',
       neo: 'station',
       plato: 'mystery-tower',
       joe: 'square',

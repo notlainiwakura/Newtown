@@ -8,6 +8,7 @@ import { execute, query, queryOne, transaction } from '../storage/database.js';
 import { serializeEmbedding, deserializeEmbedding, generateEmbedding, cosineSimilarity } from './embeddings.js';
 import { getLogger } from '../utils/logger.js';
 import { eventBus, parseEventType } from '../events/bus.js';
+import { mirrorMemoryToChroma } from './chroma.js';
 
 export type MemorySortBy = 'relevance' | 'recency' | 'importance' | 'access_count';
 export type LifecycleState = 'seed' | 'growing' | 'mature' | 'complete' | 'composting';
@@ -248,9 +249,10 @@ export async function saveMemory(
   const lifecycleState = memory.lifecycleState ?? 'seed';
 
   // Generate embedding for the memory content
+  let embedding: Float32Array | null = null;
   let embeddingBuffer: Buffer | null = null;
   try {
-    const embedding = await generateEmbedding(memory.content);
+    embedding = await generateEmbedding(memory.content);
     embeddingBuffer = serializeEmbedding(embedding);
   } catch (error) {
     logger.warn({ error }, 'Failed to generate embedding for memory');
@@ -290,9 +292,8 @@ export async function saveMemory(
   );
 
   // Insert into vec0 if embedding exists
-  if (embeddingBuffer) {
+  if (embedding) {
     try {
-      const embedding = deserializeEmbedding(embeddingBuffer);
       execute(
         'INSERT INTO memory_embeddings(rowid, embedding, memory_id) VALUES (?, ?, ?)',
         [BigInt(Date.now() * 1000 + Math.floor(Math.random() * 1000)), embedding, id]
@@ -300,6 +301,31 @@ export async function saveMemory(
     } catch {
       // vec0 insert failure is non-critical
     }
+  }
+
+  try {
+    await mirrorMemoryToChroma({
+      id,
+      characterId: process.env['LAIN_CHARACTER_ID'] || eventBus.characterId,
+      sessionKey: memory.sessionKey,
+      userId: memory.userId,
+      content: memory.content,
+      memoryType: memory.memoryType,
+      importance: memory.importance,
+      emotionalWeight: memory.emotionalWeight ?? 0,
+      embedding,
+      createdAt: now,
+      relatedTo: memory.relatedTo,
+      sourceMessageId: memory.sourceMessageId,
+      metadata: memory.metadata || {},
+      lifecycleState,
+      phase: null,
+      wingId,
+      roomId,
+      hall,
+    });
+  } catch (error) {
+    logger.warn({ error, memoryId: id }, 'Failed to mirror memory to Chroma');
   }
 
   eventBus.emitActivity({

@@ -23,6 +23,7 @@ import { startSelfConceptLoop } from '../agent/self-concept.js';
 import { startNarrativeLoop } from '../agent/narratives.js';
 import { startMemoryMaintenanceLoop } from '../memory/organic.js';
 import { startDreamLoop } from '../agent/dreams.js';
+import { getDefaultNewtownNewspaperConfig, getNewspaperDataDir, startNewspaperPublishingLoop } from '../agent/newspaper-publisher.js';
 import { startLetterLoop } from '../agent/letter.js';
 import { startBibliomancyLoop } from '../agent/bibliomancy.js';
 import { startDossierLoop } from '../agent/dossier.js';
@@ -57,6 +58,7 @@ import type { IncomingMessage, TextContent, ImageContent } from '../types/messag
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const PUBLIC_DIR = join(__dirname, '..', '..', 'src', 'web', 'public');
 const SKINS_DIR = join(__dirname, '..', '..', 'src', 'web', 'skins');
+const NEWSPAPERS_DIR = getNewspaperDataDir();
 const LOG_DIR = join(__dirname, '..', '..', 'logs');
 const LOG_FILE = join(LOG_DIR, 'lain-debug.log');
 
@@ -2069,6 +2071,20 @@ export async function startWebServer(port = 3000): Promise<void> {
       return;
     }
 
+    // Serve generated newspaper editions from runtime data.
+    if (url.pathname.startsWith('/newspapers/')) {
+      const newspaperPath = url.pathname.slice('/newspapers/'.length);
+      const file = await serveFromDir(NEWSPAPERS_DIR, newspaperPath);
+      if (file) {
+        res.writeHead(200, { 'Content-Type': file.type, 'Cache-Control': 'no-cache' });
+        res.end(file.content);
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not found' }));
+      return;
+    }
+
     // Serve static files
     const file = await serveStatic(url.pathname);
     if (file) {
@@ -2148,6 +2164,11 @@ export async function startWebServer(port = 3000): Promise<void> {
     stopFns.push(startNarrativeLoop());
     stopFns.push(startMemoryMaintenanceLoop());
     stopFns.push(startDreamLoop());
+    if (characterId === 'newtown') {
+      stopFns.push(startNewspaperPublishingLoop(
+        getDefaultNewtownNewspaperConfig(NEWSPAPERS_DIR)
+      ));
+    }
     if (hasSisterLetterLoop) {
       stopFns.push(startLetterLoop());
     }

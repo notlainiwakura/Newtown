@@ -33,6 +33,7 @@ import { startDiaryLoop } from '../agent/diary.js';
 import { startSelfConceptLoop } from '../agent/self-concept.js';
 import { startDreamLoop } from '../agent/dreams.js';
 import { startNarrativeLoop } from '../agent/narratives.js';
+import { startNewspaperLoop } from '../agent/newspaper.js';
 import { startMemoryMaintenanceLoop } from '../memory/organic.js';
 import { startDesireLoop } from '../agent/desires.js';
 import { paraphraseLetter, type WiredLetter } from '../agent/membrane.js';
@@ -163,6 +164,13 @@ function startBackgroundLoops(config: CharacterConfig): BackgroundLoops {
     () => startSelfConceptLoop(),
     () => startDreamLoop(),
     () => startNarrativeLoop(),
+    () => startNewspaperLoop({
+      characterId: config.id,
+      characterName: config.name,
+      newspaperBaseUrl: wiredLainUrl,
+      paperName: 'The Newtown Chronicle',
+      townName: 'Newtown',
+    }),
     () => startMemoryMaintenanceLoop(),
     () => startDesireLoop({
       characterId: config.id,

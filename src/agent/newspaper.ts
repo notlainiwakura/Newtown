@@ -13,6 +13,8 @@ export interface NewspaperConfig {
   characterId: string;
   characterName: string;
   newspaperBaseUrl: string;   // e.g. 'http://localhost:3000'
+  paperName?: string;
+  townName?: string;
   intervalMs?: number;
   enabled?: boolean;
 }
@@ -174,14 +176,17 @@ async function readNewspaper(newspaper: Newspaper, config: NewspaperConfig): Pro
     content = content.slice(0, 2000) + '\n\n[...truncated]';
   }
 
-  const prompt = `You just read today's edition of the Laintown Daily, edited by ${newspaper.editor_name}.
+  const paperName = config.paperName ?? 'The Laintown Chronicle';
+  const townName = config.townName ?? 'Laintown';
+
+  const prompt = `You just read today's edition of ${paperName}, edited by ${newspaper.editor_name}.
 
 Here's the newspaper:
 ---
 ${content}
 ---
 
-Write a brief, natural reaction to what you read. What caught your attention? What do you think about the events described? Did anything surprise you or remind you of something? Keep it to 2-3 sentences — this is your internal thought after reading, not a published response.`;
+Write a brief, natural reaction to what you read. What caught your attention? What do you think about the events described in ${townName}? Did anything surprise you or remind you of something? Keep it to 2-3 sentences — this is your internal thought after reading, not a published response.`;
 
   const result = await provider.complete({
     messages: [{ role: 'user', content: prompt }],

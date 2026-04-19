@@ -62,6 +62,11 @@ vi.mock('../src/commune/location.js', () => ({
 }));
 vi.mock('../src/commune/buildings.js', () => ({
   isValidBuilding: vi.fn(() => true),
+  BUILDINGS: [
+    { id: 'library', name: 'Library', description: 'Quiet shelves' },
+    { id: 'bar', name: 'Bar', description: 'Low voices and late light' },
+    { id: 'field', name: 'Field', description: 'Open grass and sky' },
+  ],
   BUILDING_MAP: { library: { name: 'Library' }, bar: { name: 'Bar' }, field: { name: 'Field' } },
 }));
 vi.mock('../src/memory/embeddings.js', () => ({ cosineSimilarity: vi.fn(() => 0.3) }));
@@ -348,6 +353,48 @@ describe('Curiosity — offline loop', () => {
     _metaStore.set('curiosity-offline:last_cycle_at', (Date.now() - 1000).toString());
     const { startOfflineCuriosityLoop } = await import('../src/agent/curiosity-offline.js');
     startOfflineCuriosityLoop({ enabled: false, ...cfg })();
+  });
+  it('records local-only curiosity without submitting research', async () => {
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    _metaStore.set('curiosity-offline:last_cycle_at', (Date.now() - 10_000_000).toString());
+
+    const agent = await import('../src/agent/index.js');
+    const memStore = await import('../src/memory/store.js');
+    vi.mocked(agent.getProvider).mockReturnValue({
+      complete: vi.fn()
+        .mockResolvedValueOnce({
+          content: 'QUESTION: Why do people linger in the square?\nREASON: The pattern keeps returning to me.',
+        })
+        .mockResolvedValueOnce({
+          content: 'STAY: I want to remain where I am for now.',
+        }),
+    } as any);
+
+    const { startOfflineCuriosityLoop } = await import('../src/agent/curiosity-offline.js');
+    const stop = startOfflineCuriosityLoop({
+      ...cfg,
+      enabled: true,
+      intervalMs: 1_000_000,
+      maxJitterMs: 0,
+      submitResearchRequests: false,
+    });
+
+    await vi.advanceTimersByTimeAsync(1);
+    stop();
+
+    expect(memStore.saveMemory).toHaveBeenCalledWith(expect.objectContaining({
+      sessionKey: 'curiosity:offline',
+      metadata: expect.objectContaining({
+        type: 'local_curiosity',
+        localOnly: true,
+        answered: true,
+      }),
+    }));
+    expect(fetch).not.toHaveBeenCalled();
+
+    randomSpy.mockRestore();
+    vi.useRealTimers();
   });
 });
 

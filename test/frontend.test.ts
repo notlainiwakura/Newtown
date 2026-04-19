@@ -23,6 +23,29 @@ function readPublicFile(relativePath: string): string {
   return readFileSync(join(PUBLIC_DIR, relativePath), 'utf-8');
 }
 
+describe('Direct chat shell regressions', () => {
+  const html = readPublicFile('index.html');
+  const app = readPublicFile('app.js');
+
+  it('uses a dynamic presence sender instead of a hardcoded resident label', () => {
+    expect(html).toContain('id="presence-sender"');
+    expect(html).toContain('id="presence-text"');
+    expect(html).toContain('<title>NEWTOWN</title>');
+  });
+
+  it('updates streaming and presence labels from the active character identity', () => {
+    expect(app).toContain('document.title = characterLabel;');
+    expect(app).toContain("presenceSender.textContent = characterLabel");
+    expect(app).toContain('<span class="sender">${characterLabel}</span>');
+  });
+
+  it('normalizes legacy visitor labels to VISITOR', () => {
+    expect(app).toContain("const LEGACY_VISITOR_NAMES = new Set(['', 'SHRAII', 'LAIN', 'NEWTOWN'])");
+    expect(app).toContain("window.LAIN_SENDER_NAME = normalizedVisitorName || 'VISITOR';");
+    expect(app).toContain("localStorage.setItem('newtown-sender-name', window.LAIN_SENDER_NAME);");
+  });
+});
+
 // ============================================================================
 // Config (game/js/config.js)
 // ============================================================================

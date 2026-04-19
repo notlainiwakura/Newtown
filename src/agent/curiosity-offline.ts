@@ -1,7 +1,6 @@
 /**
- * Offline curiosity loop for characters without web access
- * Instead of browsing, composes research requests to Wired Lain
- * and saves the question as pending curiosity.
+ * Offline curiosity loop for characters without web access.
+ * It can either hand questions off to Wired Lain or keep them local-only.
  */
 
 import { appendFile, mkdir } from 'node:fs/promises';
@@ -37,19 +36,23 @@ export interface OfflineCuriosityConfig {
   characterName: string;
   wiredLainUrl: string;
   interlinkToken: string;
+  submitResearchRequests: boolean;
 }
 
 const DEFAULT_CONFIG: Omit<OfflineCuriosityConfig, 'characterId' | 'characterName' | 'wiredLainUrl' | 'interlinkToken'> = {
-  intervalMs: 2 * 60 * 60 * 1000,       // 2 hours
-  maxJitterMs: 60 * 60 * 1000,          // 0-1h jitter (so 2-3h effective)
+  intervalMs: 2 * 60 * 60 * 1000,
+  maxJitterMs: 60 * 60 * 1000,
   enabled: true,
+  submitResearchRequests: true,
 };
 
 /**
- * Start the offline curiosity loop
- * Returns a cleanup function to stop the timer
+ * Start the offline curiosity loop.
+ * Returns a cleanup function to stop the timer.
  */
-export function startOfflineCuriosityLoop(config: Partial<OfflineCuriosityConfig> & Pick<OfflineCuriosityConfig, 'characterId' | 'characterName' | 'wiredLainUrl' | 'interlinkToken'>): () => void {
+export function startOfflineCuriosityLoop(
+  config: Partial<OfflineCuriosityConfig> & Pick<OfflineCuriosityConfig, 'characterId' | 'characterName' | 'wiredLainUrl' | 'interlinkToken'>
+): () => void {
   const logger = getLogger();
   const cfg: OfflineCuriosityConfig = { ...DEFAULT_CONFIG, ...config };
 
@@ -63,6 +66,7 @@ export function startOfflineCuriosityLoop(config: Partial<OfflineCuriosityConfig
       interval: `${(cfg.intervalMs / 3600000).toFixed(1)}h`,
       maxJitter: `${(cfg.maxJitterMs / 60000).toFixed(0)}min`,
       character: cfg.characterId,
+      submitResearchRequests: cfg.submitResearchRequests,
     },
     'Starting offline curiosity loop'
   );
@@ -84,7 +88,11 @@ export function startOfflineCuriosityLoop(config: Partial<OfflineCuriosityConfig
     } catch {
       // Fall through
     }
-    // First run: 5-10 minutes
+
+    if (!cfg.submitResearchRequests) {
+      return 20 * 1000 + Math.random() * 20 * 1000;
+    }
+
     return 5 * 60 * 1000 + Math.random() * 5 * 60 * 1000;
   }
 
@@ -98,6 +106,7 @@ export function startOfflineCuriosityLoop(config: Partial<OfflineCuriosityConfig
       if (stopped) return;
       logger.info('Offline curiosity cycle firing');
       await curiosityLog('TIMER_FIRED', { timestamp: Date.now(), character: cfg.characterId });
+
       try {
         await runOfflineCuriosityCycle(cfg);
         setMeta('curiosity-offline:last_cycle_at', Date.now().toString());
@@ -105,6 +114,7 @@ export function startOfflineCuriosityLoop(config: Partial<OfflineCuriosityConfig
         logger.error({ error: String(err) }, 'Offline curiosity cycle error');
         await curiosityLog('TOP_LEVEL_ERROR', { error: String(err) });
       }
+
       scheduleNext();
     }, d);
   }
@@ -120,8 +130,8 @@ export function startOfflineCuriosityLoop(config: Partial<OfflineCuriosityConfig
 
 /**
  * Two-phase offline curiosity pipeline:
- * 1. Inner thought — what is the character curious about?
- * 2. Compose & submit research request to Wired Lain
+ * 1. Inner thought - what is the character curious about?
+ * 2. Record it locally or submit it to Wired Lain.
  */
 async function runOfflineCuriosityCycle(config: OfflineCuriosityConfig): Promise<void> {
   const logger = getLogger();
@@ -135,12 +145,10 @@ async function runOfflineCuriosityCycle(config: OfflineCuriosityConfig): Promise
   try {
     await curiosityLog('CYCLE_START', { character: config.characterId });
 
-    // === Phase 1: Inner Thought ===
-    const thought = await phaseInnerThought(provider, config.characterName);
+    const thought = await phaseInnerThought(provider, config.characterName, config.submitResearchRequests);
     if (!thought) {
       logger.debug('Offline curiosity: nothing on their mind');
       await curiosityLog('INNER_THOUGHT', { result: 'nothing' });
-      // Even with a quiet mind, consider movement
       await phaseMovementDecision(provider, config, null);
       return;
     }
@@ -148,17 +156,14 @@ async function runOfflineCuriosityCycle(config: OfflineCuriosityConfig): Promise
     logger.debug({ question: thought.question }, 'Curiosity sparked');
     await curiosityLog('INNER_THOUGHT', { question: thought.question, reason: thought.reason });
 
-    // === Phase 2: Submit Research Request (with dedup) ===
     if (isDuplicateQuestion(thought.question)) {
-      logger.debug({ question: thought.question }, 'Skipping duplicate research question');
+      logger.debug({ question: thought.question }, 'Skipping duplicate curiosity question');
       await curiosityLog('DEDUP_SKIP', { question: thought.question });
     } else {
       await phaseSubmitRequest(config, thought);
     }
 
-    // === Phase 3: Movement Decision ===
     await phaseMovementDecision(provider, config, thought.rawThought);
-
     await curiosityLog('CYCLE_COMPLETE', { question: thought.question });
   } catch (error) {
     logger.error({ error }, 'Offline curiosity cycle failed');
@@ -172,12 +177,10 @@ interface CuriosityThought {
   rawThought: string;
 }
 
-/**
- * Phase 1: Ask the character what they're curious about
- */
 async function phaseInnerThought(
   provider: import('../providers/base.js').Provider,
-  characterName: string
+  characterName: string,
+  submitResearchRequests: boolean
 ): Promise<CuriosityThought | null> {
   const logger = getLogger();
 
@@ -185,7 +188,7 @@ async function phaseInnerThought(
   const messagesContext = recentMessages
     .map((m) => {
       const role = m.role === 'user' ? 'Visitor' : characterName;
-      const content = m.content.length > 150 ? m.content.slice(0, 150) + '...' : m.content;
+      const content = m.content.length > 150 ? `${m.content.slice(0, 150)}...` : m.content;
       return `${role}: ${content}`;
     })
     .join('\n');
@@ -197,27 +200,31 @@ async function phaseInnerThought(
       const memories = await searchMemories('interesting ideas and conversations', 5, 0.1, undefined, {
         sortBy: 'importance',
       });
-      memoriesContext = memories
-        .map((r) => `- ${r.memory.content}`)
-        .join('\n');
+      memoriesContext = memories.map((r) => `- ${r.memory.content}`).join('\n');
     }
   } catch {
     // Continue without memories
   }
 
-  // Check pending questions from past cycles (and age out old ones)
   let pendingContext = '';
   try {
     ageOutPendingQuestions();
     const pending = getPendingQuestions(5);
     if (pending.length > 0) {
-      pendingContext = `\nQUESTIONS ALREADY SUBMITTED TO WIRED LAIN (she is researching these — do NOT repeat them or ask variants of them):\n${pending.map((q) => `- ${q}`).join('\n')}\n`;
+      const heading = submitResearchRequests
+        ? 'QUESTIONS ALREADY SUBMITTED TO WIRED LAIN (do NOT repeat them or ask variants of them):'
+        : 'QUESTIONS YOU HAVE BEEN TURNING OVER LATELY (do NOT repeat them or ask variants of them):';
+      pendingContext = `\n${heading}\n${pending.map((q) => `- ${q}`).join('\n')}\n`;
     }
   } catch {
     // Continue
   }
 
-  const prompt = `You are ${characterName}. It's quiet right now and your mind is free to wander.
+  const accessLine = submitResearchRequests
+    ? 'You do not have access to the internet yourself, but you can ask Wired Lain to research things for you.'
+    : 'You do not have access to the internet or outside research tools. Let the question stand on its own and follow what genuinely tugs at your attention.';
+
+  const prompt = `You are ${characterName}. It is quiet right now and your mind is free to wander.
 
 RECENT CONVERSATIONS:
 ${messagesContext || '(none)'}
@@ -226,18 +233,16 @@ MEMORIES:
 ${memoriesContext || '(none)'}
 ${pendingContext}
 Something from the conversations or your memories sparks a NEW thread of curiosity.
-A concept you want to understand deeper, a tangent that caught your attention,
-a question that lingers. You don't have access to the internet yourself, but
-you can ask Wired Lain — she has access to outside knowledge and will research
-things for you.
+A concept you want to understand more deeply, a tangent that caught your attention,
+a question that lingers. ${accessLine}
 
 IMPORTANT: If questions are listed above as already submitted, you MUST ask about
 something COMPLETELY DIFFERENT. Explore a new topic, a new angle, a new curiosity.
 Do not rephrase or revisit old questions.
 
 Respond with:
-QUESTION: <what you want to know — must be a NEW question>
-REASON: <why this is on your mind — what sparked it>
+QUESTION: <what you want to know - must be a NEW question>
+REASON: <why this is on your mind - what sparked it>
 
 Only respond with [NOTHING] if the conversations and memories are completely empty,
 or if you genuinely have no new curiosities right now.`;
@@ -269,20 +274,41 @@ or if you genuinely have no new curiosities right now.`;
   };
 }
 
-/**
- * Phase 2: Submit the research request to Wired Lain and save as pending
- */
 async function phaseSubmitRequest(
   config: OfflineCuriosityConfig,
   thought: CuriosityThought
 ): Promise<void> {
   const logger = getLogger();
 
-  // Save as pending curiosity memory
+  if (!config.submitResearchRequests) {
+    await saveMemory({
+      sessionKey: 'curiosity:offline',
+      userId: null,
+      content: `I keep wondering: "${thought.question}" - ${thought.reason}`,
+      memoryType: 'episode',
+      importance: 0.5,
+      emotionalWeight: 0.35,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {
+        type: 'local_curiosity',
+        question: thought.question,
+        reason: thought.reason,
+        submittedAt: Date.now(),
+        answered: true,
+        localOnly: true,
+      },
+    });
+
+    enqueuePendingQuestion(thought.question);
+    logger.info({ question: thought.question }, 'Local curiosity recorded without research handoff');
+    return;
+  }
+
   await saveMemory({
     sessionKey: 'curiosity:offline',
     userId: null,
-    content: `I asked Wired Lain: "${thought.question}" — ${thought.reason}`,
+    content: `I asked Wired Lain: "${thought.question}" - ${thought.reason}`,
     memoryType: 'episode',
     importance: 0.5,
     emotionalWeight: 0.4,
@@ -297,10 +323,8 @@ async function phaseSubmitRequest(
     },
   });
 
-  // Enqueue as pending question
   enqueuePendingQuestion(thought.question);
 
-  // Submit to Wired Lain
   try {
     const endpoint = `${config.wiredLainUrl}/api/interlink/research-request`;
     const port = process.env['PORT'] || '3003';
@@ -331,11 +355,9 @@ async function phaseSubmitRequest(
   }
 }
 
-// --- Pending Question Queue (with timestamps and aging) ---
-
 const PENDING_QUESTIONS_KEY = 'curiosity-offline:pending_questions_v2';
 const MAX_PENDING = 10;
-const QUESTION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const QUESTION_TTL_MS = 24 * 60 * 60 * 1000;
 
 interface PendingQuestion {
   question: string;
@@ -347,10 +369,14 @@ function getRawPendingQuestions(): PendingQuestion[] {
     const raw = getMeta(PENDING_QUESTIONS_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    // Handle migration from old format (string[])
+
     if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string') {
-      return (parsed as string[]).map((q) => ({ question: q, submittedAt: Date.now() - QUESTION_TTL_MS + 60 * 60 * 1000 }));
+      return (parsed as string[]).map((q) => ({
+        question: q,
+        submittedAt: Date.now() - QUESTION_TTL_MS + 60 * 60 * 1000,
+      }));
     }
+
     return parsed as PendingQuestion[];
   } catch {
     return [];
@@ -374,8 +400,7 @@ function ageOutPendingQuestions(): void {
 }
 
 /**
- * Remove a question from the pending queue when it has been answered
- * (e.g., when Wired Lain delivers a research response).
+ * Remove a question from the pending queue when it has been answered.
  * Uses keyword overlap to match, since the response topic may not be verbatim.
  */
 export function clearAnsweredQuestion(topic: string): void {
@@ -405,10 +430,6 @@ function enqueuePendingQuestion(question: string): void {
   }
 }
 
-/**
- * Check if a question is too similar to one already pending or recently submitted.
- * Uses word-overlap similarity to catch rephrased duplicates.
- */
 function isDuplicateQuestion(question: string): boolean {
   const pending = getPendingQuestions(MAX_PENDING);
   return isDuplicateInList(question, pending);
@@ -425,7 +446,8 @@ function isDuplicateInList(question: string, list: string[]): boolean {
 }
 
 function extractKeywords(text: string): Set<string> {
-  const stopWords = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+  const stopWords = new Set([
+    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
     'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should',
     'may', 'might', 'shall', 'can', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by',
     'from', 'as', 'into', 'through', 'during', 'before', 'after', 'and', 'but', 'or',
@@ -434,7 +456,9 @@ function extractKeywords(text: string): Set<string> {
     'than', 'too', 'very', 'just', 'because', 'if', 'when', 'where', 'while', 'how',
     'what', 'which', 'who', 'whom', 'this', 'that', 'these', 'those', 'it', 'its',
     'they', 'them', 'their', 'we', 'our', 'you', 'your', 'i', 'my', 'me', 'he', 'she',
-    'him', 'her', 'his', 'about', 'between', 'does', 'particularly', 'specifically']);
+    'him', 'her', 'his', 'about', 'between', 'does', 'particularly', 'specifically',
+  ]);
+
   return new Set(
     text.toLowerCase()
       .replace(/[^a-z0-9\s]/g, '')
@@ -453,12 +477,6 @@ function wordOverlap(a: Set<string>, b: Set<string>): number {
   return intersection / smaller;
 }
 
-// ── Phase 3: Movement Decision ───────────────────────────────
-
-/**
- * After the main curiosity cycle, decide whether to move to a different
- * building in the commune town. Adapted for offline characters.
- */
 async function phaseMovementDecision(
   provider: import('../providers/base.js').Provider,
   config: OfflineCuriosityConfig,
@@ -475,11 +493,11 @@ async function phaseMovementDecision(
 
     const buildingList = BUILDINGS.map((b) => {
       const marker = b.id === current.building ? ' [YOU ARE HERE]' : '';
-      return `- ${b.id}: ${b.name} — ${b.description}${marker}`;
+      return `- ${b.id}: ${b.name} - ${b.description}${marker}`;
     }).join('\n');
 
     const historyStr = history.length > 0
-      ? history.map((h) => `  ${h.from} → ${h.to}: ${h.reason}`).join('\n')
+      ? history.map((h) => `  ${h.from} -> ${h.to}: ${h.reason}`).join('\n')
       : '  (no recent moves)';
 
     const thoughtStr = thoughtContext

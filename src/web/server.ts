@@ -437,7 +437,7 @@ const NAV_LINKS_OWNER: Array<{ label: string; href: string }> = [
 ];
 
 function generateNavBar(pathname: string, ownerMode = false): string {
-  const exitLink = { label: 'EXIT', href: 'https://shraii.com' };
+  const exitLink = { label: 'EXIT', href: '/commune-map.html' };
   const NAV_LINKS = ownerMode ? [...NAV_LINKS_PUBLIC, ...NAV_LINKS_OWNER, exitLink] : [...NAV_LINKS_PUBLIC, exitLink];
   const isGamePage = pathname === '/game/' || pathname === '/game/index.html';
 

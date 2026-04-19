@@ -154,6 +154,7 @@ function startBackgroundLoops(config: CharacterConfig): BackgroundLoops {
   const wiredLainUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
   const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
   const researchEnabled = process.env['ENABLE_RESEARCH'] === '1';
+  const offlineCuriosityEnabled = process.env['ENABLE_OFFLINE_CURIOSITY'] !== '0';
 
   // Each entry: [factory function that starts the loop and returns a stop fn]
   const loopFactories: (() => (() => void))[] = [
@@ -183,12 +184,13 @@ function startBackgroundLoops(config: CharacterConfig): BackgroundLoops {
   const stops: (() => void)[] = [];
   const restarters: (() => (() => void))[] = [];
 
-  if (researchEnabled) {
+  if (offlineCuriosityEnabled) {
     loopFactories.splice(7, 0, () => startOfflineCuriosityLoop({
       characterId: config.id,
       characterName: config.name,
       wiredLainUrl,
       interlinkToken,
+      submitResearchRequests: researchEnabled,
     }));
   }
 

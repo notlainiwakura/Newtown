@@ -23,22 +23,43 @@ const CHARACTER_LABELS = {
   plato: 'PLATO',
   joe: 'JOE',
 };
+const LEGACY_VISITOR_NAMES = new Set(['', 'SHRAII', 'LAIN', 'NEWTOWN']);
 
 // Character identity — residents keep their own labels, root falls back to the town guide.
 let characterLabel = CHARACTER_LABELS[characterId] || 'NEWTOWN';
 const sessionStorageKey = `${characterId || 'newtown'}-session`;
+const presenceSender = document.getElementById('presence-sender');
+const presenceText = document.getElementById('presence-text');
 
 let sessionId = localStorage.getItem(sessionStorageKey) || null;
 
 // Visitor identity — used for display and sent to the server so inhabitants know who they're talking to
-window.LAIN_SENDER_NAME = localStorage.getItem('lain-sender-name') || 'SHRAII';
+const storedVisitorName = localStorage.getItem('newtown-sender-name')
+  || localStorage.getItem('lain-sender-name')
+  || '';
+const normalizedVisitorName = LEGACY_VISITOR_NAMES.has(storedVisitorName.trim().toUpperCase())
+  ? 'VISITOR'
+  : storedVisitorName.trim();
+window.LAIN_SENDER_NAME = normalizedVisitorName || 'VISITOR';
+localStorage.setItem('newtown-sender-name', window.LAIN_SENDER_NAME);
 const visitorName = window.LAIN_SENDER_NAME;
+
+function syncCharacterUi() {
+  document.title = characterLabel;
+  if (presenceSender) presenceSender.textContent = characterLabel;
+  if (presenceText && !presenceText.textContent?.trim()) {
+    presenceText.textContent = 'im here';
+  }
+}
+
+syncCharacterUi();
 
 fetch((apiBase || '') + '/api/meta/identity')
   .then((response) => response.ok ? response.json() : null)
   .then((identity) => {
     if (!identity?.name) return;
     characterLabel = String(identity.name).toUpperCase();
+    syncCharacterUi();
   })
   .catch(() => {});
 
@@ -239,7 +260,7 @@ function createStreamingMessage() {
   const div = document.createElement('div');
   div.className = 'lain-message';
   div.innerHTML = `
-    <span class="sender">LAIN</span>
+    <span class="sender">${characterLabel}</span>
     <span class="text" id="streaming-text"></span>
   `;
   return div;
@@ -465,7 +486,8 @@ const ambientMessages = [
 function addAmbientMessage() {
   if (Math.random() > 0.7) {
     const msg = ambientMessages[Math.floor(Math.random() * ambientMessages.length)];
-    const statusText = document.querySelector('.status-text');
+    const statusText = document.querySelector('.status-text') || document.querySelector('.status-label');
+    if (!statusText) return;
     statusText.textContent = msg.toUpperCase();
     setTimeout(() => {
       statusText.textContent = 'LAYER 07';

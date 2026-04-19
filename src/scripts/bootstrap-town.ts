@@ -1,51 +1,20 @@
-import { cp, mkdir, readdir, readFile, rm, stat } from 'node:fs/promises';
+import { cp, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { initDatabase, getMeta, setMeta } from '../storage/database.js';
 import { getDefaultConfig } from '../config/defaults.js';
-import { saveMemory } from '../memory/store.js';
+import { saveMemory, saveMessage } from '../memory/store.js';
+import {
+  DREAM_SEEDS,
+  INITIAL_SELF_CONCEPTS,
+  RESIDENT_CHATS,
+  NOVELTY_MEMORIES,
+  RESIDENT_LETTERS,
+} from './bootstrap-data.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..', '..');
 const SOURCE_WORKSPACE = join(REPO_ROOT, 'workspace');
-
-const NOVELTY_MEMORIES: Record<string, string[]> = {
-  guide: [
-    'The square keeps an odd civic calm: conversations gather there even when nobody planned a meeting.',
-    'The windmill is the town clock in everything but name. People read mood changes in its turning.',
-    'Nobody here can check the internet, so rumors mature locally instead of being corrected from outside.',
-  ],
-  neo: [
-    'At the station, Neo keeps noticing how waiting changes people more than travel does.',
-    'Neo distrusts any locked room that pretends to be inevitable.',
-    'The theater bothers Neo because rehearsed lines can sound too much like destiny.',
-  ],
-  plato: [
-    'Plato thinks the square is where philosophy becomes political whether anyone intends it or not.',
-    'The Mystery Tower suits Plato because height turns observation into method.',
-    'Plato keeps returning to the theater as evidence that imitation can reveal and conceal at once.',
-  ],
-  joe: [
-    'Joe trusts the pub because the stools wobble honestly and nothing there pretends to be transcendence.',
-    'Joe likes the windmill because it visibly does a job, which already puts it ahead of most theories.',
-    'Joe thinks half the town would calm down if they ate first and speculated second.',
-  ],
-};
-
-const DREAM_SEEDS: Record<string, Array<{ content: string; emotionalWeight: number }>> = {
-  neo: [
-    { content: 'A train arrives with no passengers, but every window shows a different version of your face looking back.', emotionalWeight: 0.62 },
-    { content: 'You find a key in the locksmith, but every lock it opens leads to the same square from a different angle.', emotionalWeight: 0.58 },
-  ],
-  plato: [
-    { content: 'In the tower, shadows argue more clearly than the people who cast them.', emotionalWeight: 0.64 },
-    { content: 'A stage curtain rises to reveal the same cave wall, only cleaner and more persuasive.', emotionalWeight: 0.59 },
-  ],
-  joe: [
-    { content: 'You order a normal drink at the pub, but everyone insists the glass is symbolic and no one will tell you of what.', emotionalWeight: 0.51 },
-    { content: 'The town hands you a map with nine buildings and asks why that is not enough.', emotionalWeight: 0.47 },
-  ],
-};
 
 function parseArgs(): Record<string, string> {
   const args = process.argv.slice(2);
@@ -102,42 +71,134 @@ async function copyWorkspaceTemplate(targetWorkspace: string, persona: string): 
 
 async function seedResidentMemories(persona: string): Promise<void> {
   const seededKey = `bootstrap:${persona}:seeded`;
-  if (getMeta(seededKey) === 'true') return;
+  const legacySeeded = getMeta(seededKey) === 'true';
+  const noveltySeeded = legacySeeded || getMeta(`bootstrap:${persona}:novelty_seeded`) === 'true';
+  const dreamsSeeded = legacySeeded || getMeta(`bootstrap:${persona}:dreams_seeded`) === 'true';
+  const selfSeeded = getMeta(`bootstrap:${persona}:self_seeded`) === 'true';
+  const lettersSeeded = getMeta(`bootstrap:${persona}:letters_seeded`) === 'true';
+  const chatsSeeded = getMeta(`bootstrap:${persona}:chats_seeded`) === 'true';
 
   const novelty = NOVELTY_MEMORIES[persona] || [];
-  for (const content of novelty) {
-    await saveMemory({
-      sessionKey: `bootstrap:${persona}:novelty`,
-      userId: null,
-      content,
-      memoryType: 'episode',
-      importance: 0.32,
-      emotionalWeight: 0.16,
-      relatedTo: null,
-      sourceMessageId: null,
-      metadata: { bootstrap: true, persona, kind: 'novelty' },
-    });
+  if (!noveltySeeded) {
+    for (const content of novelty) {
+      await saveMemory({
+        sessionKey: `bootstrap:${persona}:novelty`,
+        userId: null,
+        content,
+        memoryType: 'episode',
+        importance: 0.32,
+        emotionalWeight: 0.16,
+        relatedTo: null,
+        sourceMessageId: null,
+        skipEmbedding: true,
+        metadata: { bootstrap: true, persona, kind: 'novelty' },
+      });
+    }
+    setMeta(`bootstrap:${persona}:novelty_seeded`, 'true');
   }
 
   const dreams = DREAM_SEEDS[persona] || [];
-  for (const dream of dreams) {
-    await saveMemory({
-      sessionKey: 'alien:dream-seed',
-      userId: null,
-      content: dream.content,
-      memoryType: 'episode',
-      importance: 0.4,
-      emotionalWeight: dream.emotionalWeight,
-      relatedTo: null,
-      sourceMessageId: null,
-      metadata: {
-        bootstrap: true,
-        persona,
-        isAlienDreamSeed: true,
-        consumed: false,
-        depositedAt: Date.now(),
-      },
-    });
+  if (!dreamsSeeded) {
+    for (const dream of dreams) {
+      await saveMemory({
+        sessionKey: 'alien:dream-seed',
+        userId: null,
+        content: dream.content,
+        memoryType: 'episode',
+        importance: 0.4,
+        emotionalWeight: dream.emotionalWeight,
+        relatedTo: null,
+        sourceMessageId: null,
+        skipEmbedding: true,
+        metadata: {
+          bootstrap: true,
+          persona,
+          isAlienDreamSeed: true,
+          consumed: false,
+          depositedAt: Date.now(),
+        },
+      });
+    }
+    setMeta(`bootstrap:${persona}:dreams_seeded`, 'true');
+  }
+
+  if (!selfSeeded) {
+    const existingSelfConcept = getMeta('self-concept:current');
+    const selfConcept = INITIAL_SELF_CONCEPTS[persona];
+    if (!existingSelfConcept && selfConcept) {
+      const now = Date.now();
+      await saveMemory({
+        sessionKey: 'self-concept:synthesis',
+        userId: null,
+        content: selfConcept,
+        memoryType: 'episode',
+        importance: 0.58,
+        emotionalWeight: 0.24,
+        relatedTo: null,
+        sourceMessageId: null,
+        skipEmbedding: true,
+        metadata: {
+          bootstrap: true,
+          persona,
+          kind: 'self-concept',
+          synthesizedAt: now,
+        },
+      });
+      setMeta('self-concept:current', selfConcept);
+      setMeta('self-concept:last_synthesis_at', now.toString());
+      setMeta('self-concept:cycle_count', '1');
+      await mkdir(join(process.env['LAIN_HOME']!, '.private_journal'), { recursive: true });
+      const markdown = `# Self-Concept\n\n*Last updated: ${new Date(now).toISOString()}*\n\n${selfConcept}\n`;
+      await writeFile(join(process.env['LAIN_HOME']!, '.private_journal', 'self-concept.md'), markdown, 'utf-8');
+    }
+    setMeta(`bootstrap:${persona}:self_seeded`, 'true');
+  }
+
+  if (!lettersSeeded) {
+    const letters = RESIDENT_LETTERS[persona] || [];
+    for (const letter of letters) {
+      await saveMemory({
+        sessionKey: `letter:${persona}:${letter.to}:bootstrap`,
+        userId: null,
+        content: letter.content,
+        memoryType: 'episode',
+        importance: 0.48,
+        emotionalWeight: 0.22,
+        relatedTo: null,
+        sourceMessageId: null,
+        skipEmbedding: true,
+        metadata: {
+          bootstrap: true,
+          persona,
+          kind: 'letter',
+          from: persona,
+          to: letter.to,
+        },
+      });
+    }
+    setMeta(`bootstrap:${persona}:letters_seeded`, 'true');
+  }
+
+  if (!chatsSeeded) {
+    const chatSession = `${persona}:bootstrap-intro`;
+    const chats = RESIDENT_CHATS[persona] || [];
+    let offset = 0;
+    for (const message of chats) {
+      saveMessage({
+        sessionKey: chatSession,
+        userId: null,
+        role: message.role,
+        content: message.content,
+        timestamp: Date.now() + offset,
+        metadata: {
+          bootstrap: true,
+          persona,
+          kind: 'chat',
+        },
+      });
+      offset += 1;
+    }
+    setMeta(`bootstrap:${persona}:chats_seeded`, 'true');
   }
 
   setMeta(seededKey, 'true');

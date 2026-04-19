@@ -241,7 +241,10 @@ export function getRecentVisitorMessages(limit = 50): StoredMessage[] {
  * Save a memory with embedding
  */
 export async function saveMemory(
-  memory: Omit<Memory, 'id' | 'embedding' | 'createdAt' | 'lastAccessed' | 'accessCount' | 'lifecycleState' | 'lifecycleChangedAt' | 'phase' | 'wingId' | 'roomId' | 'hall' | 'aaakContent' | 'aaakCompressedAt'> & { lifecycleState?: LifecycleState }
+  memory: Omit<Memory, 'id' | 'embedding' | 'createdAt' | 'lastAccessed' | 'accessCount' | 'lifecycleState' | 'lifecycleChangedAt' | 'phase' | 'wingId' | 'roomId' | 'hall' | 'aaakContent' | 'aaakCompressedAt'> & {
+    lifecycleState?: LifecycleState;
+    skipEmbedding?: boolean;
+  }
 ): Promise<string> {
   const logger = getLogger();
   const id = nanoid(16);
@@ -251,11 +254,13 @@ export async function saveMemory(
   // Generate embedding for the memory content
   let embedding: Float32Array | null = null;
   let embeddingBuffer: Buffer | null = null;
-  try {
-    embedding = await generateEmbedding(memory.content);
-    embeddingBuffer = serializeEmbedding(embedding);
-  } catch (error) {
-    logger.warn({ error }, 'Failed to generate embedding for memory');
+  if (!memory.skipEmbedding) {
+    try {
+      embedding = await generateEmbedding(memory.content);
+      embeddingBuffer = serializeEmbedding(embedding);
+    } catch (error) {
+      logger.warn({ error }, 'Failed to generate embedding for memory');
+    }
   }
 
   // Assign palace placement
@@ -846,6 +851,11 @@ export interface ActivityEntry {
   metadata: Record<string, unknown>;
 }
 
+export interface GetActivityOptions {
+  includeVisitorChat?: boolean;
+  chatPrefixes?: string[];
+}
+
 // Session key prefixes for autonomous background loops (not user chat)
 const BACKGROUND_PREFIXES = [
   'diary', 'dream', 'commune', 'curiosity', 'self-concept', 'selfconcept',
@@ -857,21 +867,53 @@ const BACKGROUND_PREFIXES = [
 const BACKGROUND_SQL_FILTER = BACKGROUND_PREFIXES.map(() => `session_key LIKE ?`).join(' OR ');
 const BACKGROUND_SQL_PARAMS = BACKGROUND_PREFIXES.map((p) => `${p}:%`);
 
+function buildVisitorChatFilter(prefixes: string[]): { filter: string; params: string[] } | null {
+  const normalized = [...new Set(prefixes.filter((prefix) => prefix.trim().length > 0))];
+  const clauses: string[] = [];
+  const params: string[] = [];
+
+  for (const prefix of normalized) {
+    clauses.push('session_key LIKE ?');
+    params.push(`${prefix}:%`);
+  }
+
+  clauses.push('session_key LIKE ?');
+  params.push('stranger:%');
+
+  if (clauses.length === 0) return null;
+  return {
+    filter: clauses.join(' OR '),
+    params,
+  };
+}
+
 /**
  * Get recent activity across both memories and messages tables.
  * Only returns background loop activity (diary, dreams, commune, etc.),
- * excluding user chat sessions.
+ * excluding user chat sessions by default.
+ * Pages that need visible resident conversations can opt into visitor chat.
  */
-export function getActivity(from: number, to: number, limit = 500): ActivityEntry[] {
+export function getActivity(from: number, to: number, limit = 500, options?: GetActivityOptions): ActivityEntry[] {
   const memories = query<MemoryRow>(
     `SELECT * FROM memories WHERE created_at BETWEEN ? AND ? AND (${BACKGROUND_SQL_FILTER}) ORDER BY created_at DESC LIMIT ?`,
     [from, to, ...BACKGROUND_SQL_PARAMS, limit]
   );
 
-  const messages = query<MessageRow>(
+  const backgroundMessages = query<MessageRow>(
     `SELECT * FROM messages WHERE timestamp BETWEEN ? AND ? AND (${BACKGROUND_SQL_FILTER}) ORDER BY timestamp DESC LIMIT ?`,
     [from, to, ...BACKGROUND_SQL_PARAMS, limit]
   );
+
+  const visitorChat = options?.includeVisitorChat
+    ? buildVisitorChatFilter(options.chatPrefixes ?? ['web'])
+    : null;
+
+  const visitorMessages = visitorChat
+    ? query<MessageRow>(
+        `SELECT * FROM messages WHERE timestamp BETWEEN ? AND ? AND (${visitorChat.filter}) ORDER BY timestamp DESC LIMIT ?`,
+        [from, to, ...visitorChat.params, limit]
+      )
+    : [];
 
   const entries: ActivityEntry[] = [];
 
@@ -890,7 +932,7 @@ export function getActivity(from: number, to: number, limit = 500): ActivityEntr
     });
   }
 
-  for (const row of messages) {
+  for (const row of [...backgroundMessages, ...visitorMessages]) {
     entries.push({
       id: row.id,
       kind: 'message',

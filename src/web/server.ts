@@ -924,10 +924,14 @@ export async function startWebServer(port = 3000): Promise<void> {
     if (url.pathname === '/api/activity' && req.method === 'GET') {
       const fromParam = url.searchParams.get('from');
       const toParam = url.searchParams.get('to');
+      const includeChat = url.searchParams.get('includeChat') === '1';
       const now = Date.now();
       const from = fromParam ? Number(fromParam) : now - 7 * 24 * 60 * 60 * 1000;
       const to = toParam ? Number(toParam) : now;
-      const entries = getActivity(from, to);
+      const entries = getActivity(from, to, 500, {
+        includeVisitorChat: includeChat,
+        chatPrefixes: ['web'],
+      });
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify(entries));
       return;

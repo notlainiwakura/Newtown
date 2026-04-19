@@ -210,6 +210,8 @@
     function parseType(sessionKey) {
       if (!sessionKey) return 'unknown';
       var prefix = sessionKey.split(':')[0];
+      if (prefix === 'stranger') return 'chat';
+      if (CHARS.some(function (char) { return char.id === prefix; })) return 'chat';
       var map = {
         commune: 'commune', diary: 'diary', dream: 'dream',
         curiosity: 'curiosity', 'self-concept': 'self-concept',
@@ -242,7 +244,7 @@
       var collected = [];
 
       CHARS.forEach(function (char) {
-        var url = char.path + '?from=' + from + '&to=' + now + '&_t=' + now;
+        var url = char.path + '?from=' + from + '&to=' + now + '&includeChat=1&_t=' + now;
 
         fetch(url, { cache: 'no-store' })
           .then(function (r) { return r.ok ? r.json() : []; })

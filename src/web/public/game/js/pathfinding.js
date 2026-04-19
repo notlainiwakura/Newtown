@@ -1,5 +1,5 @@
 /**
- * LAINTOWN GAME — A* Pathfinding
+ * NEWTOWN GAME — A* Pathfinding
  * Finds tile-by-tile paths on the collision map grid.
  * Used by CharacterManager for inter-building walking animation.
  */

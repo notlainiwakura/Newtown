@@ -40,7 +40,17 @@
   function getBuildingIcons() {
     const manifest = window.LaintownSkins?.getSkinManifest();
     if (manifest?.buildingIcons) return manifest.buildingIcons;
-    return { library: '📚', bar: '🍺', field: '🌾', windmill: '🏗', lighthouse: '🗼', school: '🏫', market: '🏪', locksmith: '🔐', threshold: '🚪' };
+    return {
+      pub: '🍺',
+      station: '🚉',
+      'abandoned-house': '🏚',
+      field: '🌾',
+      windmill: '🌬',
+      locksmith: '🔐',
+      'mystery-tower': '🗼',
+      theater: '🎭',
+      square: '⬜',
+    };
   }
 
   // ===== Building definitions (mirrors backend) =====

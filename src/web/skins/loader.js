@@ -1,4 +1,4 @@
-// Laintown Skin Loader
+// Newtown Skin Loader
 const SKIN_STORAGE_KEY = 'laintown-skin';
 const SKIN_CHANGED_EVENT = 'skin-changed';
 const DEFAULT_SKIN = 'default';
@@ -10,9 +10,9 @@ let fontLinkEl = null;
 let registry = null;
 
 function skinsBasePath() {
-  // Character pages (e.g., /pkd/, /mckenna/) have their own server with a /skins/ route.
+  // Character pages (e.g., /neo/, /plato/) have their own server with a /skins/ route.
   // All other pages (including /game/, /newspaper.html, etc.) use the root /skins/.
-  const charPaths = ['/pkd', '/mckenna', '/john', '/doctor', '/hiru', '/local'];
+  const charPaths = ['/neo', '/plato', '/joe'];
   const path = location.pathname;
   for (const cp of charPaths) {
     if (path.startsWith(cp + '/') || path === cp) {

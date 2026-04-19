@@ -1,5 +1,5 @@
 /**
- * LAINTOWN GAME — Possession Manager
+ * NEWTOWN GAME — Possession Manager
  * State machine, building zone detection, SSE stream.
  */
 

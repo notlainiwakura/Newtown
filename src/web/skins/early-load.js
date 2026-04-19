@@ -19,7 +19,7 @@
   document.documentElement.style.background = bg;
 
   if (skinId === 'default') return;
-  var charPaths = ['/pkd', '/mckenna', '/john', '/doctor', '/hiru', '/local'];
+  var charPaths = ['/neo', '/plato', '/joe'];
   var path = '/skins';
   for (var i = 0; i < charPaths.length; i++) {
     if (location.pathname.indexOf(charPaths[i] + '/') === 0 || location.pathname === charPaths[i]) {

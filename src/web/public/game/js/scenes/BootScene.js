@@ -1,5 +1,5 @@
 /**
- * LAINTOWN GAME — Boot Scene
+ * NEWTOWN GAME — Boot Scene
  * Generate procedural sprites and tilemap.
  * Isometric: flat tiles 128x64 diamonds, wall/forest blocks 128x96.
  */

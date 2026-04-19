@@ -65,13 +65,9 @@
   --error-border: rgba(255, 0, 64, 0.5);
 
   /* Character colors */
-  --color-wired-lain: #ff0040;
-  --color-lain: #ffffff;
-  --color-dr-claude: #ff0040;
-  --color-pkd: #cc0030;
-  --color-mckenna: #ffffff;
-  --color-john: #ff0040;
-  --color-hiru: #ffffff;
+  --color-neo: #00ff88;
+  --color-plato: #ffee55;
+  --color-joe: #66ccff;
 
   /* Event types */
   --type-diary: #ff0040;

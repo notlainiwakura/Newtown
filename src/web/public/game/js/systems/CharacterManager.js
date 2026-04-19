@@ -1,5 +1,5 @@
 /**
- * LAINTOWN GAME — Character Manager
+ * NEWTOWN GAME — Character Manager
  * NPC sprites, position polling, movement tweens.
  * Characters in the same building get spread across different walkable tiles.
  * Idle behaviors: breathing, wandering within buildings, approaching co-located peers.

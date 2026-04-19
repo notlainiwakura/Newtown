@@ -4,9 +4,9 @@
   "description": "Black, red, white. No gradients, no mercy.",
   "fonts": { "heading": "Space Mono", "body": "Space Mono", "mono": "Space Mono" },
   "buildingIcons": {
-    "library": "▣", "bar": "▤", "field": "▥", "windmill": "▦",
-    "lighthouse": "▧", "school": "▨", "market": "▩", "locksmith": "▪", "threshold": "▫"
+    "pub": "▣", "station": "▤", "abandoned-house": "▥", "field": "▦",
+    "windmill": "▧", "locksmith": "▨", "mystery-tower": "▩", "theater": "▪", "square": "▫"
   },
   "googleFontsUrl": "https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap",
-  "previewColors": ["#ff0040", "#ffffff", "#000000"]
+  "previewColors": ["#00ff88", "#ffee55", "#66ccff"]
 }

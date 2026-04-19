@@ -1,4 +1,4 @@
-// Laintown telemetry console — unified real-time activity feed from all town inhabitants
+// Newtown telemetry console — unified real-time activity feed from all town inhabitants
 (function () {
   'use strict';
 

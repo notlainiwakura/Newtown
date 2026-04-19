@@ -1,5 +1,5 @@
 /**
- * LAINTOWN GAME â€” Dialog Scene
+ * NEWTOWN GAME â€” Dialog Scene
  * Chat window overlay with scrollable conversation history.
  * Runs as a parallel scene on top of WorldScene.
  */

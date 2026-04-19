@@ -1,5 +1,5 @@
 /**
- * LAINTOWN GAME — World Scene
+ * NEWTOWN GAME — World Scene
  * Isometric ¾ view: diamond tiles, depth-sorted rendering.
  */
 

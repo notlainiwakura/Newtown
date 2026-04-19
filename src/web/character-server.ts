@@ -292,6 +292,19 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
       return;
     }
 
+    // Health check (no auth)
+    if (url.pathname === '/api/health' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        characterId: config.id,
+        name: config.name,
+        uptime: process.uptime(),
+        timestamp: Date.now(),
+      }));
+      return;
+    }
+
     // Location (no auth — public for commune map)
     if (url.pathname === '/api/location' && req.method === 'GET') {
       try {

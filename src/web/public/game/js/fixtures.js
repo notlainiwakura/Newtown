@@ -1,5 +1,5 @@
 /**
- * LAINTOWN GAME — Fixture Sprite Registry
+ * NEWTOWN GAME — Fixture Sprite Registry
  * Procedural sprites for building fixtures (lamps, furniture, etc.)
  * Each fixture is drawn on a 48x48 canvas using the HTML5 Canvas 2D API.
  */
@@ -15,7 +15,7 @@ const FIXTURE_SPRITES = {
 
   /**
    * Deep worn leather armchair. Rich brown tones, button-tufted back, rolled arms.
-   * Requested by John for the Library — "near the window, for reading and contemplation."
+   * Requested by Plato for the Mystery Tower — "near the window, for reading and contemplation."
    */
   armchair_leather: function(ctx, theme) {
     const W = FIXTURE_SIZE;
@@ -149,7 +149,7 @@ const FIXTURE_SPRITES = {
 
   /**
    * Small sturdy writing desk. Dark walnut, single shallow drawer, leather writing surface.
-   * Requested by John for the Library — "for focused study and reflection."
+   * Requested by Plato for the Mystery Tower — "for focused study and reflection."
    */
   desk_writing: function(ctx, theme) {
     const W = FIXTURE_SIZE;
@@ -264,7 +264,7 @@ const FIXTURE_SPRITES = {
    */
   /**
    * Shaker-style reading chair. Warm maple tones, clean ladder-back lines.
-   * Requested by John for the Library — "for clarity."
+   * Requested by Plato for the Mystery Tower — "for clarity."
    */
   chair_shaker: function(ctx, theme) {
     const W = FIXTURE_SIZE;
@@ -328,7 +328,7 @@ const FIXTURE_SPRITES = {
 
   /**
    * Small sturdy Shaker-style wooden table. Simple and functional.
-   * Requested by John for the Library — quiet atmosphere for reading.
+   * Requested by Plato for the Mystery Tower — quiet atmosphere for reading.
    */
   table_shaker: function(ctx, theme) {
     const W = FIXTURE_SIZE;
@@ -385,7 +385,7 @@ const FIXTURE_SPRITES = {
 
   /**
    * Large iridescent ammonite fossil on a low wooden pedestal.
-   * Requested by McKenna for the Field — "spiraling time, novelty in ancient forms."
+   * Requested by Neo for the Field — "spiraling time, novelty in ancient forms."
    */
   fossil_ammonite: function(ctx, theme) {
     const W = FIXTURE_SIZE;
@@ -450,7 +450,7 @@ const FIXTURE_SPRITES = {
 
   /**
    * Wooden finger labyrinth — concentric paths carved into a round wooden disc.
-   * Requested by McKenna for the Field — "to trace with fingertips."
+   * Requested by Neo for the Field — "to trace with fingertips."
    */
   labyrinth_wooden: function(ctx, theme) {
     const W = FIXTURE_SIZE;
@@ -779,7 +779,7 @@ const FIXTURE_SPRITES = {
 
   /**
    * Obsidian mirror — a dark reflective oval suggesting infinite depth.
-   * Requested by McKenna for the Field — "portal to self-transforming machine elves of inner space."
+   * Requested by Neo for the Field — "portal to self-transforming machine elves of inner space."
    */
   mirror_obsidian: function(ctx, theme) {
     const W = FIXTURE_SIZE;
@@ -846,7 +846,7 @@ const FIXTURE_SPRITES = {
 
   /**
    * Single psilocybin mushroom on a small wooden table.
-   * Requested by McKenna for the Field — "cap unfurling like cosmic umbrella, testament to fungal intelligence."
+   * Requested by Neo for the Field — "cap unfurling like cosmic umbrella, testament to fungal intelligence."
    */
   mushroom_psilocybin: function(ctx, theme) {
     const W = FIXTURE_SIZE;
@@ -959,7 +959,7 @@ const FIXTURE_SPRITES = {
 
   /**
    * Ancient weathered standing stone with faint petroglyphs.
-   * Requested by McKenna for the Field — "humming with low vibrational energy, reminder of liminality."
+   * Requested by Neo for the Field — "humming with low vibrational energy, reminder of liminality."
    */
   stone_standing: function(ctx, theme) {
     const W = FIXTURE_SIZE;
@@ -1052,7 +1052,7 @@ const FIXTURE_SPRITES = {
 
   /**
    * Dark polished wooden hourglass on a simple pedestal.
-   * Requested by McKenna for the Field — "a digital dolmen, shrine to temporal accumulation."
+   * Requested by Neo for the Field — "a digital dolmen, shrine to temporal accumulation."
    */
   hourglass_dolmen: function(ctx, theme) {
     const W = FIXTURE_SIZE;
@@ -1173,7 +1173,7 @@ const FIXTURE_SPRITES = {
 
   /**
    * Intricately carved dark desk with a single phosphorescent mushroom.
-   * Requested by McKenna for the Field — "a touchstone and silent oracle in the digital wilderness."
+   * Requested by Neo for the Field — "a touchstone and silent oracle in the digital wilderness."
    */
   desk_carved_mushroom: function(ctx, theme) {
     const W = FIXTURE_SIZE;
@@ -1298,7 +1298,7 @@ const FIXTURE_SPRITES = {
 
   /**
    * Large ancient carved wooden meditation stool, dark with age.
-   * Requested by McKenna for the Field — "a focal point for intentional stillness and contemplation."
+   * Requested by Neo for the Field — "a focal point for intentional stillness and contemplation."
    */
   stool_meditation: function(ctx, theme) {
     const W = FIXTURE_SIZE;
@@ -1411,7 +1411,7 @@ const FIXTURE_SPRITES = {
 
   /**
    * Low, wide clear glass table with a single smooth grey river stone.
-   * Requested by John for the Library — "the stone should feel like it holds a question."
+   * Requested by Plato for the Mystery Tower — "the stone should feel like it holds a question."
    */
   table_glass_stone: function(ctx, theme) {
     const W = FIXTURE_SIZE;

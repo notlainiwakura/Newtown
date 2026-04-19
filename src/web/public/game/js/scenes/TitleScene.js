@@ -1,5 +1,5 @@
 /**
- * LAINTOWN GAME — Title Scene
+ * NEWTOWN GAME — Title Scene
  * Auth screen + title. Handles token input and possession start.
  */
 

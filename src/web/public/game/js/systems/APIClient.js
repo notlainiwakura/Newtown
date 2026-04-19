@@ -1,5 +1,5 @@
 /**
- * LAINTOWN GAME — API Client
+ * NEWTOWN GAME — API Client
  * All backend API calls for possession, chat, location, etc.
  * Reuses patterns from commune-map.js and possess.js.
  */

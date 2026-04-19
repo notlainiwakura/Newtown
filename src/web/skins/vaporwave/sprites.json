@@ -7,82 +7,36 @@
   "pupil": "#200028",
   "mouth": "#c080c0",
   "characters": {
-    "lain": {
-      "hairColor": "#3a1050",
-      "hairLight": "#5a2070",
-      "outfitColor": "#3a1050",
-      "outfitAccent": "#5a2080",
-      "accentColor": "#c080ff",
-      "glowColor": "#c080ff",
-      "glowOpacity": 0.1,
-      "headScale": 1.0,
-      "eyeStyle": "default"
-    },
-    "wired-lain": {
-      "hairColor": "#400060",
-      "hairLight": "#600080",
-      "outfitColor": "#280040",
-      "outfitAccent": "#400060",
-      "accentColor": "#ff40ff",
-      "glowColor": "#ff40ff",
-      "glowOpacity": 0.2,
-      "headScale": 1.0,
-      "eyeStyle": "default"
-    },
-    "pkd": {
-      "hairColor": "#2a1040",
-      "hairLight": "#3a2050",
-      "outfitColor": "#3a1060",
-      "outfitAccent": "#4a2070",
-      "skinTone": "#c0a0b8",
-      "skinShadow": "#b090a8",
-      "accentColor": "#8040ff",
-      "glowColor": "#8040ff",
-      "glowOpacity": 0.1,
-      "headScale": 1.0,
-      "eyeStyle": "default"
-    },
-    "mckenna": {
-      "hairColor": "#1a1030",
-      "hairLight": "#2a2040",
-      "outfitColor": "#2a1040",
-      "outfitAccent": "#3a2050",
+    "neo": {
+      "hairColor": "#201030",
+      "hairLight": "#3a2058",
+      "outfitColor": "#120018",
+      "outfitAccent": "#40ffb0",
       "accentColor": "#40ffb0",
       "glowColor": "#40ffb0",
+      "glowOpacity": 0.15,
+      "headScale": 1.0,
+      "eyeStyle": "default"
+    },
+    "plato": {
+      "hairColor": "#ffe0ff",
+      "hairLight": "#fff0ff",
+      "outfitColor": "#fff0d8",
+      "outfitAccent": "#ffd166",
+      "accentColor": "#ffd166",
+      "glowColor": "#ffd166",
       "glowOpacity": 0.1,
       "headScale": 1.0,
       "eyeStyle": "default"
     },
-    "john": {
-      "hairColor": "#2a1830",
-      "hairLight": "#3a2840",
-      "outfitColor": "#2a1040",
-      "outfitAccent": "#3a2050",
-      "accentColor": "#ff8040",
-      "glowColor": "#ff8040",
-      "glowOpacity": 0.1,
-      "headScale": 1.0,
-      "eyeStyle": "default"
-    },
-    "dr-claude": {
-      "hairColor": "#201030",
-      "hairLight": "#302040",
-      "outfitColor": "#e0c0f8",
-      "outfitAccent": "#f0d0ff",
-      "accentColor": "#ff4060",
-      "glowColor": "#ff4060",
-      "glowOpacity": 0.1,
-      "headScale": 1.0,
-      "eyeStyle": "default"
-    },
-    "hiru": {
-      "hairColor": "#1a1040",
-      "hairLight": "#2a2050",
-      "outfitColor": "#1a1040",
-      "outfitAccent": "#2a2050",
-      "accentColor": "#40ffff",
-      "glowColor": "#40ffff",
-      "glowOpacity": 0.1,
+    "joe": {
+      "hairColor": "#402040",
+      "hairLight": "#603060",
+      "outfitColor": "#281840",
+      "outfitAccent": "#66ccff",
+      "accentColor": "#66ccff",
+      "glowColor": "#66ccff",
+      "glowOpacity": 0.12,
       "headScale": 1.0,
       "eyeStyle": "default"
     }

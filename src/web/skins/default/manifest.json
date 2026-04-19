@@ -8,16 +8,16 @@
     "mono": "Share Tech Mono"
   },
   "buildingIcons": {
-    "library": "📚",
-    "bar": "🍺",
+    "pub": "🍺",
+    "station": "🚉",
+    "abandoned-house": "🏚",
     "field": "🌾",
-    "windmill": "🏗",
-    "lighthouse": "🗼",
-    "school": "🏫",
-    "market": "🏪",
+    "windmill": "🌬",
     "locksmith": "🔐",
-    "threshold": "🚪"
+    "mystery-tower": "🗼",
+    "theater": "🎭",
+    "square": "⬜"
   },
   "googleFontsUrl": "https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Share+Tech+Mono&display=swap",
-  "previewColors": ["#4080ff", "#80c0ff", "#40e0ff"]
+  "previewColors": ["#60e0a0", "#e0c870", "#88b0d0"]
 }

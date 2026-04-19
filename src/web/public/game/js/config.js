@@ -1,5 +1,5 @@
 /**
- * LAINTOWN GAME — Configuration & Constants
+ * NEWTOWN GAME — Configuration & Constants
  */
 
 // Game theme colors — read from CSS custom properties (set by skin system)

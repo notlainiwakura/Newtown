@@ -385,6 +385,28 @@ const OWNER_ONLY_PATHS = [
   '/api/chat/stream',
 ];
 
+const CHARACTER_PROXY_PREFIXES = ['/neo/', '/plato/', '/joe/'] as const;
+const PUBLIC_CHARACTER_API_PATHS = [
+  '/api/health',
+  '/api/location',
+  '/api/events',
+  '/api/activity',
+  '/api/building/notes',
+  '/api/documents',
+  '/api/postboard',
+] as const;
+
+function isPublicCharacterApiPath(pathname: string): boolean {
+  for (const prefix of CHARACTER_PROXY_PREFIXES) {
+    if (!pathname.startsWith(prefix)) continue;
+    const targetPath = '/' + pathname.slice(prefix.length);
+    return PUBLIC_CHARACTER_API_PATHS.some((publicPath) => (
+      targetPath === publicPath || targetPath.startsWith(`${publicPath}/`)
+    ));
+  }
+  return false;
+}
+
 /**
  * Verify interlink auth token from Authorization: Bearer header.
  * Returns true if authenticated, false if response was already sent with error.
@@ -558,8 +580,9 @@ export async function startWebServer(port = 3000): Promise<void> {
     // Block non-owners from restricted pages
     if (!isOwner(req)) {
       const isOwnerOnly = OWNER_ONLY_PATHS.some(p => url.pathname === p || url.pathname.startsWith(p));
+      const isPublicResidentApi = isPublicCharacterApiPath(url.pathname);
       const isRootChat = (url.pathname === '/' || url.pathname === '/index.html') && !url.pathname.startsWith('/api/') && !url.pathname.startsWith('/skins/');
-      if (isOwnerOnly || isRootChat) {
+      if ((isOwnerOnly && !isPublicResidentApi) || isRootChat) {
         if (req.headers['accept']?.includes('text/html') || !url.pathname.startsWith('/api/')) {
           res.writeHead(302, { Location: '/commune-map.html' });
           res.end();

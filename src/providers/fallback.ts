@@ -13,6 +13,7 @@ import type {
   CompletionResult,
   CompletionWithToolsOptions,
   CompletionWithToolsResult,
+  ModelInfo,
   ToolCall,
   ToolResult,
   StreamCallback,
@@ -42,7 +43,37 @@ function isModelGoneError(error: unknown): boolean {
   );
 }
 
-export type ProviderFactory = (model: string) => Provider;
+/**
+ * findings.md P2:1090 — when the active provider lacks a streaming
+ * impl we used to just call the buffered method and return the result,
+ * never firing the caller's `onChunk`. UIs that show a typing indicator
+ * until the first chunk arrived would spin forever. Synthesize one
+ * chunk from the buffered content so callers always get SOMETHING
+ * through their callback — still not real streaming, but the UI
+ * contract is preserved.
+ */
+async function synthesizeStream<T extends CompletionResult>(
+  bufferedPromise: Promise<T>,
+  onChunk: StreamCallback,
+): Promise<T> {
+  const result = await bufferedPromise;
+  if (result.content) onChunk(result.content);
+  return result;
+}
+
+/**
+ * findings.md P2:1146 — fallback entries can either be a bare model name
+ * (inherits the primary's provider type) or an object carrying its own
+ * `type` so the chain can cross providers (Anthropic primary → OpenAI
+ * fallback). The factory is invoked with the entry, not a bare string,
+ * so it can branch on the right concrete provider constructor.
+ */
+export type FallbackChainEntry = string | { type?: string; model: string };
+export type ProviderFactory = (entry: FallbackChainEntry) => Provider;
+
+function entryModel(entry: FallbackChainEntry): string {
+  return typeof entry === 'string' ? entry : entry.model;
+}
 
 /**
  * Creates a provider that tries models in order until one works.
@@ -51,7 +82,7 @@ export type ProviderFactory = (model: string) => Provider;
  */
 export function createFallbackProvider(
   primaryProvider: Provider,
-  fallbackModels: string[],
+  fallbackModels: FallbackChainEntry[],
   factory: ProviderFactory,
 ): Provider {
   if (fallbackModels.length === 0) return primaryProvider;
@@ -79,10 +110,11 @@ export function createFallbackProvider(
     }
 
     // Try fallback models in order
-    for (const model of fallbackModels) {
+    for (const entry of fallbackModels) {
+      const model = entryModel(entry);
       if (failedModels.has(model)) continue;
       try {
-        const fallback = factory(model);
+        const fallback = factory(entry);
         const result = await fn(fallback);
         // Success — promote this model
         logger.info(
@@ -100,7 +132,7 @@ export function createFallbackProvider(
 
     // All models exhausted
     throw new Error(
-      `All models exhausted in fallback chain: [${primaryProvider.model}, ${fallbackModels.join(', ')}]`,
+      `All models exhausted in fallback chain: [${primaryProvider.model}, ${fallbackModels.map(entryModel).join(', ')}]`,
     );
   }
 
@@ -108,6 +140,10 @@ export function createFallbackProvider(
   const proxy: Provider = {
     get name() { return activeProvider.name; },
     get model() { return activeProvider.model; },
+    // findings.md P2:818 — the proxy always exposes stream methods
+    // (synthesizing when the delegate lacks them), so the flag is
+    // always true from the caller's perspective.
+    supportsStreaming: true,
 
     complete(options: CompletionOptions): Promise<CompletionResult> {
       return withFallback((p) => p.complete(options), 'complete');
@@ -118,7 +154,9 @@ export function createFallbackProvider(
       onChunk: StreamCallback,
     ): Promise<CompletionResult> {
       return withFallback(
-        (p) => p.completeStream ? p.completeStream(options, onChunk) : p.complete(options),
+        (p) => p.completeStream
+          ? p.completeStream(options, onChunk)
+          : synthesizeStream(p.complete(options), onChunk),
         'completeStream',
       );
     },
@@ -134,7 +172,7 @@ export function createFallbackProvider(
       return withFallback(
         (p) => p.completeWithToolsStream
           ? p.completeWithToolsStream(options, onChunk)
-          : p.completeWithTools(options),
+          : synthesizeStream(p.completeWithTools(options), onChunk),
         'completeWithToolsStream',
       );
     },
@@ -143,9 +181,10 @@ export function createFallbackProvider(
       options: CompletionWithToolsOptions,
       toolCalls: ToolCall[],
       toolResults: ToolResult[],
+      assistantText?: string,
     ): Promise<CompletionWithToolsResult> {
       return withFallback(
-        (p) => p.continueWithToolResults(options, toolCalls, toolResults),
+        (p) => p.continueWithToolResults(options, toolCalls, toolResults, assistantText),
         'continueWithToolResults',
       );
     },
@@ -155,13 +194,25 @@ export function createFallbackProvider(
       toolCalls: ToolCall[],
       toolResults: ToolResult[],
       onChunk: StreamCallback,
+      assistantText?: string,
     ): Promise<CompletionWithToolsResult> {
       return withFallback(
         (p) => p.continueWithToolResultsStream
-          ? p.continueWithToolResultsStream(options, toolCalls, toolResults, onChunk)
-          : p.continueWithToolResults(options, toolCalls, toolResults),
+          ? p.continueWithToolResultsStream(options, toolCalls, toolResults, onChunk, assistantText)
+          : synthesizeStream(
+              p.continueWithToolResults(options, toolCalls, toolResults, assistantText),
+              onChunk,
+            ),
         'continueWithToolResultsStream',
       );
+    },
+
+    // findings.md P2:828 — delegate to whichever provider is currently
+    // active. After a fallback promotion the model context shifts (e.g.
+    // primary gpt-4 → fallback gpt-4o), so always route through
+    // activeProvider rather than snapshotting at construction time.
+    getModelInfo(): ModelInfo {
+      return activeProvider.getModelInfo();
     },
   };
 

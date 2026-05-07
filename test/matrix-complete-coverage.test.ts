@@ -43,23 +43,23 @@ vi.mock('../src/agent/letter.js', () => ({
   startLetterLoop: vi.fn().mockReturnValue(() => {}),
 }));
 
-vi.mock('../src/agent/skills.js', () => ({
-  saveCustomTool: vi.fn().mockResolvedValue(true),
-  listCustomTools: vi.fn().mockResolvedValue([]),
-  deleteCustomTool: vi.fn().mockResolvedValue(true),
-}));
-
 vi.mock('grammy', () => ({
   Bot: vi.fn().mockImplementation(() => ({
     api: { sendMessage: vi.fn().mockResolvedValue({}) },
   })),
 }));
 
-vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: { create: vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'test' }] }) },
-  })),
-}));
+vi.mock('@anthropic-ai/sdk', async () => {
+  // findings.md P2:838 — preserve real APIError exports so the provider's
+  // `err instanceof APIError` retry classification works under test.
+  const actual = await vi.importActual<typeof import('@anthropic-ai/sdk')>('@anthropic-ai/sdk');
+  return {
+    ...actual,
+    default: vi.fn().mockImplementation(() => ({
+      messages: { create: vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'test' }] }) },
+    })),
+  };
+});
 
 vi.mock('pdf-parse', () => ({
   PDFParse: vi.fn().mockImplementation(() => ({
@@ -106,9 +106,8 @@ describe('Tool registry — complete matrix', () => {
     'expand_memory',
     'web_search',
     'fetch_webpage',
-    'create_tool',
-    'list_my_tools',
-    'delete_tool',
+    // create_tool / list_my_tools / delete_tool removed — findings.md P1:1561
+    // (LLM-authored JS tools via `new Function(...)` were an RCE surface)
     'introspect_list',
     'introspect_read',
     'introspect_search',
@@ -155,23 +154,12 @@ describe('Tool registry — complete matrix', () => {
     }
   );
 
-  it.each(EXPECTED_BUILTIN_TOOLS.map((name) => [name]))(
-    'tool "%s" — toolRequiresApproval returns boolean',
-    async (toolName) => {
-      const { toolRequiresApproval } = await import('../src/agent/tools.js');
-      const result = toolRequiresApproval(toolName);
-      expect(typeof result).toBe('boolean');
-    }
-  );
-
-  it('telegram_call — requiresApproval is true', async () => {
-    const { toolRequiresApproval } = await import('../src/agent/tools.js');
-    expect(toolRequiresApproval('telegram_call')).toBe(true);
-  });
-
-  it('unknown tool — toolRequiresApproval returns false', async () => {
-    const { toolRequiresApproval } = await import('../src/agent/tools.js');
-    expect(toolRequiresApproval('nonexistent_tool_xyz')).toBe(false);
+  it('dead toolRequiresApproval helper has been removed (P1 findings.md)', async () => {
+    // The helper existed but executeTool never consulted it, so tools
+    // marked requiresApproval ran unattended. Removed to avoid false
+    // confidence; any real approval flow must gate executeTool itself.
+    const mod = await import('../src/agent/tools.js') as Record<string, unknown>;
+    expect(mod['toolRequiresApproval']).toBeUndefined();
   });
 
   it('getToolDefinitions — returns array', async () => {
@@ -714,13 +702,10 @@ describe('Session function matrix', () => {
 
 describe('Doctor tool definitions matrix', () => {
   const EXPECTED_DOCTOR_TOOLS = [
-    'run_diagnostic_tests',
     'check_service_health',
     'get_health_status',
     'get_telemetry',
     'read_file',
-    'edit_file',
-    'run_command',
     'get_reports',
   ];
 
@@ -784,21 +769,9 @@ describe('Doctor tool definitions matrix', () => {
     expect(results).toEqual([]);
   });
 
-  it('run_command — blocked command returns error', async () => {
-    const { executeDoctorTool } = await import('../src/agent/doctor-tools.js');
-    const result = await executeDoctorTool({ id: 'x', name: 'run_command', input: { command: 'sudo rm -rf /' } });
-    expect(result.content).toContain('blocked');
-  });
-
   it('read_file — blocked path returns access denied', async () => {
     const { executeDoctorTool } = await import('../src/agent/doctor-tools.js');
     const result = await executeDoctorTool({ id: 'x', name: 'read_file', input: { path: '../../../etc/passwd' } });
-    expect(result.content).toContain('Access denied');
-  });
-
-  it('edit_file — blocked path returns access denied', async () => {
-    const { executeDoctorTool } = await import('../src/agent/doctor-tools.js');
-    const result = await executeDoctorTool({ id: 'x', name: 'edit_file', input: { path: '../../../etc/passwd', old_text: 'a', new_text: 'b' } });
     expect(result.content).toContain('Access denied');
   });
 });
@@ -835,7 +808,7 @@ describe('Character tool definitions matrix', () => {
       unregisterTool(name);
     }
     const { registerCharacterTools } = await import('../src/agent/character-tools.js');
-    registerCharacterTools('test-char', 'TestChar', 'http://localhost:3000', 'test-token', [
+    registerCharacterTools('test-char', 'TestChar', 'http://localhost:3000', [
       { id: 'peer1', name: 'Peer One', url: 'http://localhost:3001' },
     ]);
   }
@@ -1070,7 +1043,8 @@ describe('HTTP route contracts matrix (unit-level)', () => {
     try {
       const mod = await import('../src/web/owner-auth.js');
       expect(typeof mod.isOwner).toBe('function');
-      expect(typeof mod.setOwnerCookie).toBe('function');
+      expect(typeof mod.issueOwnerCookie).toBe('function');
+      expect(typeof mod.clearOwnerCookie).toBe('function');
     } catch { /* module may not load in test context */ }
     if (savedToken !== undefined) process.env['LAIN_OWNER_TOKEN'] = savedToken;
   });

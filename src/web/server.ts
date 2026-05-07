@@ -5,16 +5,17 @@
 
 import 'dotenv/config';
 import { exec } from 'node:child_process';
+import os from 'node:os';
 import { promisify } from 'node:util';
 const execAsync = promisify(exec);
 import { createServer, request as httpRequest } from 'node:http';
 import type { ServerResponse, IncomingMessage as NodeIncomingMessage } from 'node:http';
-import { appendFile, mkdir } from 'node:fs/promises';
+import { appendFile, mkdir, rename } from 'node:fs/promises';
 import { readFile, stat } from 'node:fs/promises';
 import { join, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { nanoid } from 'nanoid';
-import { initAgent, processMessage, processMessageStream } from '../agent/index.js';
+import { initAgent, processMessage, processMessageStream, unregisterTool } from '../agent/index.js';
 // import { startProactiveLoop } from '../agent/proactive.js';
 import { startCuriosityLoop } from '../agent/curiosity.js';
 import { startStateDecayLoop } from '../agent/internal-state.js';
@@ -33,43 +34,107 @@ import { startExperimentLoop } from '../agent/experiments.js';
 import { startBookLoop } from '../agent/book.js';
 import { startNoveltyLoop } from '../agent/novelty.js';
 import { startDreamSeederLoop } from '../agent/dream-seeder.js';
-import { startEvolutionLoop, getAllLineages, MORTAL_CHARACTERS } from '../agent/evolution.js';
+import { startEvolutionLoop, getAllLineages } from '../agent/evolution.js';
+import { getMortalCharacters, getHealthCheckTargets, getAllCharacters, requireCharacterName, getWebCharacter, getAgentConfigFor } from '../config/characters.js';
 import { startFeedHealthLoop, getFeedHealthState } from '../agent/feed-health.js';
-import { startWeatherLoop } from '../commune/weather.js';
+import { startWeatherLoop, startTownWeatherRefreshLoop } from '../commune/weather.js';
+import { startBuildingMemoryPruneLoop } from '../commune/building-memory.js';
 import { getBudgetStatus } from '../providers/budget.js';
 import { paraphraseLetter, type WiredLetter } from '../agent/membrane.js';
 import { getProvider } from '../agent/index.js';
 import { extractTextFromHtml } from '../agent/tools.js';
 import { generateEmbeddings } from '../memory/embeddings.js';
 import { saveMemory, getActivity, getNotesByBuilding, getDocumentsByAuthor, savePostboardMessage, getPostboardMessages, deletePostboardMessage, togglePostboardPin, countMemories, countMessages } from '../memory/store.js';
-import { createObject, getObject, getObjectsByLocation, getObjectsByOwner, getAllObjects, pickupObject, dropObject, transferObject, destroyObject, isFixture } from '../objects/store.js';
+import { createObject, getObject, getObjectsByLocation, getObjectsByOwner, getAllObjects, pickupObject, dropObject, transferObject, destroyObject, isFixture, expireStaleObjects, startObjectExpiryLoop } from '../objects/store.js';
 import { eventBus, isBackgroundEvent, type SystemEvent } from '../events/bus.js';
-import { createTownEvent, getActiveTownEvents, getAllTownEvents, endTownEvent, expireStaleEvents, getActiveEffects, type CreateEventParams } from '../events/town-events.js';
+import { createTownEvent, getActiveTownEvents, getAllTownEvents, endTownEvent, startExpireStaleEventsLoop, getActiveEffects, type CreateEventParams } from '../events/town-events.js';
 import { sanitize } from '../security/sanitizer.js';
 import { safeFetch } from '../security/ssrf.js';
+import { isAllowedReplyTo } from '../security/reply-to.js';
+import {
+  verifyInterlinkRequest,
+  assertBodyIdentity,
+  getInterlinkHeaders,
+} from '../security/interlink-auth.js';
 import { secureCompare } from '../utils/crypto.js';
-import { isOwner, setOwnerCookie } from './owner-auth.js';
-import { initDatabase, getMeta, query } from '../storage/database.js';
+import { isOwner, issueOwnerCookie, clearOwnerCookie, getOwnerNonce } from './owner-auth.js';
+import {
+  revokeNonce,
+  revokeAllNonces,
+  revokeNonceOnAuthority,
+  revokeAllOnAuthority,
+} from './owner-nonce-store.js';
+import { getCorsOrigin } from './cors.js';
+import { buildHtmlCsp } from './csp-hashes.js';
+import { initDatabase, getMeta, query, getDatabase } from '../storage/database.js';
 import { getPaths } from '../config/index.js';
 import { getBasePath } from '../config/paths.js';
 import { getDefaultConfig } from '../config/defaults.js';
+import { isResearchEnabled } from '../config/features.js';
 import type { IncomingMessage, TextContent, ImageContent } from '../types/message.js';
+import { purgeLocalOnlyResearchArtifacts } from '../memory/local-only.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const PUBLIC_DIR = join(__dirname, '..', '..', 'src', 'web', 'public');
 const SKINS_DIR = join(__dirname, '..', '..', 'src', 'web', 'skins');
 const NEWSPAPERS_DIR = getNewspaperDataDir();
+const REMOTE_RESEARCH_TOOLS = [
+  'web_search',
+  'fetch_webpage',
+  'show_image',
+  'search_images',
+  'fetch_and_show_image',
+  'view_image',
+];
+
+// findings.md P2:2880 — CSP used to list `'unsafe-inline'` under script-src
+// and style-src, defeating XSS protection. Inline blocks in public/ are
+// static on disk, so we hash them once at boot and emit each digest as a
+// `'sha256-...'` source. No per-request overhead; no page rewriting.
+const HTML_CSP = buildHtmlCsp(PUBLIC_DIR);
 const LOG_DIR = join(__dirname, '..', '..', 'logs');
 const LOG_FILE = join(LOG_DIR, 'lain-debug.log');
+
+// findings.md P2:2444 — debug log used to grow without bound and append raw
+// chat bodies verbatim (PII, owner-visible content, etc.). Cap file size
+// with single-slot rotation, and redact any long string fields (message
+// bodies, response text, stack traces) to a short preview + length hint.
+const LOG_MAX_BYTES = 8 * 1024 * 1024; // 8 MB, then rotate
+const LOG_FIELD_PREVIEW_BYTES = 200;
+
+function redactLongStrings(value: unknown): unknown {
+  if (typeof value === 'string') {
+    if (value.length <= LOG_FIELD_PREVIEW_BYTES) return value;
+    return `${value.slice(0, LOG_FIELD_PREVIEW_BYTES)}…[+${value.length - LOG_FIELD_PREVIEW_BYTES} chars]`;
+  }
+  if (Array.isArray(value)) return value.map(redactLongStrings);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = redactLongStrings(v);
+    return out;
+  }
+  return value;
+}
+
+async function rotateLogIfLarge(): Promise<void> {
+  try {
+    const s = await stat(LOG_FILE);
+    if (s.size > LOG_MAX_BYTES) {
+      await rename(LOG_FILE, `${LOG_FILE}.1`); // overwrites any prior .1
+    }
+  } catch { /* file doesn't exist yet, or rotate raced — ignore */ }
+}
 
 // Debug logging to file
 async function debugLog(context: string, data: unknown): Promise<void> {
   try {
     await mkdir(LOG_DIR, { recursive: true });
+    await rotateLogIfLarge();
+    const redacted = redactLongStrings(data);
     const timestamp = new Date().toISOString();
-    const entry = `[${timestamp}] [${context}] ${JSON.stringify(data, null, 2)}\n${'='.repeat(80)}\n`;
+    const entry = `[${timestamp}] [${context}] ${JSON.stringify(redacted, null, 2)}\n${'='.repeat(80)}\n`;
     await appendFile(LOG_FILE, entry);
-    console.log(`[DEBUG] [${context}]`, typeof data === 'string' ? data : JSON.stringify(data).substring(0, 200));
+    console.log(`[DEBUG] [${context}]`, typeof redacted === 'string' ? redacted : JSON.stringify(redacted).substring(0, 200));
   } catch (e) {
     console.error('Failed to write debug log:', e);
   }
@@ -104,7 +169,7 @@ function collectBody(req: import('node:http').IncomingMessage, maxBytes = MAX_BO
 // --- Owner session management ---
 // Owner authenticates via /gate?token=LAIN_OWNER_TOKEN, gets an HMAC-signed HTTP-only cookie.
 // All servers (main, character, doctor) can independently verify using the same LAIN_OWNER_TOKEN.
-// isOwner() and setOwnerCookie() imported from ./owner-auth.js
+// isOwner() / issueOwnerCookie() / clearOwnerCookie() imported from ./owner-auth.js
 
 /**
  * Verify write access for /api/* endpoints.
@@ -162,9 +227,21 @@ function checkRateLimit(ip: string): boolean {
   return entry.count <= RATE_LIMIT_MAX;
 }
 
+// findings.md P2:2446 — getClientIp lives in ./client-ip.ts so
+// character-server / doctor-server (P2:2494) can use the same XFF
+// trust rule without circular-importing from server.ts. Re-export
+// here for back-compat with `test/client-ip-trust.test.ts` which
+// imports the helper from '../src/web/server.js'.
+export { getClientIp } from './client-ip.js';
+import { getClientIp } from './client-ip.js';
+
 // --- CORS origin ---
 
-const CORS_ORIGIN = process.env['LAIN_CORS_ORIGIN'] || '*';
+// findings.md P2:2366 — route through the shared helper so CORS config
+// lives in one place across all three servers. Main server keeps the
+// permissive `'*'` fallback because the public commune map is designed
+// to be embeddable; character/doctor servers default to no header.
+const CORS_ORIGIN = getCorsOrigin('*') ?? '*';
 
 // --- Live conversation broadcast ---
 interface ConversationEvent {
@@ -374,71 +451,53 @@ async function serveFromDir(baseDir: string, path: string): Promise<{ content: B
   }
 }
 
-// Pages that require owner auth — non-owners get 403
-const OWNER_ONLY_PATHS = [
+// findings.md P2:2388 — character routes and ports used to be hardcoded in
+// three places (here, the CHARACTER_PORTS proxy map below, and the two
+// skin loaders under src/web/skins/). A rename like doctor → dr-claude
+// would miss one spot and break skin injection. Derive from the manifest
+// instead so a single rename stays consistent.
+const STATIC_OWNER_ONLY_PATHS = [
   '/postboard.html',
   '/town-events.html',
   '/dreams.html',
   '/dashboard.html',
-  '/neo/',
-  '/plato/',
-  '/joe/',
   '/api/chat',
   '/api/chat/stream',
 ];
 
-const CHARACTER_PROXY_PREFIXES = ['/neo/', '/plato/', '/joe/'] as const;
-const PUBLIC_CHARACTER_API_PATHS = [
-  '/api/health',
-  '/api/location',
-  '/api/events',
-  '/api/activity',
-  '/api/building/notes',
-  '/api/documents',
-  '/api/postboard',
-] as const;
-
-function isPublicCharacterApiPath(pathname: string): boolean {
-  for (const prefix of CHARACTER_PROXY_PREFIXES) {
-    if (!pathname.startsWith(prefix)) continue;
-    const targetPath = '/' + pathname.slice(prefix.length);
-    return PUBLIC_CHARACTER_API_PATHS.some((publicPath) => (
-      targetPath === publicPath || targetPath.startsWith(`${publicPath}/`)
-    ));
-  }
-  return false;
+function getCharacterRoutePrefixes(): string[] {
+  return getAllCharacters().map(c => `/${c.id}/`);
 }
 
+const OWNER_ONLY_PATHS = [...STATIC_OWNER_ONLY_PATHS];
+
 /**
- * Verify interlink auth token from Authorization: Bearer header.
- * Returns true if authenticated, false if response was already sent with error.
+ * Verify per-character interlink auth (findings.md P1:2289).
+ *
+ * On success returns the authenticated character id (from `X-Interlink-From`,
+ * whose derived bearer token was verified). On failure writes the error
+ * response and returns null — callers should `if (!fromId) return;`.
+ *
+ * Callers MUST treat the returned `fromId` as the source of truth for
+ * identity and reject any body-asserted identity field that disagrees via
+ * `assertBodyIdentity`.
  */
 function verifyInterlinkAuth(
   req: import('node:http').IncomingMessage,
   res: ServerResponse
-): boolean {
-  const token = process.env['LAIN_INTERLINK_TOKEN'];
-  if (!token) {
-    res.writeHead(503, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Interlink not configured' }));
-    return false;
+): string | null {
+  const result = verifyInterlinkRequest(req);
+  if (!result.ok) {
+    res.writeHead(result.status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: result.error }));
+    return null;
   }
+  return result.fromId;
+}
 
-  const authHeader = req.headers['authorization'];
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.writeHead(401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Missing or invalid Authorization header' }));
-    return false;
-  }
-
-  const provided = authHeader.slice('Bearer '.length);
-  if (!secureCompare(provided, token)) {
-    res.writeHead(403, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Invalid token' }));
-    return false;
-  }
-
-  return true;
+function rejectBodyIdentityMismatch(res: ServerResponse, reason: string): void {
+  res.writeHead(403, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Body identity mismatch', detail: reason }));
 }
 
 // --- Navigation bar injection ---
@@ -450,19 +509,26 @@ const NAV_LINKS_PUBLIC: Array<{ label: string; href: string }> = [
   { label: 'PAPER', href: '/newspaper.html' },
 ];
 
-const NAV_LINKS_OWNER: Array<{ label: string; href: string }> = [
-  { label: 'POST', href: '/postboard.html' },
-  { label: 'EVENTS', href: '/town-events.html' },
-  { label: 'DREAMS', href: '/dreams.html' },
-  { label: 'DASH', href: '/dashboard.html' },
-  { label: 'NEO', href: '/neo/' },
-  { label: 'PLATO', href: '/plato/' },
-  { label: 'JOE', href: '/joe/' },
-];
+function getOwnerNavLinks(): Array<{ label: string; href: string }> {
+  const characterLinks = getAllCharacters()
+    .filter((character) => character.server !== 'web')
+    .map((character) => ({
+      label: character.name.toUpperCase(),
+      href: `/${character.id}/`,
+    }));
+
+  return [
+    { label: 'POST', href: '/postboard.html' },
+    { label: 'EVENTS', href: '/town-events.html' },
+    { label: 'DREAMS', href: '/dreams.html' },
+    { label: 'DASH', href: '/dashboard.html' },
+    ...characterLinks,
+  ];
+}
 
 function generateNavBar(pathname: string, ownerMode = false): string {
-  const exitLink = { label: 'EXIT', href: '/commune-map.html' };
-  const NAV_LINKS = ownerMode ? [...NAV_LINKS_PUBLIC, ...NAV_LINKS_OWNER, exitLink] : [...NAV_LINKS_PUBLIC, exitLink];
+  const exitLink = { label: 'EXIT', href: 'https://shraii.com' };
+  const NAV_LINKS = ownerMode ? [...NAV_LINKS_PUBLIC, ...getOwnerNavLinks(), exitLink] : [...NAV_LINKS_PUBLIC, exitLink];
   const isGamePage = pathname === '/game/' || pathname === '/game/index.html';
 
   const links = NAV_LINKS.map(({ label, href }) => {
@@ -477,36 +543,111 @@ function generateNavBar(pathname: string, ownerMode = false): string {
     }
     const cls = active ? ' class="ltn-active"' : '';
     return `<a href="${href}"${cls}>${label}</a>`;
-  }).join('');
+  }).join(' ');
 
-  return `<style>
-#laintown-nav{position:fixed;top:0;left:0;right:0;height:32px;background:var(--bg-deep,#0a0a0f);border-bottom:1px solid var(--border-glow,#1a1a2e);display:flex;align-items:center;z-index:99999;font-family:'Share Tech Mono',monospace;padding:0 12px;gap:0}
-#laintown-nav .ltn-title{color:var(--accent-primary,#4a9eff);font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-right:16px}
-#laintown-nav a{color:var(--text-dim,#556);font-size:11px;letter-spacing:1.5px;text-transform:uppercase;text-decoration:none;padding:0 10px;line-height:32px;transition:color .2s}
-#laintown-nav a:hover{color:var(--accent-secondary,#8ab4f8)}
-#laintown-nav a.ltn-active{color:var(--accent-primary,#4a9eff)}
-</style>
-<style>${isGamePage ? 'body{padding-top:0!important}#laintown-nav{background:var(--nav-game-bg,rgba(10,10,15,0.6));border-bottom-color:var(--nav-game-border,rgba(26,26,46,0.4))}' : 'body{padding-top:32px!important}'}</style>
-<div id="laintown-nav"><span class="ltn-title">NEWTOWN</span>${links}</div>
-<script>(function(){var k=new URLSearchParams(location.search).get('key');if(k){var as=document.querySelectorAll('#laintown-nav a');for(var i=0;i<as.length;i++){var a=as[i],h=a.getAttribute('href');if(h){var hi=h.indexOf('#'),base=hi>-1?h.slice(0,hi):h,frag=hi>-1?h.slice(hi):'';if(base.indexOf('?')===-1){a.setAttribute('href',base+'?key='+encodeURIComponent(k)+frag)}else{a.setAttribute('href',base+'&key='+encodeURIComponent(k)+frag)}}}}})();</script>`;
+  return `<div id="laintown-nav"${isGamePage ? ' class="ltn-game"' : ''}><span class="ltn-title">NEWTOWN</span> ${links}</div>`;
+}
+
+function addClassToBodyTag(bodyTag: string, className: string): string {
+  const classAttr = bodyTag.match(/\sclass=(["'])(.*?)\1/i);
+  if (!classAttr || classAttr.index === undefined) {
+    return bodyTag.replace(/>$/, ` class="${className}">`);
+  }
+
+  const quote = classAttr[1] ?? '"';
+  const current = classAttr[2] ?? '';
+  const classes = new Set(current.split(/\s+/).filter(Boolean));
+  classes.add(className);
+  const nextAttr = ` class=${quote}${Array.from(classes).join(' ')}${quote}`;
+  return bodyTag.slice(0, classAttr.index) + nextAttr + bodyTag.slice(classAttr.index + classAttr[0].length);
+}
+
+function injectNavAssets(html: string): string {
+  if (!html.includes('/laintown-nav.css')) {
+    html = html.replace('</head>', '  <link rel="stylesheet" href="/laintown-nav.css">\n</head>');
+  }
+  if (!html.includes('/laintown-nav.js')) {
+    html = html.replace('</head>', '  <script src="/laintown-nav.js" defer></script>\n</head>');
+  }
+  return html;
 }
 
 function injectNavBar(html: string, pathname: string, ownerMode = false): string {
   const nav = generateNavBar(pathname, ownerMode);
+  // findings.md P2:2388 — inject the authoritative character-route list BEFORE
+  // early-load.js runs so the synchronous skin-path resolver reads from a
+  // manifest-derived source rather than the historical hardcoded array.
+  const charPaths = JSON.stringify(getCharacterRoutePrefixes().map(p => p.replace(/\/$/, '')));
+  if (!html.includes('name="laintown-char-paths"')) {
+    html = html.replace(
+      '</head>',
+      `  <meta name="laintown-char-paths" content='${charPaths}'>\n</head>`
+    );
+  }
   // Inject telemetry script before </head> (skip on dashboard — it has its own stats)
   if (!pathname.includes('dashboard')) {
+    if (!html.includes('/laintown-telemetry.css')) {
+      html = html.replace('</head>', '  <link rel="stylesheet" href="/laintown-telemetry.css">\n</head>');
+    }
     html = html.replace('</head>', '<script src="/laintown-telemetry.js" defer></script></head>');
   }
   // Strip any existing nav bar (from character server's own injection)
   html = html.replace(/<style>[^<]*#laintown-nav[\s\S]*?<\/style>/g, '');
   html = html.replace(/<div id="laintown-nav">[\s\S]*?<\/div>\s*<script>\(function\(\)\{var k=[\s\S]*?<\/script>/g, '');
+  html = html.replace(/<div id="laintown-nav"[\s\S]*?<\/div>\s*/g, '');
+  html = injectNavAssets(html);
+
   // Inject after the opening <body...> tag
   const bodyMatch = html.match(/<body[^>]*>/i);
   if (bodyMatch) {
-    const idx = html.indexOf(bodyMatch[0]) + bodyMatch[0].length;
-    return html.slice(0, idx) + nav + html.slice(idx);
+    const isGamePage = pathname === '/game/' || pathname === '/game/index.html';
+    const bodyTag = bodyMatch[0];
+    const idx = html.indexOf(bodyTag);
+    const classedBody = addClassToBodyTag(bodyTag, isGamePage ? 'ltn-game-nav' : 'ltn-has-nav');
+    return html.slice(0, idx) + classedBody + nav + html.slice(idx + bodyTag.length);
   }
   return html;
+}
+
+function formatUptime(seconds: number): string {
+  const days = Math.floor(seconds / 86_400);
+  const hours = Math.floor((seconds % 86_400) / 3_600);
+  const minutes = Math.floor((seconds % 3_600) / 60);
+  if (days > 0) return `${days}d ${hours}h ${minutes}m`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+async function getDiskStats(): Promise<{ total: string; used: string; available: string; percent: number }> {
+  if (process.platform === 'win32') {
+    const drive = (process.cwd().slice(0, 2) || 'C:').replace(/'/g, "''");
+    const { stdout } = await execAsync(
+      `powershell -NoProfile -Command "(Get-CimInstance Win32_LogicalDisk -Filter \\\"DeviceID='${drive}'\\\" | Select-Object Size,FreeSpace | ConvertTo-Json -Compress)"`,
+      { timeout: 5000 }
+    );
+    const parsed = JSON.parse(stdout.trim()) as { Size?: number; FreeSpace?: number };
+    const totalBytes = Number(parsed.Size || 0);
+    const freeBytes = Number(parsed.FreeSpace || 0);
+    const usedBytes = Math.max(0, totalBytes - freeBytes);
+    return {
+      total: String(totalBytes),
+      used: String(usedBytes),
+      available: String(freeBytes),
+      percent: totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 100) : 0,
+    };
+  }
+
+  const { stdout } = await execAsync('df -k . | tail -1', { timeout: 5000 });
+  const parts = stdout.trim().split(/\s+/);
+  const totalKb = Number(parts[1] || 0);
+  const usedKb = Number(parts[2] || 0);
+  const availKb = Number(parts[3] || 0);
+  return {
+    total: String(totalKb * 1024),
+    used: String(usedKb * 1024),
+    available: String(availKb * 1024),
+    percent: Number.parseInt(parts[4] || '0', 10) || 0,
+  };
 }
 
 export async function startWebServer(port = 3000): Promise<void> {
@@ -516,14 +657,28 @@ export async function startWebServer(port = 3000): Promise<void> {
 
   console.log('Initializing database...');
   await initDatabase(paths.database, config.security.keyDerivation);
+  purgeLocalOnlyResearchArtifacts();
 
   // Set character identity for event bus
   const characterId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
   eventBus.setCharacterId(characterId);
 
+  // findings.md P2:171 — web server initializes the single `server: 'web'`
+  // character from characters.json, picking up its `providers[]` if declared
+  // and falling back to DEFAULT_PROVIDERS otherwise.
   console.log('Initializing agent...');
-  for (const agentConfig of config.agents) {
-    await initAgent(agentConfig);
+  const webChar = getWebCharacter();
+  if (!webChar) {
+    throw new Error(
+      'No characters.json entry with server:"web" — web server has no character to serve.',
+    );
+  }
+  await initAgent(getAgentConfigFor(webChar.id));
+  if (!isResearchEnabled()) {
+    for (const toolName of REMOTE_RESEARCH_TOOLS) {
+      unregisterTool(toolName);
+    }
+    console.log('[Newtown] Local-only mode active: remote research tools disabled');
   }
 
   const server = createServer(async (req, res) => {
@@ -545,7 +700,7 @@ export async function startWebServer(port = 3000): Promise<void> {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'");
+    res.setHeader('Content-Security-Policy', HTML_CSP);
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
@@ -564,27 +719,144 @@ export async function startWebServer(port = 3000): Promise<void> {
       return;
     }
 
-    // Owner gate — authenticate via secret token, get HMAC-signed session cookie
+    // Character manifest (no auth — public for commune map / game client)
+    if (url.pathname === '/api/characters' && req.method === 'GET') {
+      const { getAllCharacters, loadManifest } = await import('../config/characters.js');
+      const manifest = loadManifest();
+      const characters = getAllCharacters().map(c => ({
+        id: c.id,
+        name: c.name,
+        port: c.port,
+        defaultLocation: c.defaultLocation,
+        possessable: c.possessable === true ? true : undefined,
+        // findings.md P2:3216 — expose the web/host character so the game
+        // client can resolve an explicit fallback instead of guessing via
+        // Object.keys(CHARACTERS)[0], which depends on manifest order.
+        web: c.server === 'web' ? true : undefined,
+      }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ town: manifest.town, characters }));
+      return;
+    }
+
+    // Owner gate — authenticate via secret token, get HMAC-signed session cookie.
+    //
+    // findings.md P2:2466 — tokens in URL query strings leak via browser history,
+    // nginx access logs, proxy logs, and the Referer header. Prefer POST /gate
+    // with the token in the request body; keep GET /gate for backward-compat with
+    // existing bookmarks but add Cache-Control: no-store and Referrer-Policy:
+    // no-referrer so downstream requests and the disk cache don't amplify the
+    // leak window.
+    if (url.pathname === '/gate' && req.method === 'POST') {
+      const ownerToken = process.env['LAIN_OWNER_TOKEN'];
+      let provided: string | undefined;
+      try {
+        const raw = await collectBody(req, 4096);
+        const ct = (req.headers['content-type'] ?? '').toString().toLowerCase();
+        if (ct.includes('application/json')) {
+          const parsed = JSON.parse(raw) as { token?: unknown };
+          if (typeof parsed.token === 'string') provided = parsed.token;
+        } else if (ct.includes('application/x-www-form-urlencoded')) {
+          const params = new URLSearchParams(raw);
+          provided = params.get('token') ?? undefined;
+        } else {
+          // Treat raw body as token if no content-type specified (curl convenience).
+          provided = raw.trim() || undefined;
+        }
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+        res.end('Bad Request');
+        return;
+      }
+      const headers = {
+        'Cache-Control': 'no-store',
+        'Referrer-Policy': 'no-referrer',
+      };
+      if (ownerToken && provided && secureCompare(provided, ownerToken)) {
+        issueOwnerCookie(res, ownerToken, req);
+        res.writeHead(302, { ...headers, 'Location': '/' });
+        res.end();
+      } else {
+        res.writeHead(403, { ...headers, 'Content-Type': 'text/plain' });
+        res.end('Forbidden');
+      }
+      return;
+    }
+
     if (url.pathname === '/gate' && req.method === 'GET') {
       const ownerToken = process.env['LAIN_OWNER_TOKEN'];
       const provided = url.searchParams.get('token');
+      const headers = {
+        'Cache-Control': 'no-store',
+        'Referrer-Policy': 'no-referrer',
+      };
       if (ownerToken && provided && secureCompare(provided, ownerToken)) {
-        setOwnerCookie(res, ownerToken);
-        res.writeHead(302, { 'Location': '/' });
+        issueOwnerCookie(res, ownerToken, req);
+        res.writeHead(302, { ...headers, 'Location': '/' });
         res.end();
       } else {
-        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.writeHead(403, { ...headers, 'Content-Type': 'text/plain' });
         res.end('Forbidden');
       }
+      return;
+    }
+
+    // findings.md P2:2348 — owner logout (revoke THIS device's nonce + clear cookie).
+    // Works on any character server; WL revokes locally, mortals proxy through
+    // the interlink endpoint. Cookie clearing is always local (cookies are
+    // domain-scoped so this is the only server that can drop its own).
+    if (url.pathname === '/owner/logout' && req.method === 'POST') {
+      if (!isOwner(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not authenticated' }));
+        return;
+      }
+      const nonce = getOwnerNonce(req);
+      if (nonce) {
+        try {
+          await revokeNonceOnAuthority(nonce);
+        } catch (err) {
+          // WL unreachable — still clear the local cookie so the user is
+          // logged out from this browser. The nonce will remain revocable
+          // as soon as WL is back; legitimate sessions see no impact.
+          console.error('owner logout: authority revoke failed (cookie still cleared):', err);
+        }
+      }
+      clearOwnerCookie(res, req);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    // findings.md P2:2348 — "log me out of every device." Revokes every
+    // non-revoked nonce on the authority, clears this device's cookie too.
+    if (url.pathname === '/owner/logout-all' && req.method === 'POST') {
+      if (!isOwner(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not authenticated' }));
+        return;
+      }
+      let count = 0;
+      try {
+        count = await revokeAllOnAuthority();
+      } catch (err) {
+        console.error('owner logout-all: authority revoke-all failed:', err);
+        clearOwnerCookie(res, req);
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Authority unreachable; local cookie cleared' }));
+        return;
+      }
+      clearOwnerCookie(res, req);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ revoked: count }));
       return;
     }
 
     // Block non-owners from restricted pages
     if (!isOwner(req)) {
       const isOwnerOnly = OWNER_ONLY_PATHS.some(p => url.pathname === p || url.pathname.startsWith(p));
-      const isPublicResidentApi = isPublicCharacterApiPath(url.pathname);
       const isRootChat = (url.pathname === '/' || url.pathname === '/index.html') && !url.pathname.startsWith('/api/') && !url.pathname.startsWith('/skins/');
-      if ((isOwnerOnly && !isPublicResidentApi) || isRootChat) {
+      if (isOwnerOnly || isRootChat) {
         if (req.headers['accept']?.includes('text/html') || !url.pathname.startsWith('/api/')) {
           res.writeHead(302, { Location: '/commune-map.html' });
           res.end();
@@ -601,7 +873,7 @@ export async function startWebServer(port = 3000): Promise<void> {
       try {
         const { getCurrentLocation } = await import('../commune/location.js');
         const { BUILDING_MAP } = await import('../commune/buildings.js');
-        const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+        const charId = process.env['LAIN_CHARACTER_ID'] || 'lain';
         const loc = getCurrentLocation(charId);
         const building = BUILDING_MAP.get(loc.building);
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -625,11 +897,11 @@ export async function startWebServer(port = 3000): Promise<void> {
       if (!verifyInterlinkAuth(req, res)) return;
       try {
         const { getCurrentState, getStateSummary } = await import('../agent/internal-state.js');
-        const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+        const charId = process.env['LAIN_CHARACTER_ID'] || 'lain';
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ characterId: charId, summary: getStateSummary(), state: getCurrentState() }));
       } catch {
-        const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+        const charId = process.env['LAIN_CHARACTER_ID'] || 'lain';
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ characterId: charId, summary: '', state: null }));
       }
@@ -652,8 +924,10 @@ export async function startWebServer(port = 3000): Promise<void> {
 
     // Identity (no auth)
     if (url.pathname === '/api/meta/identity' && req.method === 'GET') {
-      const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
-      const charName = process.env['LAIN_CHARACTER_NAME'] || 'Newtown';
+      const charId = process.env['LAIN_CHARACTER_ID'] || 'lain';
+      // findings.md P2:2271 — fail-closed; identity endpoint must never
+      // silently return "Lain" for a mis-configured non-Lain character.
+      const charName = requireCharacterName();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ id: charId, name: charName }));
       return;
@@ -684,11 +958,9 @@ export async function startWebServer(port = 3000): Promise<void> {
       }
 
       try {
-        const charPorts: Record<string, number> = {
-          'neo': 3003,
-          'plato': 3004,
-          'joe': 3005,
-        };
+        const charPorts: Record<string, number> = Object.fromEntries(
+          getAllCharacters().map((character) => [character.id, character.port])
+        );
         const charIds = Object.keys(charPorts);
 
         // Fetch conversation histories from all characters
@@ -698,7 +970,7 @@ export async function startWebServer(port = 3000): Promise<void> {
         const fetches = charIds.map(async (charId) => {
           try {
             let records: ConvRecord[];
-            if (charId === (process.env['LAIN_CHARACTER_ID'] || 'newtown')) {
+            if (charId === (process.env['LAIN_CHARACTER_ID'] || webChar.id)) {
               // Read locally
               const raw = getMeta('commune:conversation_history');
               records = raw ? JSON.parse(raw) : [];
@@ -779,8 +1051,10 @@ export async function startWebServer(port = 3000): Promise<void> {
     // Integrity check — reports actual data paths for isolation verification (auth required)
     if (url.pathname === '/api/meta/integrity' && req.method === 'GET') {
       if (!isOwner(req)) { if (!verifyInterlinkAuth(req, res)) return; }
-      const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
-      const charName = process.env['LAIN_CHARACTER_NAME'] || 'Newtown';
+      const charId = process.env['LAIN_CHARACTER_ID'] || 'lain';
+      // findings.md P2:2271 — fail-closed; integrity report must never
+      // silently claim the character is "Lain" when the env is unset.
+      const charName = requireCharacterName();
       const basePath = getBasePath();
       const dbPath = join(basePath, 'lain.db');
       const journalPath = join(basePath, '.private_journal', 'thoughts.json');
@@ -792,7 +1066,7 @@ export async function startWebServer(port = 3000): Promise<void> {
       // 1. LAIN_HOME is set (every character except default Lain should have this)
       checks.push({
         check: 'LAIN_HOME',
-        ok: !!process.env['LAIN_HOME'] || charId === 'newtown',
+        ok: !!process.env['LAIN_HOME'] || charId === 'lain',
         detail: lainHome,
       });
 
@@ -839,8 +1113,10 @@ export async function startWebServer(port = 3000): Promise<void> {
     // Telemetry — exposes key stats for Dr. Claude's town-wide monitoring (auth required)
     if (url.pathname === '/api/telemetry' && req.method === 'GET') {
       if (!isOwner(req)) { if (!verifyInterlinkAuth(req, res)) return; }
-      const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
-      const charName = process.env['LAIN_CHARACTER_NAME'] || 'Newtown';
+      const charId = process.env['LAIN_CHARACTER_ID'] || 'lain';
+      // findings.md P2:2271 — fail-closed; telemetry must not lie about
+      // whose data it's reporting.
+      const charName = requireCharacterName();
       const sinceMs = Date.now() - 24 * 60 * 60 * 1000;
       try {
         const totalMemories = countMemories();
@@ -885,7 +1161,7 @@ export async function startWebServer(port = 3000): Promise<void> {
           avgEmotionalWeight: avgRow[0]?.avg_ew ?? 0,
           sessionActivity: Object.fromEntries(sessionCounts.map(r => [r.prefix, r.count])),
           hotMemories: hotMemories.map(m => ({
-            content: m.content.slice(0, 150),
+            content: m.content,
             emotionalWeight: m.emotional_weight,
           })),
           loopHealth,
@@ -930,15 +1206,19 @@ export async function startWebServer(port = 3000): Promise<void> {
       const to = toParam ? Number(toParam) : now;
       const entries = getActivity(from, to, 500, {
         includeVisitorChat: includeChat,
-        chatPrefixes: ['web'],
+        chatPrefixes: ['web', 'newtown'],
       });
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify(entries));
       return;
     }
 
-    // Building notes (no auth — used for note discovery between characters)
+    // findings.md P2:2376 — building notes and documents leak introspective
+    // LLM-generated content. Previously "public for character discovery"; now
+    // gated by interlink auth so only authenticated peer processes — not the
+    // open web — can enumerate them. Owners also allowed.
     if (url.pathname === '/api/building/notes' && req.method === 'GET') {
+      if (!isOwner(req)) { if (!verifyInterlinkAuth(req, res)) return; }
       const building = url.searchParams.get('building');
       if (!building) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -953,9 +1233,9 @@ export async function startWebServer(port = 3000): Promise<void> {
       return;
     }
 
-    // Documents by this character (no auth — for document discovery between characters)
     if (url.pathname === '/api/documents' && req.method === 'GET') {
-      const characterId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+      if (!isOwner(req)) { if (!verifyInterlinkAuth(req, res)) return; }
+      const characterId = process.env['LAIN_CHARACTER_ID'] || 'lain';
       const titleParam = url.searchParams.get('title');
       const docs = getDocumentsByAuthor(characterId);
       if (titleParam) {
@@ -1040,8 +1320,12 @@ export async function startWebServer(port = 3000): Promise<void> {
 
     // --- Town Events (admin-triggered events affecting all inhabitants) ---
 
-    // GET /api/town-events — read active events (no auth for character discovery)
+    // GET /api/town-events — read active events. Requires owner or interlink
+    // auth: the effects endpoint below can drive forceLocation, which a
+    // character consumer applies to its own movement, so we don't want the
+    // feed to be world-readable or world-pollutable-looking-authoritative.
     if (url.pathname === '/api/town-events' && req.method === 'GET') {
+      if (!isOwner(req) && !verifyInterlinkAuth(req, res)) return;
       const all = url.searchParams.get('all') === '1';
       const events = all ? getAllTownEvents(50) : getActiveTownEvents();
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1049,8 +1333,11 @@ export async function startWebServer(port = 3000): Promise<void> {
       return;
     }
 
-    // GET /api/town-events/effects — merged mechanical effects
+    // GET /api/town-events/effects — merged mechanical effects (forceLocation,
+    // weather, etc). Drives character behaviour on the consumer side, so the
+    // same auth bar as the events list applies.
     if (url.pathname === '/api/town-events/effects' && req.method === 'GET') {
+      if (!isOwner(req) && !verifyInterlinkAuth(req, res)) return;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(getActiveEffects()));
       return;
@@ -1102,18 +1389,15 @@ export async function startWebServer(port = 3000): Promise<void> {
 
     // ======= Dreams Dashboard (aggregator endpoints) =======
 
-    // Character definitions for dream aggregation
-    const DREAM_PEERS: Array<{ id: string; name: string; port: number }> = [
-      { id: 'neo', name: 'Neo', port: 3003 },
-      { id: 'plato', name: 'Plato', port: 3004 },
-      { id: 'joe', name: 'Joe', port: 3005 },
-    ];
+    // Character definitions for dream aggregation — from the manifest
+    const DREAM_PEERS = getHealthCheckTargets();
 
     function fetchPeerJson<T>(port: number, path: string): Promise<T | null> {
-      const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
+      const headers = getInterlinkHeaders();
+      if (!headers) return Promise.resolve(null);
       return new Promise((resolve) => {
         const req = httpRequest(
-          { hostname: '127.0.0.1', port, path, method: 'GET', headers: { 'Authorization': `Bearer ${interlinkToken}` }, timeout: 5000 },
+          { hostname: '127.0.0.1', port, path, method: 'GET', headers, timeout: 5000 },
           (pRes) => {
             const chunks: Buffer[] = [];
             pRes.on('data', (c: Buffer) => chunks.push(c));
@@ -1171,7 +1455,7 @@ export async function startWebServer(port = 3000): Promise<void> {
       // Fetch all seeds from all peers (larger limit to allow merge-sort)
       const peerResults = await Promise.all(
         DREAM_PEERS.map(async (peer) => {
-          // The main town server queries its own DB directly
+          // Wired Lain queries its own DB directly
           if (peer.port === 3000) {
             const seeds = query<{ id: string; content: string; metadata: string; created_at: number; emotional_weight: number }>(
               `SELECT id, content, metadata, created_at, emotional_weight FROM memories
@@ -1233,7 +1517,7 @@ export async function startWebServer(port = 3000): Promise<void> {
       const lastAssessment = getMeta('evolution:last_assessment_at');
       const inProgress = getMeta('evolution:succession_in_progress');
 
-      const characters = MORTAL_CHARACTERS.map(char => {
+      const characters = getMortalCharacters().map(char => {
         const lineage = lineages[char.id];
         const assessment = getMeta(`evolution:assessment:${char.id}`);
         const deferred = getMeta(`evolution:deferred:${char.id}`);
@@ -1279,7 +1563,8 @@ export async function startWebServer(port = 3000): Promise<void> {
     // In-memory ring buffer for recent conversation lines (max 100, 10 min TTL)
     // POST /api/conversations/event — characters post individual lines here (interlink auth)
     if (url.pathname === '/api/conversations/event' && req.method === 'POST') {
-      if (!verifyInterlinkAuth(req, res)) return;
+      const fromId = verifyInterlinkAuth(req, res);
+      if (!fromId) return;
       try {
         const body = await collectBody(req);
         const event = JSON.parse(body) as {
@@ -1294,6 +1579,11 @@ export async function startWebServer(port = 3000): Promise<void> {
         if (!event.speakerId || !event.message || !event.building) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Missing fields' }));
+          return;
+        }
+        const speakerCheck = assertBodyIdentity(fromId, event.speakerId);
+        if (!speakerCheck.ok) {
+          rejectBodyIdentityMismatch(res, speakerCheck.reason);
           return;
         }
         conversationBuffer.push(event);
@@ -1357,6 +1647,9 @@ export async function startWebServer(port = 3000): Promise<void> {
     // POST /api/buildings/:id/event — record a building event (interlink auth)
     if (url.pathname.match(/^\/api\/buildings\/[^/]+\/event$/) && req.method === 'POST') {
       if (!verifyInterlinkAuth(req, res)) return;
+      // building events are low-stakes shared memory; no identity field in
+      // the body to bind to. Any authenticated character may post events for
+      // any building they claim to be in.
       try {
         const buildingId = decodeURIComponent(url.pathname.split('/')[3]!);
         const body = await collectBody(req);
@@ -1415,6 +1708,7 @@ export async function startWebServer(port = 3000): Promise<void> {
 
     // GET /api/objects — list objects (optional ?location=X or ?owner=X)
     if (url.pathname === '/api/objects' && req.method === 'GET') {
+      expireStaleObjects();
       const location = url.searchParams.get('location');
       const owner = url.searchParams.get('owner');
       let objects;
@@ -1432,6 +1726,7 @@ export async function startWebServer(port = 3000): Promise<void> {
 
     // GET /api/objects/:id — get single object
     if (url.pathname.match(/^\/api\/objects\/[^/]+$/) && req.method === 'GET') {
+      expireStaleObjects();
       const id = url.pathname.slice('/api/objects/'.length);
       const obj = getObject(id);
       if (!obj) {
@@ -1446,7 +1741,8 @@ export async function startWebServer(port = 3000): Promise<void> {
 
     // POST /api/objects — create a new object (interlink auth)
     if (url.pathname === '/api/objects' && req.method === 'POST') {
-      if (!verifyInterlinkAuth(req, res)) return;
+      const fromId = verifyInterlinkAuth(req, res);
+      if (!fromId) return;
       try {
         const body = await collectBody(req);
         const { name, description, creatorId, creatorName, location } = JSON.parse(body) as {
@@ -1457,9 +1753,28 @@ export async function startWebServer(port = 3000): Promise<void> {
           res.end(JSON.stringify({ error: 'name, description, creatorId, and location are required' }));
           return;
         }
+        const creatorCheck = assertBodyIdentity(fromId, creatorId);
+        if (!creatorCheck.ok) {
+          rejectBodyIdentityMismatch(res, creatorCheck.reason);
+          return;
+        }
+        // findings.md P2:1188 — sanitize() now clears .sanitized to '' on
+        // block paths, but we still must check .blocked and refuse with a
+        // 400 rather than silently storing empty strings as the object's
+        // name/description.
+        const nameCheck = sanitize(name);
+        const descCheck = sanitize(description);
+        if (nameCheck.blocked || descCheck.blocked) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: 'Object name or description blocked by input sanitizer',
+            reason: nameCheck.reason ?? descCheck.reason,
+          }));
+          return;
+        }
         const obj = createObject(
-          sanitize(name).sanitized.slice(0, 100),
-          sanitize(description).sanitized.slice(0, 500),
+          nameCheck.sanitized.slice(0, 100),
+          descCheck.sanitized.slice(0, 500),
           creatorId, creatorName, location
         );
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1473,7 +1788,8 @@ export async function startWebServer(port = 3000): Promise<void> {
 
     // POST /api/objects/:id/pickup — pick up from ground (interlink auth)
     if (url.pathname.match(/^\/api\/objects\/[^/]+\/pickup$/) && req.method === 'POST') {
-      if (!verifyInterlinkAuth(req, res)) return;
+      const fromId = verifyInterlinkAuth(req, res);
+      if (!fromId) return;
       try {
         const id = url.pathname.split('/')[3]!;
         // Block fixture pickup
@@ -1484,6 +1800,11 @@ export async function startWebServer(port = 3000): Promise<void> {
         }
         const body = await collectBody(req);
         const { characterId, characterName } = JSON.parse(body) as { characterId: string; characterName: string };
+        const charCheck = assertBodyIdentity(fromId, characterId);
+        if (!charCheck.ok) {
+          rejectBodyIdentityMismatch(res, charCheck.reason);
+          return;
+        }
         const ok = pickupObject(id, characterId, characterName);
         if (!ok) {
           res.writeHead(409, { 'Content-Type': 'application/json' });
@@ -1501,11 +1822,17 @@ export async function startWebServer(port = 3000): Promise<void> {
 
     // POST /api/objects/:id/drop — drop from inventory (interlink auth)
     if (url.pathname.match(/^\/api\/objects\/[^/]+\/drop$/) && req.method === 'POST') {
-      if (!verifyInterlinkAuth(req, res)) return;
+      const fromId = verifyInterlinkAuth(req, res);
+      if (!fromId) return;
       try {
         const id = url.pathname.split('/')[3]!;
         const body = await collectBody(req);
         const { characterId, location } = JSON.parse(body) as { characterId: string; location: string };
+        const charCheck = assertBodyIdentity(fromId, characterId);
+        if (!charCheck.ok) {
+          rejectBodyIdentityMismatch(res, charCheck.reason);
+          return;
+        }
         const ok = dropObject(id, characterId, location);
         if (!ok) {
           res.writeHead(409, { 'Content-Type': 'application/json' });
@@ -1523,7 +1850,8 @@ export async function startWebServer(port = 3000): Promise<void> {
 
     // POST /api/objects/:id/give — transfer to another character (interlink auth)
     if (url.pathname.match(/^\/api\/objects\/[^/]+\/give$/) && req.method === 'POST') {
-      if (!verifyInterlinkAuth(req, res)) return;
+      const authFromId = verifyInterlinkAuth(req, res);
+      if (!authFromId) return;
       try {
         const id = url.pathname.split('/')[3]!;
         // Block fixture transfer
@@ -1534,6 +1862,11 @@ export async function startWebServer(port = 3000): Promise<void> {
         }
         const body = await collectBody(req);
         const { fromId, toId, toName } = JSON.parse(body) as { fromId: string; toId: string; toName: string };
+        const fromCheck = assertBodyIdentity(authFromId, fromId);
+        if (!fromCheck.ok) {
+          rejectBodyIdentityMismatch(res, fromCheck.reason);
+          return;
+        }
         const ok = transferObject(id, fromId, toId, toName);
         if (!ok) {
           res.writeHead(409, { 'Content-Type': 'application/json' });
@@ -1551,7 +1884,8 @@ export async function startWebServer(port = 3000): Promise<void> {
 
     // DELETE /api/objects/:id — destroy an object (interlink auth)
     if (url.pathname.match(/^\/api\/objects\/[^/]+$/) && req.method === 'DELETE') {
-      if (!verifyInterlinkAuth(req, res)) return;
+      const fromId = verifyInterlinkAuth(req, res);
+      if (!fromId) return;
       try {
         const id = url.pathname.slice('/api/objects/'.length);
         // Block fixture destruction
@@ -1562,6 +1896,11 @@ export async function startWebServer(port = 3000): Promise<void> {
         }
         const body = await collectBody(req);
         const { characterId } = JSON.parse(body) as { characterId: string };
+        const charCheck = assertBodyIdentity(fromId, characterId);
+        if (!charCheck.ok) {
+          rejectBodyIdentityMismatch(res, charCheck.reason);
+          return;
+        }
         const ok = destroyObject(id, characterId);
         if (!ok) {
           res.writeHead(409, { 'Content-Type': 'application/json' });
@@ -1602,7 +1941,7 @@ export async function startWebServer(port = 3000): Promise<void> {
     // API endpoint for streaming chat (SSE)
     if (url.pathname === '/api/chat/stream' && req.method === 'POST') {
       if (!verifyApiAuth(req, res)) return;
-      const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+      const clientIp = getClientIp(req);
       if (!checkRateLimit(clientIp)) {
         res.writeHead(429, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Too many requests' }));
@@ -1629,7 +1968,7 @@ export async function startWebServer(port = 3000): Promise<void> {
     // API endpoint for chat (non-streaming fallback)
     if (url.pathname === '/api/chat' && req.method === 'POST') {
       if (!verifyApiAuth(req, res)) return;
-      const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+      const clientIp = getClientIp(req);
       if (!checkRateLimit(clientIp)) {
         res.writeHead(429, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Too many requests' }));
@@ -1656,14 +1995,16 @@ export async function startWebServer(port = 3000): Promise<void> {
     // --- Peer message (direct from commune inhabitants, interlink auth required) ---
 
     if (url.pathname === '/api/peer/message' && req.method === 'POST') {
-      if (!verifyInterlinkAuth(req, res)) return;
+      const authFromId = verifyInterlinkAuth(req, res);
+      if (!authFromId) return;
       try {
         const body = await collectBody(req);
-        const { fromId, fromName, message } = JSON.parse(body) as {
+        const { fromId, fromName, message, possessed } = JSON.parse(body) as {
           fromId: string;
           fromName: string;
           message: string;
           timestamp?: number;
+          possessed?: boolean;
         };
 
         if (!fromId || !fromName || !message) {
@@ -1671,16 +2012,31 @@ export async function startWebServer(port = 3000): Promise<void> {
           res.end(JSON.stringify({ error: 'Missing required fields: fromId, fromName, message' }));
           return;
         }
+        const fromCheck = assertBodyIdentity(authFromId, fromId);
+        if (!fromCheck.ok) {
+          rejectBodyIdentityMismatch(res, fromCheck.reason);
+          return;
+        }
 
         const sessionId = `peer:${fromId}:${Date.now()}`;
+        // findings.md P2:2942 — owner typing via /api/possession/say on a
+        // possessable character advertises `possessed: true`. Prefix the
+        // content so downstream context is unambiguous and tag metadata
+        // so store.ts persists the flag (src/memory/store.ts:148).
+        const contentText = possessed
+          ? `(possession: owner-authored) ${message}`
+          : message;
         const incomingMsg: IncomingMessage = {
           id: nanoid(16),
-          channel: 'web',
+          // findings.md P2:215 — direct inter-character traffic over the
+          // interlink is a distinct channel from web-user chat.
+          channel: 'peer',
           peerKind: 'user',
           peerId: sessionId,
           senderId: fromName,
-          content: { type: 'text', text: message } satisfies TextContent,
+          content: { type: 'text', text: contentText } satisfies TextContent,
           timestamp: Date.now(),
+          ...(possessed ? { metadata: { peerPossessed: true } } : {}),
         };
 
         const agentResponse = await processMessage({
@@ -1705,9 +2061,72 @@ export async function startWebServer(port = 3000): Promise<void> {
 
     // --- Interlink endpoints ---
 
+    // findings.md P2:2348 — owner-nonce authority endpoints. Only served by
+    // Wired Lain (other servers don't own the table); interlink auth gates
+    // cross-server access the same way interlink letters/research-requests
+    // are gated. Routes:
+    //   GET    /api/interlink/owner-nonce/:nonce  -> { revoked: boolean } | 404
+    //   DELETE /api/interlink/owner-nonce/:nonce  -> 204 (revoke single)
+    //   DELETE /api/interlink/owner-nonces        -> { count } (revoke all)
+    if (url.pathname.startsWith('/api/interlink/owner-nonce')) {
+      if (process.env['LAIN_CHARACTER_ID'] !== 'wired-lain') {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'owner-nonce authority is on Wired Lain only' }));
+        return;
+      }
+      if (!verifyInterlinkAuth(req, res)) return;
+
+      if (url.pathname === '/api/interlink/owner-nonces' && req.method === 'DELETE') {
+        const count = revokeAllNonces();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ count }));
+        return;
+      }
+
+      // Per-nonce: /api/interlink/owner-nonce/<urlencoded-nonce>
+      const prefix = '/api/interlink/owner-nonce/';
+      if (url.pathname.startsWith(prefix)) {
+        const nonce = decodeURIComponent(url.pathname.slice(prefix.length));
+        if (!nonce) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Missing nonce' }));
+          return;
+        }
+        if (req.method === 'GET') {
+          // localIsRevoked returns true for unknown (treat-as-revoked), but
+          // callers want to distinguish unknown (forged or purged) from
+          // known-revoked. We probe the DB directly for an authoritative
+          // yes/no/404.
+          const db = getDatabase();
+          const row = db.prepare('SELECT revoked_at FROM owner_nonces WHERE nonce = ?').get(nonce) as
+            | { revoked_at: number | null }
+            | undefined;
+          if (!row) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'unknown nonce' }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ revoked: row.revoked_at !== null }));
+          return;
+        }
+        if (req.method === 'DELETE') {
+          revokeNonce(nonce);
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+      }
+
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Method not allowed' }));
+      return;
+    }
+
     if (url.pathname === '/api/interlink/letter' && req.method === 'POST') {
       try {
-        if (!verifyInterlinkAuth(req, res)) return;
+        const senderId = verifyInterlinkAuth(req, res);
+        if (!senderId) return;
         const body = await collectBody(req);
 
         let letter: WiredLetter;
@@ -1729,16 +2148,14 @@ export async function startWebServer(port = 3000): Promise<void> {
 
         const processed = await paraphraseLetter(letter);
 
-        // Determine who sent this letter based on our own identity
-        const myId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
-        const correspondent = myId === 'wired-lain'
-          ? { name: 'Lain', id: 'lain', sessionPrefix: 'lain:letter' }
-          : myId === 'lain'
-            ? { name: 'Wired Lain', id: 'wired-lain', sessionPrefix: 'wired:letter' }
-            : { name: 'The Town', id: 'town', sessionPrefix: 'town:letter' };
-        const sisterName = correspondent.name;
-        const sisterId = correspondent.id;
-        const sessionPrefix = correspondent.sessionPrefix;
+        // Attribute the letter to the authenticated sender. The manifest
+        // supplies the display name; fall back to the id if unregistered
+        // (shouldn't happen in practice, but we don't want to crash here).
+        const { getCharacterEntry } = await import('../config/characters.js');
+        const senderEntry = getCharacterEntry(senderId);
+        const sisterName = senderEntry?.name ?? senderId;
+        const sisterId = senderId;
+        const sessionPrefix = `${senderId}:letter`;
 
         const memoryId = await saveMemory({
           sessionKey: `${sessionPrefix}`,
@@ -1757,7 +2174,9 @@ export async function startWebServer(port = 3000): Promise<void> {
         const letterSessionId = `${sessionPrefix}:${Date.now()}`;
         const incomingLetter: IncomingMessage = {
           id: nanoid(16),
-          channel: 'web',
+          // findings.md P2:215 — letter-as-chat delivery is peer-origin,
+          // not user-origin; labelling it `'peer'` keeps analytics clean.
+          channel: 'peer',
           peerKind: 'user',
           peerId: letterSessionId,
           senderId: sisterId,
@@ -1867,15 +2286,20 @@ export async function startWebServer(port = 3000): Promise<void> {
     // --- Research request endpoint (characters petition Wired Lain) ---
 
     if (url.pathname === '/api/interlink/research-request' && req.method === 'POST') {
-      const researchEnabled = process.env['ENABLE_RESEARCH'] === '1';
-      // Only Wired Lain handles research requests, and Newtown keeps this disabled by default.
-      if (!researchEnabled || characterId !== 'wired-lain') {
+      if (!isResearchEnabled()) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not found' }));
+        return;
+      }
+      // Only Wired Lain handles research requests
+      if (characterId !== 'wired-lain') {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Not found' }));
         return;
       }
       try {
-        if (!verifyInterlinkAuth(req, res)) return;
+        const authFromId = verifyInterlinkAuth(req, res);
+        if (!authFromId) return;
         const body = await collectBody(req);
 
         let parsed: {
@@ -1907,6 +2331,11 @@ export async function startWebServer(port = 3000): Promise<void> {
         if (!characterId || !characterName || !question || !replyTo) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Missing required fields' }));
+          return;
+        }
+        const requesterCheck = assertBodyIdentity(authFromId, characterId);
+        if (!requesterCheck.ok) {
+          rejectBodyIdentityMismatch(res, requesterCheck.reason);
           return;
         }
 
@@ -1958,53 +2387,47 @@ export async function startWebServer(port = 3000): Promise<void> {
       }
 
       try {
-        const [dfResult, freeResult, uptimeResult] = await Promise.all([
-          execAsync('df -h / | tail -1', { timeout: 5000 }),
-          execAsync('free -b | grep -E "^Mem|^Swap"', { timeout: 5000 }),
-          execAsync('uptime', { timeout: 5000 }),
-        ]);
-
-        const dfParts = dfResult.stdout.trim().split(/\s+/);
-        const disk = {
-          total: dfParts[1] || '?',
-          used: dfParts[2] || '?',
-          available: dfParts[3] || '?',
-          percent: parseInt(dfParts[4] || '0', 10),
-        };
-
-        const freeLines = freeResult.stdout.trim().split('\n');
-        const memParts = freeLines[0]?.split(/\s+/) || [];
-        const swapParts = freeLines[1]?.split(/\s+/) || [];
+        const disk = await getDiskStats();
+        const totalMem = os.totalmem();
+        const freeMem = os.freemem();
+        const usedMem = Math.max(0, totalMem - freeMem);
         const ram = {
-          total: memParts[1] || '?',
-          used: memParts[2] || '?',
-          free: memParts[3] || '?',
-          percent: memParts[1] && memParts[2]
-            ? Math.round((parseFloat(memParts[2]) / parseFloat(memParts[1])) * 100)
-            : 0,
+          total: String(totalMem),
+          used: String(usedMem),
+          free: String(freeMem),
+          percent: totalMem > 0 ? Math.round((usedMem / totalMem) * 100) : 0,
         };
         const swap = {
-          total: swapParts[1] || '?',
-          used: swapParts[2] || '?',
-          free: swapParts[3] || '?',
-          percent: swapParts[1] && swapParts[2]
-            ? Math.round((parseFloat(swapParts[2]) / parseFloat(swapParts[1])) * 100)
-            : 0,
+          total: '0',
+          used: '0',
+          free: '0',
+          percent: 0,
         };
-
-        const uptimeOut = uptimeResult.stdout.trim();
-        const loadMatch = uptimeOut.match(/load average[s]?:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)/);
-        const load = loadMatch
-          ? [parseFloat(loadMatch[1] ?? '0'), parseFloat(loadMatch[2] ?? '0'), parseFloat(loadMatch[3] ?? '0')]
-          : [0, 0, 0];
-        const uptimeMatch = uptimeOut.match(/up\s+(.+?),\s+\d+\s+user/);
-        const uptime = uptimeMatch?.[1]?.trim() || '?';
+        if (process.platform !== 'win32') {
+          try {
+            const freeResult = await execAsync('free -b | grep -E "^Swap"', { timeout: 5000 });
+            const swapParts = freeResult.stdout.trim().split(/\s+/);
+            const swapTotal = Number(swapParts[1] || 0);
+            const swapUsed = Number(swapParts[2] || 0);
+            const swapFree = Number(swapParts[3] || 0);
+            swap.total = String(swapTotal);
+            swap.used = String(swapUsed);
+            swap.free = String(swapFree);
+            swap.percent = swapTotal > 0 ? Math.round((swapUsed / swapTotal) * 100) : 0;
+          } catch {
+            // Swap is optional; keep zeroed values.
+          }
+        }
+        const load = os.loadavg().map(v => Number(v.toFixed(2)));
+        const uptime = formatUptime(os.uptime());
 
         // Service status for non-HTTP services
         let telegramActive = false;
         let gatewayActive = false;
-        try { await execAsync('systemctl is-active lain-telegram', { timeout: 3000 }); telegramActive = true; } catch { /* inactive */ }
-        try { await execAsync('systemctl is-active lain-gateway', { timeout: 3000 }); gatewayActive = true; } catch { /* inactive */ }
+        if (process.platform !== 'win32') {
+          try { await execAsync('systemctl is-active lain-telegram', { timeout: 3000 }); telegramActive = true; } catch { /* inactive */ }
+          try { await execAsync('systemctl is-active lain-gateway', { timeout: 3000 }); gatewayActive = true; } catch { /* inactive */ }
+        }
 
         res.writeHead(200, {
           'Content-Type': 'application/json',
@@ -2020,11 +2443,11 @@ export async function startWebServer(port = 3000): Promise<void> {
     }
 
     // Proxy requests for other character servers (when accessed directly, not through nginx)
-    const CHARACTER_PORTS: Record<string, number> = {
-      '/neo/': 3003,
-      '/plato/': 3004,
-      '/joe/': 3005,
-    };
+    // findings.md P2:2388 — derive from manifest so a rename only needs to land in
+    // characters.json.
+    const CHARACTER_PORTS: Record<string, number> = Object.fromEntries(
+      getAllCharacters().map(c => [`/${c.id}/`, c.port])
+    );
     for (const [prefix, targetPort] of Object.entries(CHARACTER_PORTS)) {
       if (url.pathname.startsWith(prefix)) {
         const targetPath = '/' + url.pathname.slice(prefix.length) + url.search;
@@ -2075,7 +2498,6 @@ export async function startWebServer(port = 3000): Promise<void> {
       return;
     }
 
-    // Serve generated newspaper editions from runtime data.
     if (url.pathname.startsWith('/newspapers/')) {
       const newspaperPath = url.pathname.slice('/newspapers/'.length);
       const file = await serveFromDir(NEWSPAPERS_DIR, newspaperPath);
@@ -2132,10 +2554,9 @@ export async function startWebServer(port = 3000): Promise<void> {
     }
   });
 
-  // Expire stale town events every 5 minutes
-  setInterval(() => {
-    try { expireStaleEvents(); } catch { /* ignore */ }
-  }, 5 * 60 * 1000);
+  // findings.md P2:285 — shared scheduler so every town_events writer
+  // (web + character servers) runs the same expiry cadence.
+  startExpireStaleEventsLoop();
 
   server.listen(port, () => {
     console.log(`
@@ -2157,8 +2578,6 @@ export async function startWebServer(port = 3000): Promise<void> {
 
     // Character-aware loop starting
     const isWired = characterId === 'wired-lain';
-    const hasSisterLetterLoop = characterId === 'lain' || characterId === 'wired-lain';
-    const enableDoctorLoop = characterId !== 'newtown';
     const stopFns: Array<() => void> = [];
 
     // Both sisters get these loops
@@ -2167,24 +2586,30 @@ export async function startWebServer(port = 3000): Promise<void> {
     stopFns.push(startSelfConceptLoop());
     stopFns.push(startNarrativeLoop());
     stopFns.push(startMemoryMaintenanceLoop());
+    // findings.md P2:1473 — schedule a periodic prune of expired
+    // building_events instead of running a DELETE on every residue
+    // read. Harmless on character DBs where the table stays empty;
+    // does real work on Wired Lain where events accumulate.
+    stopFns.push(startBuildingMemoryPruneLoop(getDatabase()));
     stopFns.push(startDreamLoop());
     if (characterId === 'newtown') {
       stopFns.push(startNewspaperPublishingLoop(
         getDefaultNewtownNewspaperConfig(NEWSPAPERS_DIR)
       ));
     }
-    if (hasSisterLetterLoop) {
-      stopFns.push(startLetterLoop());
-    }
-    if (enableDoctorLoop) {
-      stopFns.push(startDoctorLoop());
-    }
+    stopFns.push(startLetterLoop());
+    stopFns.push(startDoctorLoop());
     stopFns.push(startDesireLoop());
 
-    // Both get curiosity (Wired has unrestricted; Lain has whitelisted)
-    stopFns.push(startCuriosityLoop());
+      if (isResearchEnabled()) {
+        stopFns.push(startCuriosityLoop());
+      }
 
     if (isWired) {
+      // Wired Lain owns the canonical object registry; prune loose ground
+      // objects on a cadence so WALK does not accumulate forever.
+      stopFns.push(startObjectExpiryLoop());
+
       // Wired Lain only: bibliomancy + experiments + book + dossiers
       stopFns.push(startBibliomancyLoop());
       stopFns.push(startExperimentLoop());
@@ -2211,9 +2636,12 @@ export async function startWebServer(port = 3000): Promise<void> {
       stopFns.push(startWeatherLoop());
 
       console.log(`  Character: Wired Lain (bibliomancy + experiments + book + dossiers + novelty + dream-seeder + evolution + feed-health + weather enabled, proactive disabled)`);
-    } else if (characterId === 'newtown') {
-      console.log('  Character: Newtown (guide loops enabled, sister-specific loops disabled)');
     } else {
+      // findings.md P2:1505 — non-WL characters warm a local cache of
+      // WL's /api/weather so internal-state.ts and agent prompts can
+      // consume the town's authoritative weather.
+      stopFns.push(startTownWeatherRefreshLoop());
+
       // Lain only: proactive Telegram outreach (currently disabled)
       // stopFns.push(startProactiveLoop());
       console.log(`  Character: Lain (proactive disabled, bibliomancy disabled)`);
@@ -2233,99 +2661,13 @@ export async function startWebServer(port = 3000): Promise<void> {
 }
 
 // --- Web search with fallback ---
-
-const SEARCH_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-
-function parseDdgHtml(html: string): string[] {
-  const results: string[] = [];
-  const blocks = html.split(/class="result\s+results_links/g);
-  for (let i = 1; i < blocks.length && results.length < 5; i++) {
-    const block = blocks[i] || '';
-    const linkMatch = block.match(/class="result__a"[^>]*href="([^"]+)"[^>]*>([^<]+)</);
-    const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
-    if (linkMatch) {
-      const title = linkMatch[2]?.trim() || '';
-      const snippet = snippetMatch?.[1]?.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() || '';
-      results.push(`${title}\n${snippet}\n${linkMatch[1]}`);
-    }
-  }
-  return results;
-}
-
-function parseDdgLite(html: string): string[] {
-  const results: string[] = [];
-  // DDG lite uses simple <a> tags with class="result-link" and <td> for snippets
-  const rows = html.split(/<tr>/g);
-  for (const row of rows) {
-    if (results.length >= 5) break;
-    const linkMatch = row.match(/class="result-link"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/);
-    if (linkMatch) {
-      const url = linkMatch[1]?.trim() || '';
-      const title = linkMatch[2]?.replace(/<[^>]+>/g, '').trim() || '';
-      // The snippet is typically in the next <td class="result-snippet">
-      const snippetMatch = row.match(/class="result-snippet"[^>]*>([\s\S]*?)<\/td>/);
-      const snippet = snippetMatch?.[1]?.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() || '';
-      if (title || snippet) {
-        results.push(`${title}\n${snippet}\n${url}`);
-      }
-    }
-  }
-  return results;
-}
+// Delegates to src/utils/web-search.ts (DDG HTML → DDG Lite → Wikipedia).
 
 async function webSearch(question: string): Promise<string> {
-  // Try DDG HTML first
-  try {
-    const resp = await fetch('https://html.duckduckgo.com/html/', {
-      method: 'POST',
-      headers: { 'User-Agent': SEARCH_UA, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `q=${encodeURIComponent(question)}`,
-      signal: AbortSignal.timeout(15000),
-    });
-    if (resp.ok) {
-      const results = parseDdgHtml(await resp.text());
-      if (results.length > 0) return results.join('\n\n');
-    }
-  } catch {
-    console.log('[Research] DDG HTML search failed, trying fallback');
-  }
-
-  // Fallback: DDG Lite (different HTML, often more reliable)
-  try {
-    const resp = await fetch(`https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(question)}`, {
-      headers: { 'User-Agent': SEARCH_UA },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (resp.ok) {
-      const results = parseDdgLite(await resp.text());
-      if (results.length > 0) return results.join('\n\n');
-    }
-  } catch {
-    console.log('[Research] DDG Lite search failed, trying fallback');
-  }
-
-  // Fallback: Wikipedia API search (useful for factual queries)
-  try {
-    const resp = await fetch(
-      `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(question)}&format=json&srlimit=3&utf8=1`,
-      { headers: { 'User-Agent': SEARCH_UA }, signal: AbortSignal.timeout(10000) },
-    );
-    if (resp.ok) {
-      const data = await resp.json() as { query?: { search?: Array<{ title: string; snippet: string }> } };
-      const items = data.query?.search ?? [];
-      if (items.length > 0) {
-        const results = items.map((item) => {
-          const snippet = item.snippet.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
-          return `${item.title}\n${snippet}\nhttps://en.wikipedia.org/wiki/${encodeURIComponent(item.title.replace(/ /g, '_'))}`;
-        });
-        return results.join('\n\n');
-      }
-    }
-  } catch {
-    console.log('[Research] Wikipedia search also failed');
-  }
-
-  return `No search results found for "${question}"`;
+  const { searchWeb } = await import('../utils/web-search.js');
+  const results = await searchWeb(question);
+  if (results.length === 0) return `No search results found for "${question}"`;
+  return results.map((r) => `${r.title}\n${r.snippet}\n${r.url}`).join('\n\n');
 }
 
 // --- Research request handler (runs in background) ---
@@ -2439,26 +2781,38 @@ Compose a response letter to ${characterName}. Write it as Wired Lain — in you
   const responseContent = llmResult.content;
 
   // Deliver as a WiredLetter to the character
-  const token = process.env['LAIN_INTERLINK_TOKEN'];
-  if (!token) {
-    console.error('[Research] Cannot deliver response: LAIN_INTERLINK_TOKEN not set');
+  const headers = getInterlinkHeaders();
+  if (!headers) {
+    console.error('[Research] Cannot deliver response: interlink not configured');
     return;
   }
 
-  const letter: WiredLetter = {
+  // Include senderId so the recipient attributes the letter correctly.
+  // It must match the authenticated X-Interlink-From (this process's
+  // LAIN_CHARACTER_ID) — the recipient rejects mismatches.
+  const senderId = process.env['LAIN_CHARACTER_ID']!;
+  const letter: WiredLetter & { senderId?: string } = {
     topics: [question],
     impressions: [responseContent],
-    gift: researchContent.slice(0, 2000),
+    gift: researchContent,
     emotionalState: 'curious',
+    senderId,
   };
+
+  // SSRF guard: `replyTo` comes from an interlink-authenticated caller, so
+  // treat it as attacker-controllable. Only allow http://loopback on a known
+  // character-manifest port — the only legitimate shape of a peer URL in
+  // this deployment.
+  const allowedPorts = getAllCharacters().map(c => c.port);
+  if (!isAllowedReplyTo(replyTo, allowedPorts)) {
+    console.error(`[Research] Refusing delivery to disallowed replyTo: ${replyTo}`);
+    return;
+  }
 
   try {
     const deliveryResponse = await fetch(`${replyTo}/api/interlink/letter`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
-      },
+      headers,
       body: JSON.stringify(letter),
       signal: AbortSignal.timeout(15000),
     });
@@ -2469,7 +2823,7 @@ Compose a response letter to ${characterName}. Write it as Wired Lain — in you
       await saveMemory({
         sessionKey: `research:delivered:${requestId}`,
         userId: null,
-        content: `sent research findings to ${characterName} about "${question}": ${responseContent.slice(0, 500)}`,
+        content: `sent research findings to ${characterName} about "${question}": ${responseContent}`,
         memoryType: 'episode',
         importance: 0.5,
         emotionalWeight: 0.4,

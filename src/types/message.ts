@@ -37,29 +37,38 @@ export interface TextContent {
   text: string;
 }
 
-export interface ImageContent {
+/**
+ * findings.md P2:199 — media payloads require at least one pointer to
+ * the bytes. The legacy shape had both `url?` and `base64?` optional,
+ * which TypeScript accepted as `{ type: 'image', mimeType: 'image/png' }`
+ * with no data pointer at all, forcing every downstream consumer
+ * (agent/conversation.ts et al) into defensive null checks that we
+ * sometimes forgot. Model the constraint at the type level: either
+ * `url` is a string, or `base64` is a string. Both may be populated
+ * (e.g. a channel that caches the download locally) but neither alone
+ * is allowed.
+ */
+export type MediaPayload =
+  | { url: string; base64?: string }
+  | { url?: string; base64: string };
+
+export type ImageContent = MediaPayload & {
   type: 'image';
-  url?: string;
-  base64?: string;
   mimeType: string;
   caption?: string;
-}
+};
 
-export interface FileContent {
+export type FileContent = MediaPayload & {
   type: 'file';
-  url?: string;
-  base64?: string;
   mimeType: string;
   filename: string;
-}
+};
 
-export interface AudioContent {
+export type AudioContent = MediaPayload & {
   type: 'audio';
-  url?: string;
-  base64?: string;
   mimeType: string;
   duration?: number;
-}
+};
 
 export interface AgentRequest {
   sessionKey: string;

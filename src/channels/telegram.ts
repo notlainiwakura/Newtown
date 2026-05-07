@@ -13,6 +13,13 @@ export interface TelegramConfig extends ChannelConfig {
   token: string;
   allowedUsers?: string[];
   allowedGroups?: string[];
+  /**
+   * Explicit opt-in to serve every user on the platform when no
+   * allowedUsers/allowedGroups are configured. Default is fail-closed —
+   * empty allowlists reject all senders. Set `true` only if you really
+   * want a bot that answers anyone who discovers the handle.
+   */
+  public?: boolean;
 }
 
 export class TelegramChannel extends BaseChannel {
@@ -40,6 +47,22 @@ export class TelegramChannel extends BaseChannel {
     }
 
     logger.info({ channelId: this.id }, 'Connecting Telegram bot');
+
+    const emptyAllowlists =
+      !this.config.allowedUsers?.length && !this.config.allowedGroups?.length;
+    if (emptyAllowlists) {
+      if (this.config.public === true) {
+        logger.warn(
+          { channelId: this.id },
+          'Telegram channel running in PUBLIC mode — every user on the platform can message this bot',
+        );
+      } else {
+        logger.warn(
+          { channelId: this.id },
+          'Telegram channel has empty allowlists and public !== true — all incoming messages will be rejected. Set public: true or populate allowedUsers/allowedGroups.',
+        );
+      }
+    }
 
     this.bot = new Bot(this.config.token);
 
@@ -211,9 +234,10 @@ export class TelegramChannel extends BaseChannel {
       return false;
     }
 
-    // If no restrictions, allow all
+    // Empty allowlists are fail-closed by default. Only serve every user
+    // when the operator has explicitly set `public: true` in the config.
     if (!this.config.allowedUsers?.length && !this.config.allowedGroups?.length) {
-      return true;
+      return this.config.public === true;
     }
 
     // Check user whitelist
@@ -236,30 +260,26 @@ export class TelegramChannel extends BaseChannel {
 
     let content: IncomingMessage['content'];
 
+    // findings.md P2:199 — Telegram media requires a separate getFile /
+    // download round-trip; we don't do that here, so emit a text
+    // placeholder instead of a media content with no url/base64.
     if (mediaType === 'photo') {
-      const imageContent: IncomingMessage['content'] = {
-        type: 'image',
-        mimeType: 'image/jpeg',
-      };
-      if (msg.caption) {
-        (imageContent as { caption?: string }).caption = msg.caption;
-      }
-      content = imageContent;
-    } else if (mediaType === 'document') {
+      const caption = msg.caption ? ' ' + msg.caption : '';
       content = {
-        type: 'file',
-        mimeType: msg.document?.mime_type ?? 'application/octet-stream',
-        filename: msg.document?.file_name ?? 'document',
-      };
+        type: 'text',
+        text: '[image attachment]' + caption,
+      } satisfies TextContent;
+    } else if (mediaType === 'document') {
+      const filename = msg.document?.file_name ?? 'document';
+      content = {
+        type: 'text',
+        text: '[file attachment: ' + filename + ']',
+      } satisfies TextContent;
     } else if (mediaType === 'voice') {
-      const audioContent: IncomingMessage['content'] = {
-        type: 'audio',
-        mimeType: 'audio/ogg',
-      };
-      if (msg.voice?.duration !== undefined) {
-        (audioContent as { duration?: number }).duration = msg.voice.duration;
-      }
-      content = audioContent;
+      content = {
+        type: 'text',
+        text: '[audio attachment]',
+      } satisfies TextContent;
     } else {
       content = {
         type: 'text',

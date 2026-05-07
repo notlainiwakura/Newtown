@@ -119,6 +119,17 @@ export async function trySendProactiveMessage(
   const logger = getLogger();
   const cfg: ProactiveConfig = { ...DEFAULT_CONFIG, ...config };
 
+  // Kill-switch. Default: DISABLED. Set PROACTIVE_OUTREACH_ENABLED=1 (or true/yes/on)
+  // to turn it on. The old inverted PROACTIVE_OUTREACH_DISABLED!=='0' check was a
+  // trap — any sensible value ('false', 'no', 'off') kept it disabled, and only
+  // the literal string '0' enabled it.
+  const enabledRaw = (process.env['PROACTIVE_OUTREACH_ENABLED'] ?? '').trim().toLowerCase();
+  const enabled = enabledRaw === '1' || enabledRaw === 'true' || enabledRaw === 'yes' || enabledRaw === 'on';
+  if (!enabled) {
+    logger.debug({ trigger }, 'trySendProactiveMessage: disabled (PROACTIVE_OUTREACH_ENABLED not set)');
+    return false;
+  }
+
   const botToken = process.env['TELEGRAM_BOT_TOKEN'];
   const chatId = process.env['TELEGRAM_CHAT_ID'];
 
@@ -354,6 +365,7 @@ async function buildReflectionPrompt(
     if (stats.memories > 0) {
       const memories = await searchMemories('important context about the user', 8, 0.1, undefined, {
         sortBy: 'recency',
+        skipAccessBoost: true,
       });
       memoriesContext = memories
         .map((r) => `- [${r.memory.memoryType}] ${r.memory.content}`)

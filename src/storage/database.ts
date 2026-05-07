@@ -5,17 +5,18 @@
 import Database from 'better-sqlite3';
 import type { Database as DatabaseType } from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { StorageError } from '../utils/errors.js';
 import { deriveKey, generateSalt } from '../utils/crypto.js';
 import type { KeyDerivationConfig } from '../types/config.js';
 import { getMasterKey } from './keychain.js';
 import { getPaths } from '../config/paths.js';
+import { getLogger } from '../utils/logger.js';
 
 let db: DatabaseType | null = null;
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 17;
 
 const MIGRATIONS = [
   // Version 1: Initial schema
@@ -269,6 +270,95 @@ const MIGRATIONS = [
 
   CREATE VIRTUAL TABLE IF NOT EXISTS memory_embeddings USING vec0(embedding float[384] distance_metric=cosine, +memory_id text);
   `,
+  // Version 12: Owner session nonces for per-device revocation
+  // (findings.md P2:2348). Rows live on Wired Lain's DB; other servers
+  // query via the interlink endpoint. `revoked_at IS NULL` means active;
+  // a non-null value means the cookie carrying this nonce is rejected.
+  `
+  CREATE TABLE IF NOT EXISTS owner_nonces (
+    nonce TEXT PRIMARY KEY,
+    issued_at INTEGER NOT NULL,
+    device_label TEXT,
+    revoked_at INTEGER
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_owner_nonces_revoked ON owner_nonces(revoked_at);
+  `,
+  // Version 13: Promote the lazy town_events.source migration into the real
+  // migration path (findings.md P2:275). Previously `createTownEvent` and
+  // `getActiveTownEvents` each ran `ALTER TABLE town_events ADD COLUMN source
+  // TEXT` wrapped in a try/catch "column already exists" on every call. The
+  // migration runner catches "duplicate column name" so this ALTER is a
+  // no-op on DBs that already had the lazy migration applied.
+  `
+  ALTER TABLE town_events ADD COLUMN source TEXT;
+  `,
+  // Version 14: Covering index for the activity feed (findings.md P2:457).
+  // `getActivity` issues
+  //   SELECT ... FROM memories WHERE created_at BETWEEN ? AND ?
+  //     AND (session_key LIKE ? OR ...22 times)
+  //     ORDER BY created_at DESC LIMIT ?
+  // every time the dashboard / commune map loads. Until now `memories` had
+  // no index on `created_at`, so each call was a full scan + in-memory sort
+  // across the whole table (~15k rows on production). Adding an index on
+  // `created_at DESC` lets SQLite walk the time range in reverse, apply the
+  // prefix filter in-flight, and stop at LIMIT. Messages already has
+  // `idx_messages_timestamp`, which the planner uses in either direction.
+  `
+  CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at DESC);
+  `,
+  // Version 15: Embedding-model stamp (findings.md P2:517). Previously
+  // every row in `memory_embeddings` was assumed to come from the
+  // hard-coded `MODEL_NAME`. If the model were ever swapped, new vectors
+  // would be commingled with old vectors in the same cosine space and
+  // search quality would silently collapse — nothing in the code or
+  // schema would flag it. This column records which model produced each
+  // embedding so search-side code can exclude mismatched rows. Existing
+  // rows stay NULL and are treated as "presumed current" until a
+  // deliberate model swap triggers a backfill migration.
+  `
+  ALTER TABLE memories ADD COLUMN embedding_model TEXT;
+  `,
+  // Version 16: Object audit trail (findings.md P2:3364). Previously
+  // `destroyObject` hard-deleted the row and `transferObject` overwrote
+  // owner fields with no history. In a narrative simulation where objects
+  // are meant to be story artifacts, their provenance evaporated the
+  // moment they changed hands. This append-only ledger records every
+  // create/pickup/drop/transfer/destroy so the town's physical history is
+  // recoverable even after the underlying object row is gone.
+  `
+  CREATE TABLE IF NOT EXISTS object_events (
+    id TEXT PRIMARY KEY,
+    object_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    actor_name TEXT,
+    subject_id TEXT,
+    subject_name TEXT,
+    location TEXT,
+    metadata TEXT DEFAULT '{}',
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_object_events_object ON object_events(object_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_object_events_created ON object_events(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_object_events_type ON object_events(event_type);
+  `,
+  // Version 17: Ground object expiry. Loose character-created objects were
+  // accumulating forever on the WALK map. Fixtures and held inventory remain
+  // permanent; ground objects get a decay timestamp that the object store
+  // prunes and hides from map queries.
+  `
+  ALTER TABLE objects ADD COLUMN expires_at INTEGER;
+
+  UPDATE objects
+     SET expires_at = created_at + 259200000
+   WHERE owner_id IS NULL
+     AND expires_at IS NULL
+     AND (metadata IS NULL OR metadata NOT LIKE '%"fixture":true%');
+
+  CREATE INDEX IF NOT EXISTS idx_objects_expires ON objects(expires_at);
+  `,
 ];
 
 /**
@@ -289,8 +379,10 @@ export async function initDatabase(
     // Ensure directory exists
     await mkdir(dirname(path), { recursive: true });
 
-    // Get master key from keychain
-    const masterKey = await getMasterKey();
+    // Get master key from keychain.
+    // findings.md P2:383 — pass the DB path so a missing keychain
+    // entry cannot silently orphan an existing encrypted DB.
+    const masterKey = await getMasterKey(path);
 
     // Derive encryption key
     const config = keyDerivationConfig ?? {
@@ -300,8 +392,10 @@ export async function initDatabase(
       parallelism: 4,
     };
 
-    // Use a deterministic salt derived from the path for consistency
-    const salt = generateSalt(16);
+    // Persist salt alongside the DB so the derived SQLCipher key is stable
+    // across restarts. Salts are not secrets — they only need to be unique
+    // per derivation — so colocating with the DB is the correct primitive.
+    const salt = await loadOrCreateSalt(path);
 
     // For SQLCipher, we need a hex key
     const encryptionKey = await deriveKey(masterKey, salt, config);
@@ -313,14 +407,49 @@ export async function initDatabase(
     // Load sqlite-vec extension for vector similarity search
     sqliteVec.load(db);
 
-    // Configure SQLCipher (Note: better-sqlite3 needs to be compiled with SQLCipher)
-    // For standard better-sqlite3, we skip encryption but keep the API consistent
-    // In production, use better-sqlite3 with SQLCipher support
+    // Configure SQLCipher. Stock better-sqlite3 (no SQLCipher linkage) does
+    // NOT throw on `PRAGMA key` — it silently ignores unknown pragmas and
+    // leaves the DB plaintext. So a try/catch alone is insufficient; we must
+    // probe `PRAGMA cipher_version` to verify SQLCipher is actually present.
+    let pragmaError: unknown;
     try {
       db.pragma(`key = '${hexKey}'`);
-    } catch {
-      // SQLCipher not available, continue without encryption
-      // Log warning in production
+    } catch (err) {
+      pragmaError = err;
+    }
+
+    // cipher_version returns the SQLCipher version string when compiled in,
+    // or undefined/empty on stock SQLite (unknown pragma → no-op).
+    const cipherVersion = (() => {
+      try {
+        const rows = db.pragma('cipher_version') as Array<{ cipher_version?: string }>;
+        const row = rows[0];
+        return row?.cipher_version ?? null;
+      } catch {
+        return null;
+      }
+    })();
+    const encryptionActive = !pragmaError && !!cipherVersion;
+
+    if (!encryptionActive) {
+      const logger = getLogger();
+      const reason = pragmaError instanceof Error ? pragmaError.message : 'SQLCipher not linked into better-sqlite3';
+      if (process.env.LAIN_REQUIRE_ENCRYPTION === '1') {
+        // Close the connection before throwing so we don't leak an open
+        // plaintext DB handle that held the derived-key state.
+        try { db.close(); } catch { /* ignore */ }
+        db = null;
+        throw new StorageError(
+          `Database encryption required (LAIN_REQUIRE_ENCRYPTION=1) but unavailable: ${reason}. ` +
+          `Rebuild better-sqlite3 against SQLCipher (see https://github.com/WiseLibs/better-sqlite3/blob/master/docs/troubleshooting.md) ` +
+          `or unset LAIN_REQUIRE_ENCRYPTION to run plaintext.`
+        );
+      }
+      logger.warn(
+        { path, reason, requireEncryption: false },
+        'SQLCipher not active — database is running in PLAINTEXT. ' +
+        'Set LAIN_REQUIRE_ENCRYPTION=1 to make this a hard failure.',
+      );
     }
 
     // Enable foreign keys and WAL mode for better performance
@@ -331,6 +460,37 @@ export async function initDatabase(
 
     // Run migrations
     await runMigrations(db);
+
+    // findings.md P2:370 — bridge between inline MIGRATIONS (bumped on
+    // schema changes) and the one-off `migrateMemoriesToPalace` backfill
+    // (`src/memory/migration.ts`, invoked by `dist/scripts/run-palace-
+    // migration.js`). Nothing in the boot path enforces both have run
+    // against a given DB, so a droplet upgraded with fresh code but no
+    // backfill can carry schema version N with pre-palace memories that
+    // `resolveWingForMemory` never places. We can't call the backfill
+    // automatically (it needs a DB backup step), but we can make the gap
+    // visible: count memories missing `wing_id` and warn loudly. After
+    // the backfill runs the count drops to 0 and the warn goes silent.
+    try {
+      const row = db
+        .prepare(
+          'SELECT COUNT(*) AS unmigrated FROM memories WHERE wing_id IS NULL',
+        )
+        .get() as { unmigrated: number } | undefined;
+      const unmigrated = row?.unmigrated ?? 0;
+      if (unmigrated > 0) {
+        getLogger().warn(
+          { path, unmigrated },
+          `Found ${unmigrated} pre-palace memories with no wing assignment. ` +
+            'Run `LAIN_HOME=<dir> node dist/scripts/run-palace-migration.js` to backfill them — ' +
+            'until then they are invisible to palace-scoped retrieval.',
+        );
+      }
+    } catch {
+      // Memory table may not exist yet on an impossibly fresh DB where
+      // MIGRATIONS[1] hasn't landed (the try/catch keeps boot alive
+      // rather than failing over a diagnostic).
+    }
 
     return db;
   } catch (error) {
@@ -369,6 +529,33 @@ export function closeDatabase(): void {
 }
 
 /**
+ * Load the persistent salt for this database, creating it on first use.
+ * Written to `${dbPath}.salt` as 32 hex chars. Atomic write via tmp+rename
+ * so a crash mid-write can't leave a zero-byte file.
+ */
+async function loadOrCreateSalt(dbPath: string): Promise<Buffer> {
+  const saltPath = `${dbPath}.salt`;
+  try {
+    const hex = (await readFile(saltPath, 'utf8')).trim();
+    if (!/^[0-9a-f]{32}$/.test(hex)) {
+      throw new StorageError(
+        `Salt file ${saltPath} is malformed. Expected 32 hex chars, got ${hex.length}. ` +
+          `Refusing to overwrite — delete the file manually only if the DB is fresh.`
+      );
+    }
+    return Buffer.from(hex, 'hex');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+  }
+
+  const salt = generateSalt(16);
+  const tmpPath = `${saltPath}.tmp`;
+  await writeFile(tmpPath, salt.toString('hex'), { encoding: 'utf8', mode: 0o600 });
+  await rename(tmpPath, saltPath);
+  return salt;
+}
+
+/**
  * Run database migrations
  */
 async function runMigrations(database: DatabaseType): Promise<void> {
@@ -385,46 +572,46 @@ async function runMigrations(database: DatabaseType): Promise<void> {
     // Table doesn't exist yet, that's fine
   }
 
-  // Replay all migrations on init. This repairs databases whose schema_version
-  // says "latest" even though some IF NOT EXISTS artifacts are missing.
-  for (const migration of MIGRATIONS) {
-    if (!migration) continue;
-
-    // Run ALTER TABLEs individually (they don't support IF NOT EXISTS),
-    // then run the rest as a batch.
-    const lines = migration.split('\n');
-    const alters: string[] = [];
-    const rest: string[] = [];
-    for (const line of lines) {
-      if (line.trim().toUpperCase().startsWith('ALTER TABLE')) {
-        alters.push(line.trim().replace(/;$/, ''));
-      } else {
-        rest.push(line);
+  // Run pending migrations
+  for (let i = currentVersion; i < MIGRATIONS.length; i++) {
+    const migration = MIGRATIONS[i];
+    if (migration) {
+      // Run ALTER TABLEs individually (they don't support IF NOT EXISTS),
+      // then run the rest as a batch.
+      const lines = migration.split('\n');
+      const alters: string[] = [];
+      const rest: string[] = [];
+      for (const line of lines) {
+        if (line.trim().toUpperCase().startsWith('ALTER TABLE')) {
+          alters.push(line.trim().replace(/;$/, ''));
+        } else {
+          rest.push(line);
+        }
       }
-    }
 
-    // Run ALTERs individually, skip duplicates
-    for (const alter of alters) {
-      try {
-        database.exec(alter);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes('duplicate column name')) continue;
-        throw err;
+      // Run ALTERs individually, skip duplicates
+      for (const alter of alters) {
+        try {
+          database.exec(alter);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.includes('duplicate column name')) continue;
+          throw err;
+        }
       }
-    }
 
-    // Run remaining statements (CREATE TABLE IF NOT EXISTS, CREATE INDEX IF NOT EXISTS)
-    const batchSql = rest.join('\n').trim();
-    if (batchSql) {
-      database.exec(batchSql);
+      // Run remaining statements (CREATE TABLE IF NOT EXISTS, CREATE INDEX IF NOT EXISTS)
+      const batchSql = rest.join('\n').trim();
+      if (batchSql) {
+        database.exec(batchSql);
+      }
     }
   }
 
   // Update version
   database
     .prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)")
-    .run(Math.max(currentVersion, SCHEMA_VERSION).toString());
+    .run(SCHEMA_VERSION.toString());
 }
 
 /**
@@ -499,4 +686,58 @@ export function getMeta(key: string): string | null {
  */
 export function setMeta(key: string, value: string): void {
   execute('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)', [key, value]);
+}
+
+/**
+ * findings.md P2:1110 — atomically increment a JSON counter field on a
+ * meta row, resetting the whole row when the period field changed.
+ *
+ * Semantics:
+ *   - key absent:            insert `freshJson`
+ *   - stored period matches: `counter += delta` in place
+ *   - stored period differs: overwrite with `freshJson` (new period reset)
+ *
+ * Runs as a single SQLite statement so concurrent callers can't lose
+ * increments between a naive read-modify-write pair.
+ *
+ * `freshJson` must encode `{ [periodField]: periodValue, [counterField]: delta }`.
+ * Returns the stored JSON after the operation.
+ */
+export function atomicMetaIncrementCounter(params: {
+  key: string;
+  freshJson: string;
+  periodField: string;
+  periodValue: string;
+  counterField: string;
+  delta: number;
+}): string {
+  const database = getDatabase();
+  try {
+    const stmt = database.prepare(`
+      INSERT INTO meta (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = CASE
+        WHEN json_extract(value, ?) = ?
+        THEN json_set(value, ?, COALESCE(json_extract(value, ?), 0) + ?)
+        ELSE excluded.value
+      END
+      RETURNING value
+    `);
+    const periodPath = `$.${params.periodField}`;
+    const counterPath = `$.${params.counterField}`;
+    const row = stmt.get(
+      params.key,
+      params.freshJson,
+      periodPath,
+      params.periodValue,
+      counterPath,
+      counterPath,
+      params.delta,
+    ) as { value: string } | undefined;
+    return row?.value ?? params.freshJson;
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new StorageError(`atomicMetaIncrementCounter failed: ${error.message}`, error);
+    }
+    throw error;
+  }
 }

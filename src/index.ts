@@ -49,24 +49,14 @@ export * from './memory/index.js';
 // Security
 export * from './security/index.js';
 
-// Browser
-export * from './browser/index.js';
-
-// Plugins
-export * from './plugins/index.js';
-
 // Utilities
 export * from './utils/index.js';
 
 // CLI runner
 import { run } from './cli/index.js';
+import { isCliEntryPath } from './cli/entry-path.js';
 
-// Run CLI if this is the main module
-const isMain =
-  process.argv[1]?.endsWith('newtown.js') ||
-  process.argv[1]?.endsWith('newtown') ||
-  process.argv[1]?.includes('dist/index.js') ||
-  process.argv[1]?.includes('src/index.ts');
+const isMain = isCliEntryPath(process.argv[1]);
 
 if (isMain) {
   run().catch((error) => {

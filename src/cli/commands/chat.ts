@@ -15,6 +15,11 @@ import {
   displayWarning,
 } from '../utils/prompts.js';
 import type { GatewayMessage, GatewayResponse } from '../../types/gateway.js';
+import {
+  AuthResultSchema,
+  ChatResultSchema,
+  EchoResultSchema,
+} from '../../gateway/schemas.js';
 
 /**
  * Start interactive chat mode
@@ -100,29 +105,41 @@ export async function chat(): Promise<void> {
     }
 
     if (!authenticated) {
-      // This should be the auth response
-      if (response.result && typeof response.result === 'object' && 'authenticated' in response.result) {
+      // findings.md P2:46 / P2:195 — use the zod schema (which requires
+      // `authenticated: z.literal(true)`) instead of an ad-hoc `'in'` check.
+      // A gateway reply of `{ authenticated: false }` now fails `.safeParse`
+      // and drops to the authentication-failed branch.
+      if (AuthResultSchema.safeParse(response.result).success) {
         authenticated = true;
         console.log('\n...connected\n');
         console.log('type your message, or /quit to exit\n');
         promptUser();
+      } else {
+        displayError('authentication failed');
+        process.exit(1);
       }
       return;
     }
 
-    // Handle chat response
-    if (response.result && typeof response.result === 'object' && 'response' in response.result) {
-      const chatResult = response.result as { response: string };
-      console.log(`\nlain: ${chatResult.response}\n`);
-    } else if (response.result && typeof response.result === 'object' && 'echo' in response.result) {
-      // Fallback for echo (if agent not available)
-      const echo = response.result as { echo: { message: string } };
-      if (echo.echo && typeof echo.echo === 'object' && 'message' in echo.echo) {
-        console.log(`\nlain: ${echo.echo.message}\n`);
+    // Handle chat response — prefer the ChatResult shape; fall back to
+    // EchoResult (returned by `/status` or stub deployments) before the
+    // generic JSON dump.
+    const chat = ChatResultSchema.safeParse(response.result);
+    if (chat.success) {
+      console.log(`\nlain: ${chat.data.response}\n`);
+    } else {
+      const echo = EchoResultSchema.safeParse(response.result);
+      const echoInner = echo.success ? echo.data.echo : undefined;
+      if (
+        echoInner &&
+        typeof echoInner === 'object' &&
+        'message' in echoInner &&
+        typeof (echoInner as { message: unknown }).message === 'string'
+      ) {
+        console.log(`\nlain: ${(echoInner as { message: string }).message}\n`);
+      } else if (response.result !== undefined) {
+        console.log(`\nlain: ${JSON.stringify(response.result)}\n`);
       }
-    } else if (response.result) {
-      // Generic response
-      console.log(`\nlain: ${JSON.stringify(response.result)}\n`);
     }
 
     promptUser();
@@ -203,6 +220,27 @@ export async function sendMessage(message: string): Promise<void> {
     const socket = connect(paths.socket);
     let authenticated = false;
     let responseBuffer = '';
+    let settled = false;
+
+    // findings.md P2:56 — without a timeout + close handler, a gateway that
+    // crashes or early-exits after accept() leaves this Promise hanging
+    // forever. Guard every resolve/reject with `settled`, clear the timer
+    // on exit, and reject if the socket closes before a response arrives.
+    const TIMEOUT_MS = Number(process.env['LAIN_CLI_TIMEOUT_MS'] ?? 30_000);
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      reject(new Error(`sendMessage timed out after ${TIMEOUT_MS}ms`));
+    }, TIMEOUT_MS);
+    timer.unref?.();
+
+    const settle = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
 
     socket.on('connect', () => {
       const authMessage: GatewayMessage = {
@@ -226,8 +264,10 @@ export async function sendMessage(message: string): Promise<void> {
 
           if (response.error) {
             displayError(`Error: ${response.error.message}`);
-            socket.end();
-            reject(new Error(response.error.message));
+            settle(() => {
+              socket.end();
+              reject(new Error(response.error!.message));
+            });
             return;
           }
 
@@ -243,19 +283,29 @@ export async function sendMessage(message: string): Promise<void> {
             return;
           }
 
-          // Print response and exit
-          if (response.result && typeof response.result === 'object' && 'response' in response.result) {
-            const chatResult = response.result as { response: string };
-            console.log(chatResult.response);
-          } else if (response.result && typeof response.result === 'object' && 'echo' in response.result) {
-            const echo = response.result as { echo: { message: string } };
-            if (echo.echo && typeof echo.echo === 'object' && 'message' in echo.echo) {
-              console.log(echo.echo.message);
+          // findings.md P2:195 — parse the result against the same schema
+          // the router validates outputs against, instead of ad-hoc `'in'`
+          // checks that silently accept the wrong shape.
+          const chat = ChatResultSchema.safeParse(response.result);
+          if (chat.success) {
+            console.log(chat.data.response);
+          } else {
+            const echoParsed = EchoResultSchema.safeParse(response.result);
+            const echoInner = echoParsed.success ? echoParsed.data.echo : undefined;
+            if (
+              echoInner &&
+              typeof echoInner === 'object' &&
+              'message' in echoInner &&
+              typeof (echoInner as { message: unknown }).message === 'string'
+            ) {
+              console.log((echoInner as { message: string }).message);
             }
           }
 
-          socket.end();
-          resolve();
+          settle(() => {
+            socket.end();
+            resolve();
+          });
         } catch {
           // Ignore parse errors
         }
@@ -263,7 +313,13 @@ export async function sendMessage(message: string): Promise<void> {
     });
 
     socket.on('error', (error) => {
-      reject(error);
+      settle(() => reject(error));
+    });
+
+    socket.on('close', () => {
+      settle(() =>
+        reject(new Error('gateway closed the connection before a response was received')),
+      );
     });
   });
 }

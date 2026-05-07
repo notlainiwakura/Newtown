@@ -1,7 +1,5 @@
 # Dependencies
 node_modules/
-node_modules.*/
-.tools/
 
 # Build output
 dist/
@@ -31,7 +29,6 @@ logs/
 pids/
 *.pid
 *.seed
-~/
 
 # Debug
 npm-debug.log*
@@ -46,7 +43,6 @@ yarn.lock
 *.sock
 *.db
 *.db-journal
-.newtown/
 
 # Misc
 SIGNAL.pdf

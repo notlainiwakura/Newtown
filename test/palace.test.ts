@@ -321,6 +321,55 @@ describe('Palace CRUD', () => {
     expect(id1).toBe(id2);
   });
 
+  it('findings.md P2:610 — resolveWing/resolveRoom wrap get-then-insert in transaction()', async () => {
+    // Source-check guard. The race this fixes is a SELECT-then-INSERT
+    // where both halves had no common lock, so two concurrent callers
+    // produced duplicate rows with identical names. Ensuring the code
+    // keeps using `transaction(...)` around the resolve is what gives
+    // us cross-connection write serialization at the SQLite level.
+    const { readFile } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    const src = await readFile(
+      fileURLToPath(new URL('../src/memory/palace.ts', import.meta.url)),
+      'utf8',
+    );
+    expect(src).toMatch(/from ['"]\.\.\/storage\/database\.js['"]/);
+    // Both resolveWing and resolveRoom bodies must call transaction(.
+    const resolveWingBody = src.match(/export function resolveWing[\s\S]*?\n\}/)?.[0] ?? '';
+    const resolveRoomBody = src.match(/export function resolveRoom[\s\S]*?\n\}/)?.[0] ?? '';
+    expect(resolveWingBody).toMatch(/\btransaction\s*(?:<[^>]*>)?\s*\(/);
+    expect(resolveRoomBody).toMatch(/\btransaction\s*(?:<[^>]*>)?\s*\(/);
+  });
+
+  it('findings.md P2:610 — concurrent resolveWing calls for the same name produce a single row', () => {
+    // Real-world concurrency test: loop many resolveWing calls for the
+    // same name. Every call must return the same ID, and the underlying
+    // table must show exactly one row for that name. Better-sqlite3 is
+    // synchronous so we can't literally interleave, but the invariant
+    // held by the transaction wrap — that repeated calls converge to
+    // one row — is what we care about.
+    const ids = new Set<string>();
+    for (let i = 0; i < 20; i++) {
+      ids.add(resolveWing('concurrent-wing'));
+    }
+    expect(ids.size).toBe(1);
+
+    const wings = listWings().filter((w) => w.name === 'concurrent-wing');
+    expect(wings).toHaveLength(1);
+  });
+
+  it('findings.md P2:610 — concurrent resolveRoom calls for same (wing,name) produce a single row', () => {
+    const wingId = resolveWing('concurrent-room-wing');
+    const ids = new Set<string>();
+    for (let i = 0; i < 20; i++) {
+      ids.add(resolveRoom(wingId, 'the-room'));
+    }
+    expect(ids.size).toBe(1);
+
+    const rooms = listRooms(wingId).filter((r) => r.name === 'the-room');
+    expect(rooms).toHaveLength(1);
+  });
+
   it('incrementWingCount and decrementWingCount update memory_count', () => {
     const id = createWing('test-counts');
     incrementWingCount(id);
@@ -513,6 +562,28 @@ describe('Palace CRUD', () => {
     expect(r.wingName).toBe('mckenna');
   });
 
+  it('findings.md P2:644 — letter: target is lowercased so mixed-case session keys land in one wing', () => {
+    const upper = resolveWingForMemory('letter:Wired-Lain', null);
+    const lower = resolveWingForMemory('letter:wired-lain', null);
+    expect(upper.wingName).toBe('wired-lain');
+    expect(lower.wingName).toBe('wired-lain');
+    expect(upper.wingName).toBe(lower.wingName);
+  });
+
+  it('findings.md P2:644 — commune: target is lowercased', () => {
+    const upper = resolveWingForMemory('commune:PKD', null);
+    const lower = resolveWingForMemory('commune:pkd', null);
+    expect(upper.wingName).toBe('pkd');
+    expect(upper.wingName).toBe(lower.wingName);
+  });
+
+  it('findings.md P2:644 — peer: target is lowercased', () => {
+    const upper = resolveWingForMemory('peer:McKenna', null);
+    const lower = resolveWingForMemory('peer:mckenna', null);
+    expect(upper.wingName).toBe('mckenna');
+    expect(upper.wingName).toBe(lower.wingName);
+  });
+
   it('resolveWingForMemory: doctor → dr-claude', () => {
     expect(resolveWingForMemory('doctor:session-1', null).wingName).toBe('dr-claude');
   });
@@ -535,9 +606,10 @@ describe('Palace CRUD', () => {
     expect(resolveWingForMemory('document:map', null).wingName).toBe('town');
   });
 
-  it('resolveWingForMemory: userId present → visitor-{userId}', () => {
+  it('resolveWingForMemory: userId present → shared visitors wing with per-user room (findings.md P2:652)', () => {
     const r = resolveWingForMemory('web:abc', '12345');
-    expect(r.wingName).toBe('visitor-12345');
+    expect(r.wingName).toBe('visitors');
+    expect(r.roomName).toBe('visitor-12345');
   });
 
   it('resolveWingForMemory: fallback → encounters', () => {
@@ -614,6 +686,53 @@ describe('Knowledge Graph CRUD', () => {
     const triple = getTriple(id);
     expect(triple?.metadata).toEqual({ confidence: 'high' });
     expect(triple?.sourceMemoryId).toBe('mem-1');
+  });
+
+  it('findings.md P2:576 — addTriple de-dups on (subject, predicate, object) for active triples', () => {
+    // Same (s, p, o) twice — second call must return the first row's ID,
+    // not insert a new row. Before the fix, every repeat insert grew the
+    // table and poisoned detectContradictions + getEntityTimeline with
+    // phantom duplicates.
+    const id1 = addTriple('Lain', 'likes', 'cats', 0.9, undefined, null, 'mem-1', { source: 'a' });
+    const id2 = addTriple('Lain', 'likes', 'cats', 0.9, undefined, null, 'mem-2', { source: 'b' });
+    expect(id2).toBe(id1);
+
+    const all = queryTriples({ subject: 'Lain', predicate: 'likes', object: 'cats' });
+    expect(all).toHaveLength(1);
+  });
+
+  it('findings.md P2:576 — addTriple merges metadata on duplicate, preserving old keys', () => {
+    const id1 = addTriple('Lain', 'works_at', 'Cafe', 1.0, undefined, null, null, { shift: 'evening' });
+    const id2 = addTriple('Lain', 'works_at', 'Cafe', 1.0, undefined, null, null, { role: 'barista' });
+    expect(id2).toBe(id1);
+
+    const triple = getTriple(id1);
+    // Old key preserved, new key added.
+    expect(triple?.metadata).toEqual({ shift: 'evening', role: 'barista' });
+  });
+
+  it('findings.md P2:576 — addTriple preserves earliest valid_from on duplicate', () => {
+    const earliest = 1_000_000_000;
+    const later = 2_000_000_000;
+    const id1 = addTriple('Lain', 'owns', 'navi', 1.0, earliest);
+    const id2 = addTriple('Lain', 'owns', 'navi', 1.0, later);
+    expect(id2).toBe(id1);
+
+    const triple = getTriple(id1);
+    expect(triple?.validFrom).toBe(earliest);
+  });
+
+  it('findings.md P2:576 — addTriple treats an ended triple as closed window; new call creates a fresh row', () => {
+    // An ended triple represents a past temporal window. Re-asserting the
+    // same fact later is a legitimate new active triple, not a duplicate.
+    const t0 = 1_000_000;
+    const t1 = 2_000_000;
+    const id1 = addTriple('Lain', 'lives_in', 'Library', 1.0, t0, t1); // ended
+    const id2 = addTriple('Lain', 'lives_in', 'Library', 1.0, t1 + 1); // new active window
+    expect(id2).not.toBe(id1);
+
+    const all = queryTriples({ subject: 'Lain', predicate: 'lives_in', object: 'Library' });
+    expect(all).toHaveLength(2);
   });
 
   // ── Triple: query by subject ────────────────────────────────────────────────
@@ -754,6 +873,31 @@ describe('Knowledge Graph CRUD', () => {
     expect(contradictions).toHaveLength(3);
   });
 
+  it('findings.md P2:600 — does not flag forward-dated (scheduled) triples as active contradictions', () => {
+    // A triple with valid_from > now and ended IS NULL is scheduled, not
+    // currently active. Before the fix, it was counted as a live
+    // contradiction alongside today's triple. After the fix, it's ignored
+    // until its valid_from window opens.
+    const future = Date.now() + 1_000_000_000;
+    addTriple('Lain', 'lives_in', 'Library'); // now
+    addTriple('Lain', 'lives_in', 'Bar', 1.0, future); // scheduled, not yet active
+
+    const contradictions = detectContradictions();
+    expect(contradictions).toHaveLength(0);
+  });
+
+  it('findings.md P2:600 — flags contradictions again once forward-dated triple is real', () => {
+    // Control for the above: if BOTH triples are currently active
+    // (valid_from <= now), the contradiction must still fire. Uses an
+    // already-past valid_from on the second triple.
+    const past = Date.now() - 1_000_000;
+    addTriple('Lain', 'lives_in', 'Library'); // now
+    addTriple('Lain', 'lives_in', 'Bar', 1.0, past); // already-active alt
+
+    const contradictions = detectContradictions();
+    expect(contradictions).toHaveLength(1);
+  });
+
   // ── Entity timeline ────────────────────────────────────────────────────────
 
   it('builds entity timeline — triples where entity is subject or object', () => {
@@ -807,7 +951,43 @@ describe('Knowledge Graph CRUD', () => {
     const entity = getEntity('Lain');
     expect(entity?.firstSeen).toBe(1000); // preserved from first insert
     expect(entity?.lastSeen).toBe(9999);  // updated
-    expect(entity?.metadata).toEqual({ role: 'ghost' }); // updated
+    expect(entity?.metadata).toEqual({ role: 'ghost' }); // overwritten via merge — same key
+  });
+
+  it('findings.md P2:590 — addEntity merges metadata instead of replacing', () => {
+    // First observation records `role`. Second observation records `mood`.
+    // Before the fix, the second call replaced metadata entirely and
+    // `role` was lost. After the fix, `json_patch` merges — both keys
+    // survive.
+    addEntity('Lain', 'person', 1000, { role: 'protagonist' });
+    addEntity('Lain', 'person', 2000, { mood: 'quiet' });
+
+    const entity = getEntity('Lain');
+    expect(entity?.metadata).toEqual({ role: 'protagonist', mood: 'quiet' });
+  });
+
+  it('findings.md P2:590 — addEntity last_seen uses MAX (does not rewind on older timestamp)', () => {
+    // Simulates re-ingesting a resurfaced older memory: we call
+    // `addEntity` with an older `firstSeen` than what's already recorded.
+    // Before the fix, last_seen rewound to the older timestamp, breaking
+    // "most recently active" ordering in listEntities.
+    addEntity('PKD', 'person', 5000, { confidence: 'high' });
+    addEntity('PKD', 'person', 1000, { note: 'resurfaced' }); // older ts!
+
+    const entity = getEntity('PKD');
+    expect(entity?.firstSeen).toBe(5000); // unchanged — ON CONFLICT doesn't touch first_seen
+    expect(entity?.lastSeen).toBe(5000); // max(5000, 1000) = 5000, NOT rewound to 1000
+    // Metadata still merges even when last_seen doesn't update.
+    expect(entity?.metadata).toEqual({ confidence: 'high', note: 'resurfaced' });
+  });
+
+  it('findings.md P2:590 — addEntity last_seen advances on newer timestamp', () => {
+    addEntity('Navi', 'concept', 1000, {});
+    addEntity('Navi', 'concept', 7777, { evolved: true });
+
+    const entity = getEntity('Navi');
+    expect(entity?.lastSeen).toBe(7777); // max(1000, 7777) = 7777
+    expect(entity?.metadata).toEqual({ evolved: true });
   });
 
   it('updateEntityLastSeen updates last_seen timestamp', () => {
@@ -1067,6 +1247,73 @@ describe('migrateMemoriesToPalace', () => {
     expect(quick.total).toBe(3);
     expect(quick.migrated).toBe(3);
     expect(quick.unmigrated).toBe(0);
+  }, 30000);
+
+  it('findings.md P2:543 — per-row UPDATE + counters wrapped in transaction() call', async () => {
+    // Source-check guard: the fix hinges on *all* four per-row writes
+    // (UPDATE memories, incrementWingCount, incrementRoomCount, vec0 INSERT)
+    // running inside a single transaction() call inside the for-of loop.
+    // Before the fix, they ran as auto-commits; a crash between steps left
+    // wing/room counters out of sync with memories.wing_id, and a re-run
+    // double-counted. Assert that the atomic wrap is still in place.
+    const { readFile } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    const src = await readFile(
+      fileURLToPath(new URL('../src/memory/migration.ts', import.meta.url)),
+      'utf8',
+    );
+    // Must import transaction and use it inside the per-row loop.
+    expect(src).toMatch(/from ['"]\.\.\/storage\/database\.js['"]/);
+    expect(src).toMatch(/\btransaction\s*\(/);
+    // The three load-bearing mutations all appear inside the source.
+    expect(src).toMatch(/UPDATE memories SET wing_id/);
+    expect(src).toMatch(/incrementWingCount\s*\(/);
+    expect(src).toMatch(/incrementRoomCount\s*\(/);
+  });
+
+  it('findings.md P2:543 — counters stay consistent with memories.wing_id after migration', async () => {
+    // Invariant guard: for every wing, palace_wings.memory_count must equal
+    // COUNT(*) of memories with that wing_id. The original bug produced
+    // drift here (counter > actual) on partial-failure re-runs. With the
+    // transactional wrap, every wing_id UPDATE and its matching increment
+    // commit together — invariant holds.
+    await saveMemory({
+      sessionKey: 'web:user-x',
+      userId: 'user-x',
+      content: 'invariant test 1',
+      memoryType: 'fact',
+      importance: 0.5,
+      emotionalWeight: 0,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {},
+    });
+    await saveMemory({
+      sessionKey: 'curiosity:invariant',
+      userId: null,
+      content: 'invariant test 2',
+      memoryType: 'episode',
+      importance: 0.5,
+      emotionalWeight: 0,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {},
+    });
+
+    // Running migration twice must not double-count (idempotency under the wrap).
+    await migrateMemoriesToPalace();
+    await migrateMemoriesToPalace();
+
+    const db = getDatabase();
+    const wings = db
+      .prepare('SELECT id, memory_count FROM palace_wings')
+      .all() as Array<{ id: string; memory_count: number }>;
+    for (const w of wings) {
+      const actual = db
+        .prepare('SELECT COUNT(*) AS n FROM memories WHERE wing_id = ?')
+        .get(w.id) as { n: number };
+      expect(w.memory_count).toBe(actual.n);
+    }
   }, 30000);
 });
 

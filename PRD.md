@@ -1535,9 +1535,6 @@ WantedBy=default.target
 - `better-sqlite3` + SQLCipher - Encrypted storage
 - `tweetnacl` - Cryptographic operations
 
-**Browser Automation**:
-- `playwright-core` - Browser control
-
 **Embeddings**:
 - `@xenova/transformers` - Local models
 - `onnxruntime-node` - ONNX inference

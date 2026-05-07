@@ -607,14 +607,14 @@ describe('Extraction — Structural', () => {
     expect(extractionSrc).toContain("'episode'");
   });
 
-  it('extraction uses withTimeout with 60000ms', () => {
-    const match = extractionSrc.match(/withTimeout\(\s*[\s\S]*?,\s*(\d+)\s*,\s*'Memory extraction'/);
+  it('extraction uses withAbortableTimeout with 60000ms (findings.md P2:145)', () => {
+    const match = extractionSrc.match(/withAbortableTimeout\(\s*[\s\S]*?,\s*(\d+)\s*,\s*'Memory extraction'/);
     expect(match).not.toBeNull();
     expect(Number(match![1])).toBe(60000);
   });
 
-  it('summarization uses withTimeout with 30000ms', () => {
-    const match = extractionSrc.match(/withTimeout\(\s*[\s\S]*?,\s*(\d+)\s*,\s*'Conversation summarization'/);
+  it('summarization uses withAbortableTimeout with 30000ms (findings.md P2:145)', () => {
+    const match = extractionSrc.match(/withAbortableTimeout\(\s*[\s\S]*?,\s*(\d+)\s*,\s*'Conversation summarization'/);
     expect(match).not.toBeNull();
     expect(Number(match![1])).toBe(30000);
   });
@@ -693,10 +693,10 @@ describe('Organic Maintenance — Structural', () => {
     expect(organicSrc).toMatch(/similarity\s*>\s*0\.7/);
   });
 
-  it('memory cap is 10,000', () => {
-    const match = organicSrc.match(/const MEMORY_CAP\s*=\s*([\d_]+)/);
+  it('memory cap default is 50,000 with env override (findings.md P2:789)', () => {
+    const match = organicSrc.match(/parsePositiveInt\(\s*process\.env\['LAIN_MEMORY_CAP'\],\s*([\d_]+)\s*\)/);
     expect(match).not.toBeNull();
-    expect(Number(match![1]!.replace(/_/g, ''))).toBe(10000);
+    expect(Number(match![1]!.replace(/_/g, ''))).toBe(50000);
   });
 
   it('era summary requires 10+ memories per month bucket', () => {
@@ -752,18 +752,39 @@ describe('Organic Maintenance — Structural', () => {
     expect(organicSrc).toMatch(/export function startMemoryMaintenanceLoop\([^)]*\):\s*\(\)\s*=>\s*void/);
   });
 
-  it('runMemoryMaintenance runs all maintenance tasks in order', () => {
-    // Should call all sub-functions
-    expect(organicSrc).toContain('gracefulForgetting()');
-    expect(organicSrc).toContain('detectCrossConversationPatterns()');
-    expect(organicSrc).toContain('evolveImportance()');
-    expect(organicSrc).toContain('decayAssociationStrength()');
-    expect(organicSrc).toContain('distillMemoryClusters()');
-    expect(organicSrc).toContain('protectLandmarkMemories()');
-    expect(organicSrc).toContain('generateEraSummaries()');
-    expect(organicSrc).toContain('enforceMemoryCap()');
-    expect(organicSrc).toContain('runTopologyMaintenance()');
-    expect(organicSrc).toContain('maintainKnowledgeGraph()');
+  it('runMemoryMaintenance runs all maintenance tasks in order (via runPhase wrapper, findings.md P2:704)', () => {
+    // Each phase is now dispatched via runPhase(<name>, <fn>) for per-phase
+    // error isolation, so the source references each sub-function by name
+    // (without call-parens) inside the runPhase call.
+    expect(organicSrc).toMatch(/runPhase\('gracefulForgetting',\s*gracefulForgetting\)/);
+    expect(organicSrc).toMatch(/runPhase\('detectCrossConversationPatterns',\s*detectCrossConversationPatterns\)/);
+    expect(organicSrc).toMatch(/runPhase\('evolveImportance',\s*evolveImportance\)/);
+    expect(organicSrc).toMatch(/runPhase\('decayAssociationStrength',\s*decayAssociationStrength\)/);
+    expect(organicSrc).toMatch(/runPhase\('distillMemoryClusters',\s*distillMemoryClusters\)/);
+    expect(organicSrc).toMatch(/runPhase\('protectLandmarkMemories',\s*protectLandmarkMemories\)/);
+    expect(organicSrc).toMatch(/runPhase\('generateEraSummaries',\s*generateEraSummaries\)/);
+    expect(organicSrc).toMatch(/runPhase\('enforceMemoryCap',\s*enforceMemoryCap\)/);
+    expect(organicSrc).toMatch(/runPhase\('runTopologyMaintenance',\s*runTopologyMaintenance\)/);
+    expect(organicSrc).toMatch(/runPhase\('maintainKnowledgeGraph',\s*maintainKnowledgeGraph\)/);
+  });
+
+  it('processConversationEnd internal-state hook logs on failure (findings.md P2:854)', () => {
+    // Regression lock: the lazy-imported internal-state updateState call
+    // previously swallowed every error with `catch { /* non-critical */ }`,
+    // so module-load failures or updateState throws stopped the 6-axis
+    // emotional state from evolving with no log. The catch must now log
+    // at warn with the module path + sessionKey.
+    const indexSrc = readFileSync(join(process.cwd(), 'src/memory/index.ts'), 'utf-8');
+    // Rough structural check: the updateState catch must call logger.warn
+    // and reference the internal-state module path.
+    expect(indexSrc).toMatch(/agent\/internal-state\.js/);
+    // The first catch clause must contain a logger.warn with the module path field.
+    const hookRegion = indexSrc.match(
+      /await updateState\([\s\S]*?\}\s*catch\s*\(([\s\S]*?)\}\s*\n/,
+    );
+    expect(hookRegion, 'expected try/catch around updateState conversation:end').not.toBeNull();
+    expect(hookRegion![0]).toMatch(/logger\.warn/);
+    expect(hookRegion![0]).toMatch(/internal-state\.js/);
   });
 });
 
@@ -940,10 +961,11 @@ describe('Palace — Wing Resolution', () => {
     expect(result.wingName).toBe('town');
   });
 
-  it('userId creates visitor wing when no session prefix matches', async () => {
+  it('userId routes to shared visitors wing with per-user room (findings.md P2:652)', async () => {
     const { resolveWingForMemory } = await import('../src/memory/palace.js');
     const result = resolveWingForMemory('chat:session123', 'user42');
-    expect(result.wingName).toBe('visitor-user42');
+    expect(result.wingName).toBe('visitors');
+    expect(result.roomName).toBe('visitor-user42');
   });
 
   it('fallback routes to encounters wing', async () => {

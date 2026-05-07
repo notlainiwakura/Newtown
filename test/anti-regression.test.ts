@@ -65,12 +65,12 @@ describe('Silent Truncation Class', () => {
   });
 
   it('per-loop maxTokens are appropriate after truncation fix', () => {
-    expect(readSrc('../src/agent/diary.ts')).toContain('maxTokens: 1024');
-    expect(readSrc('../src/agent/book.ts')).toContain('maxTokens: 5000');
-    expect(readSrc('../src/agent/dreams.ts')).toContain('maxTokens: 400');
+    expect(readSrc('../src/agent/diary.ts')).toContain('maxTokens: 2048');
+    expect(readSrc('../src/agent/book.ts')).toContain('maxTokens: 8000');
+    expect(readSrc('../src/agent/dreams.ts')).toContain('maxTokens: 500');
     expect(readSrc('../src/agent/commune-loop.ts')).toContain('maxTokens: 1024');
-    expect(readSrc('../src/agent/internal-state.ts')).toContain('maxTokens: 512');
-    expect(readSrc('../src/agent/curiosity.ts')).toContain('maxTokens: 256');
+    expect(readSrc('../src/agent/internal-state.ts')).toContain('maxTokens: 500');
+    expect(readSrc('../src/agent/curiosity.ts')).toContain('maxTokens: 400');
   });
 
   it('book decideAction uses 10 tokens intentionally (single-word response)', () => {
@@ -139,8 +139,9 @@ describe('Identity Corruption Class', () => {
     expect(src).toContain('Pick<CommuneLoopConfig');
   });
 
-  it('LAIN_CHARACTER_NAME is used for character identity in diary', () => {
-    expect(readSrc('../src/agent/diary.ts')).toContain('LAIN_CHARACTER_NAME');
+  it('diary uses requireCharacterName (fail-closed) for character identity — findings.md P2:2271', () => {
+    expect(readSrc('../src/agent/diary.ts')).toContain('requireCharacterName');
+    expect(readSrc('../src/agent/diary.ts')).not.toMatch(/process\.env\[['"]LAIN_CHARACTER_NAME['"]\]\s*\|\|\s*['"]Lain['"]/);
   });
 
   it('two characters initialized with different LAIN_HOME get different databases', async () => {
@@ -162,34 +163,44 @@ describe('Identity Corruption Class', () => {
 describe('Auth Bypass Class', () => {
   it('isOwner returns false when token unset, cookie missing, or wrong hash', async () => {
     const origToken = process.env['LAIN_OWNER_TOKEN'];
-    const { isOwner, deriveOwnerCookie } = await import('../src/web/owner-auth.js');
+    const { isOwner } = await import('../src/web/owner-auth.js');
+    const { makeV2Cookie } = await import('./fixtures/owner-cookie-v2.js');
 
     // No token set
     delete process.env['LAIN_OWNER_TOKEN'];
-    expect(isOwner({ headers: { cookie: 'lain_owner=somehash' } } as any)).toBe(false);
+    expect(isOwner({ headers: { cookie: makeV2Cookie('secret') } } as any)).toBe(false);
 
     // Token set but no cookie
     process.env['LAIN_OWNER_TOKEN'] = 'secret';
     expect(isOwner({ headers: {} } as any)).toBe(false);
 
-    // Wrong cookie value
+    // Wrong cookie value — signed by a different token
+    expect(
+      isOwner({
+        headers: { cookie: makeV2Cookie('secret', { signWith: 'not-secret' }) },
+      } as any),
+    ).toBe(false);
+
+    // Legacy v1 cookies are rejected outright
     expect(isOwner({ headers: { cookie: 'lain_owner=wronghash' + 'a'.repeat(60) } } as any)).toBe(false);
 
     if (origToken) process.env['LAIN_OWNER_TOKEN'] = origToken; else delete process.env['LAIN_OWNER_TOKEN'];
   });
 
-  it('isOwner returns true for correct HMAC-derived cookie', async () => {
+  it('isOwner returns true for correct HMAC-signed v2 cookie', async () => {
     process.env['LAIN_OWNER_TOKEN'] = 'my-owner-token';
-    const { isOwner, deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    const hash = deriveOwnerCookie('my-owner-token');
-    expect(isOwner({ headers: { cookie: `lain_owner=${hash}` } } as any)).toBe(true);
+    const { isOwner } = await import('../src/web/owner-auth.js');
+    const { makeV2Cookie } = await import('./fixtures/owner-cookie-v2.js');
+    const cookie = makeV2Cookie('my-owner-token');
+    expect(isOwner({ headers: { cookie } } as any)).toBe(true);
     delete process.env['LAIN_OWNER_TOKEN'];
   });
 
-  it('deriveOwnerCookie is deterministic and token-specific', async () => {
-    const { deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    expect(deriveOwnerCookie('tok')).toBe(deriveOwnerCookie('tok'));
-    expect(deriveOwnerCookie('tok-a')).not.toBe(deriveOwnerCookie('tok-b'));
+  it('v2 cookie signature is token-specific', async () => {
+    const { makeV2CookieValue } = await import('./fixtures/owner-cookie-v2.js');
+    // Lock the nonce+iat so only the signature varies with the token.
+    const fixedOpts = { nonce: 'fixed-nonce', iat: 1_700_000_000_000 };
+    expect(makeV2CookieValue('tok-a', fixedOpts)).not.toBe(makeV2CookieValue('tok-b', fixedOpts));
   });
 
   it('owner cookie has HttpOnly, SameSite=Strict, and uses timing-safe comparison', () => {
@@ -207,16 +218,16 @@ describe('Auth Bypass Class', () => {
     expect(src).toContain('Unauthorized');
   });
 
-  it('commune peer messages include Authorization: Bearer interlink token', () => {
+  it('commune peer messages authenticate via per-character interlink headers', () => {
+    // findings.md P1:2289 — replaced raw LAIN_INTERLINK_TOKEN + body fromId
+    // with derived per-character tokens + authenticated X-Interlink-From.
     const src = readSrc('../src/agent/commune-loop.ts');
-    expect(src).toContain('Authorization');
-    expect(src).toContain('LAIN_INTERLINK_TOKEN');
+    expect(src).toContain('getInterlinkHeaders');
   });
 
-  it('weather peer fetches include Authorization header', () => {
+  it('weather peer fetches authenticate via per-character interlink headers', () => {
     const src = readSrc('../src/commune/weather.ts');
-    expect(src).toContain('LAIN_INTERLINK_TOKEN');
-    expect(src).toContain('Authorization');
+    expect(src).toContain('getInterlinkHeaders');
   });
 });
 
@@ -295,26 +306,25 @@ describe('Shared State Corruption Class', () => {
 // 5. CONFIG DRIFT CLASS
 // ─────────────────────────────────────────────────────────
 describe('Config Drift Class', () => {
-  it('default config has 1 agent with id="default" and 3 providers', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    const config = getDefaultConfig();
-    expect(config.agents.length).toBeGreaterThan(0);
-    expect(config.agents[0]!.id).toBe('default');
-    expect(config.agents[0]!.providers).toHaveLength(3);
+  // findings.md P2:171 — `agents` moved from LainConfig into characters.json.
+  // DEFAULT_PROVIDERS is the fallback chain a manifest entry inherits when it
+  // omits `providers`.
+  it('DEFAULT_PROVIDERS has 3 tiers', async () => {
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    expect(DEFAULT_PROVIDERS).toHaveLength(3);
   });
 
-  it('all default providers are anthropic with claude models', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    const { agents: [agent] } = getDefaultConfig();
-    for (const p of agent!.providers) {
+  it('all DEFAULT_PROVIDERS entries are anthropic with claude models', async () => {
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    for (const p of DEFAULT_PROVIDERS) {
       expect(p.type).toBe('anthropic');
       expect(p.model).toContain('claude');
     }
   });
 
-  it('primary provider is claude-sonnet', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    expect(getDefaultConfig().agents[0]!.providers[0]!.model).toContain('claude-sonnet');
+  it('DEFAULT_PROVIDERS primary tier is claude-sonnet', async () => {
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    expect(DEFAULT_PROVIDERS[0]!.model).toContain('claude-sonnet');
   });
 
   it('security config is sane: requireAuth=true, maxMessageLength within [1, 1M]', async () => {
@@ -363,9 +373,9 @@ describe('Config Drift Class', () => {
     }
   });
 
-  it('all default providers have apiKeyEnv field', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    for (const p of getDefaultConfig().agents[0]!.providers) {
+  it('all DEFAULT_PROVIDERS entries have apiKeyEnv field', async () => {
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    for (const p of DEFAULT_PROVIDERS) {
       expect(p.apiKeyEnv, `provider ${p.model} missing apiKeyEnv`).toBeDefined();
     }
   });

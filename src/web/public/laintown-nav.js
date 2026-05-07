@@ -1,18 +1,40 @@
 // Newtown navigation bar — injected into all pages (including proxied character servers)
 (function () {
   var path = location.pathname;
-  var links = [
+  var publicLinks = [
     { label: 'MAP', href: '/commune-map.html' },
     { label: 'WALK', href: '/game/' },
     { label: 'NEWS', href: '/commune-newspaper.html' },
-    { label: 'PAPER', href: '/newspaper.html' },
+    { label: 'PAPER', href: '/newspaper.html' }
+  ];
+  var ownerLinks = [
+    { label: 'POST', href: '/postboard.html' },
     { label: 'EVENTS', href: '/town-events.html' },
+    { label: 'DREAMS', href: '/dreams.html' },
+    { label: 'DASH', href: '/dashboard.html' },
     { label: 'NEO', href: '/neo/' },
     { label: 'PLATO', href: '/plato/' },
-    { label: 'JOE', href: '/joe/' }
+    { label: 'JOE', href: '/joe/' },
+    { label: 'CAGE', href: '/cage/' }
   ];
+  var exitLink = { label: 'EXIT', href: 'https://shraii.com' };
 
   var isGame = path === '/game/' || path === '/game/index.html';
+  var isOwner = !!document.querySelector('meta[name="lain-owner"][content="true"]');
+  var links = isOwner ? publicLinks.concat(ownerLinks, [exitLink]) : publicLinks.concat([exitLink]);
+
+  function ensureStylesheet() {
+    if (document.querySelector('link[href="/laintown-nav.css"]')) return;
+    var link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = '/laintown-nav.css';
+    document.head.appendChild(link);
+  }
+
+  function applyBodyClass() {
+    document.body.classList.remove('ltn-has-nav', 'ltn-game-nav');
+    document.body.classList.add(isGame ? 'ltn-game-nav' : 'ltn-has-nav');
+  }
 
   function isActive(href) {
     if (href === '/commune-map.html') return path === '/commune-map.html';
@@ -20,30 +42,66 @@
     return path.indexOf(href) === 0;
   }
 
-  // Inject font + styles into <head> immediately (no need to wait for body)
-  var font = document.createElement('link');
-  font.rel = 'stylesheet';
-  font.href = 'https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap';
-  document.head.appendChild(font);
+  function syncActiveState(nav) {
+    var anchors = nav.querySelectorAll('a');
+    for (var i = 0; i < anchors.length; i++) {
+      var anchor = anchors[i];
+      if (anchor.classList.contains('ltn-title')) continue;
+      anchor.classList.remove('ltn-active');
 
-  var style = document.createElement('style');
-  style.textContent =
-    '#laintown-nav{position:fixed;top:0;left:0;right:0;height:32px;background:var(--bg-deep,#0a0a0f);border-bottom:1px solid var(--border-glow,#1a1a2e);display:flex;align-items:center;z-index:99999;font-family:"Share Tech Mono",monospace;padding:0 12px;gap:0}' +
-    '#laintown-nav .ltn-title{color:var(--accent-primary,#4a9eff);font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-right:16px;text-decoration:none}' +
-    '#laintown-nav a{color:var(--text-dim,#556);font-size:11px;letter-spacing:1.5px;text-transform:uppercase;text-decoration:none;padding:0 10px;line-height:32px;transition:color .2s}' +
-    '#laintown-nav a:hover{color:var(--accent-secondary,#8ab4f8)}' +
-    '#laintown-nav a.ltn-active{color:var(--accent-primary,#4a9eff)}' +
-    (isGame
-      ? 'body{padding-top:0!important}#laintown-nav{background:var(--nav-game-bg,rgba(10,10,15,0.6));border-bottom-color:var(--nav-game-border,rgba(26,26,46,0.4))}'
-      : 'body{padding-top:32px!important}');
-  document.head.appendChild(style);
+      var href = anchor.getAttribute('href');
+      if (!href) continue;
+      var target;
+      try {
+        target = new URL(href, location.origin);
+      } catch {
+        continue;
+      }
+      if (target.origin === location.origin && isActive(target.pathname)) {
+        anchor.classList.add('ltn-active');
+      }
+    }
+  }
+
+  function propagateKey(nav) {
+    var key = new URLSearchParams(location.search).get('key');
+    if (!key || nav.dataset.ltnKeyPropagated === 'true') return;
+
+    var anchors = nav.querySelectorAll('a');
+    for (var i = 0; i < anchors.length; i++) {
+      var anchor = anchors[i];
+      var href = anchor.getAttribute('href');
+      if (!href) continue;
+      var target;
+      try {
+        target = new URL(href, location.origin);
+      } catch {
+        continue;
+      }
+      if (target.origin !== location.origin) continue;
+      target.searchParams.set('key', key);
+      anchor.setAttribute('href', target.pathname + target.search + target.hash);
+    }
+    nav.dataset.ltnKeyPropagated = 'true';
+  }
+
+  ensureStylesheet();
 
   // Build and insert nav once body exists
   function insertNav() {
-    if (document.getElementById('laintown-nav')) return; // Already injected by server.ts
+    applyBodyClass();
+
+    var existing = document.getElementById('laintown-nav');
+    if (existing) {
+      if (isGame) existing.classList.add('ltn-game');
+      syncActiveState(existing);
+      propagateKey(existing);
+      return; // Already injected by server.ts
+    }
 
     var nav = document.createElement('div');
     nav.id = 'laintown-nav';
+    if (isGame) nav.className = 'ltn-game';
     var title = document.createElement('a');
     title.className = 'ltn-title';
     title.href = '/';
@@ -59,6 +117,7 @@
     }
 
     document.body.insertBefore(nav, document.body.firstChild);
+    propagateKey(nav);
   }
 
   if (document.readyState === 'loading') {

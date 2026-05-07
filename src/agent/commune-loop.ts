@@ -26,10 +26,11 @@ import { eventBus } from '../events/bus.js';
 import { getCurrentState } from './internal-state.js';
 import type { PeerConfig } from './character-tools.js';
 import type { ToolResult } from '../providers/base.js';
+import { getInterlinkHeaders } from '../security/interlink-auth.js';
+import { getLabeledSection, parseLabeledSections } from '../utils/structured-output.js';
 
 const COMMUNE_LOG_FILE = join(process.cwd(), 'logs', 'commune-debug.log');
 const WIRED_LAIN_URL = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
-const INTERLINK_TOKEN = process.env['LAIN_INTERLINK_TOKEN'] || '';
 
 async function communeLog(context: string, data: unknown): Promise<void> {
   try {
@@ -173,7 +174,8 @@ export function startCommuneLoop(
     scheduleNext(jitter);
   }
 
-  eventBus.on('activity', (event: import('../events/bus.js').SystemEvent) => {
+  // findings.md P2:2209 — store handler ref so restart doesn't leak listeners.
+  const activityHandler = (event: import('../events/bus.js').SystemEvent): void => {
     if (stopped || isRunning) return;
     if (event.type === 'state') {
       maybeRunEarly('state shift');
@@ -182,11 +184,13 @@ export function startCommuneLoop(
     } else if (event.sessionKey?.includes('letter')) {
       maybeRunEarly('letter activity');
     }
-  });
+  };
+  eventBus.on('activity', activityHandler);
 
   return () => {
     stopped = true;
     if (timer) clearTimeout(timer);
+    eventBus.off('activity', activityHandler);
     logger.info('Commune loop stopped');
   };
 }
@@ -288,6 +292,7 @@ async function phaseImpulse(
   try {
     const memories = await searchMemories('interesting ideas and conversations', 5, 0.1, undefined, {
       sortBy: 'importance',
+      skipAccessBoost: true,
     });
     memoriesContext = memories.map((r) => `- ${r.memory.content}`).join('\n');
   } catch {
@@ -393,15 +398,16 @@ If you truly have nothing to say to anyone right now, respond with [NOTHING].`;
     return null;
   }
 
-  const peerMatch = response.match(/PEER:\s*(.+)/i);
-  const messageMatch = response.match(/MESSAGE:\s*([\s\S]+)/i);
+  const sections = parseLabeledSections(response, ['PEER', 'MESSAGE']);
+  const peerMatch = getLabeledSection(sections, 'PEER');
+  const messageMatch = getLabeledSection(sections, 'MESSAGE');
 
   if (!peerMatch || !messageMatch) {
     logger.debug({ response }, 'Could not parse commune impulse');
     return null;
   }
 
-  const peerId = peerMatch[1]!.trim().replace(/"/g, '');
+  const peerId = peerMatch.replace(/"/g, '');
   const peer = config.peers.find((p) => p.id === peerId);
   if (!peer) {
     logger.debug({ peerId }, 'Impulse selected unknown peer');
@@ -412,7 +418,7 @@ If you truly have nothing to say to anyone right now, respond with [NOTHING].`;
     peerId: peer.id,
     peerName: peer.name,
     peerUrl: peer.url,
-    opening: messageMatch[1]!.trim(),
+    opening: messageMatch,
   };
 }
 
@@ -440,13 +446,19 @@ async function phaseConversation(
   if (!firstReply) {
     return [];
   }
+  // findings.md P2:2518 — if the peer was possessed, label this turn
+  // so the transcript + downstream memory don't mislabel owner text
+  // as peer-authored.
+  const firstSpeaker = firstReply.possessed
+    ? `${impulse.peerName} (possession: owner-authored)`
+    : impulse.peerName;
 
   transcript.push({ speaker: config.characterName, message: impulse.opening });
-  transcript.push({ speaker: impulse.peerName, message: firstReply });
+  transcript.push({ speaker: firstSpeaker, message: firstReply.text });
 
   // Broadcast opening exchange
   broadcastLine(config.characterId, config.characterName, impulse.peerId, impulse.peerName, impulse.opening, building);
-  broadcastLine(impulse.peerId, impulse.peerName, config.characterId, config.characterName, firstReply, building);
+  broadcastLine(impulse.peerId, impulse.peerName, config.characterId, config.characterName, firstReply.text, building);
 
   // Continue for additional rounds
   const totalRounds = MIN_ROUNDS + Math.floor(Math.random() * (MAX_ROUNDS - MIN_ROUNDS + 1));
@@ -494,10 +506,14 @@ Otherwise, respond with just your next message (no prefix, no "MESSAGE:" label).
     }
 
     // Broadcast peer reply
-    broadcastLine(impulse.peerId, impulse.peerName, config.characterId, config.characterName, peerReply, building);
+    broadcastLine(impulse.peerId, impulse.peerName, config.characterId, config.characterName, peerReply.text, building);
 
+    // findings.md P2:2518 — label possession-authored peer turns.
+    const peerSpeaker = peerReply.possessed
+      ? `${impulse.peerName} (possession: owner-authored)`
+      : impulse.peerName;
     transcript.push({ speaker: config.characterName, message: ourReply });
-    transcript.push({ speaker: impulse.peerName, message: peerReply });
+    transcript.push({ speaker: peerSpeaker, message: peerReply.text });
   }
 
   return transcript;
@@ -507,15 +523,19 @@ async function sendPeerMessage(
   impulse: CommuneImpulse,
   config: CommuneLoopConfig,
   message: string
-): Promise<string | null> {
+): Promise<{ text: string; possessed: boolean } | null> {
   const logger = getLogger();
 
   try {
     const endpoint = `${impulse.peerUrl}/api/peer/message`;
-    const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
+    const headers = getInterlinkHeaders();
+    if (!headers) {
+      logger.warn('Interlink not configured — skipping peer message');
+      return null;
+    }
     const response = await fetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${interlinkToken}` },
+      headers,
       body: JSON.stringify({
         fromId: config.characterId,
         fromName: config.characterName,
@@ -530,8 +550,12 @@ async function sendPeerMessage(
       return null;
     }
 
-    const result = await response.json() as { response: string };
-    return result.response;
+    // findings.md P2:2518 — surface the possession flag so the commune
+    // transcript can label possession-authored turns. Otherwise the
+    // peer's voice model quietly learns from owner keystrokes every
+    // time someone walks around Laintown while possessed.
+    const result = await response.json() as { response: string; possessed?: boolean };
+    return { text: result.response, possessed: !!result.possessed };
   } catch (error) {
     logger.warn({ error, peer: impulse.peerId }, 'Could not reach peer');
     return null;
@@ -678,7 +702,9 @@ async function phaseApproach(
   );
   await communeLog('APPROACH', { our: ourLoc.building, peer: peerBuilding, peerName: impulse.peerName });
 
-  const moveTools = getToolDefinitions().filter((t) => t.name === 'move_to_building');
+  // findings.md P2:1887 — honor the character's allowlist here too so a
+  // character who is not allowed `move_to_building` won't get it offered.
+  const moveTools = getToolDefinitions(config.characterId).filter((t) => t.name === 'move_to_building');
   if (moveTools.length === 0) return;
 
   const approachPrompt = `You are ${config.characterName}. You want to talk to ${impulse.peerName}. They are at the ${peerBuilding}. You are at the ${ourLoc.building}.
@@ -713,7 +739,9 @@ async function phaseAftermath(
 ): Promise<void> {
   const logger = getLogger();
 
-  const aftermathTools = getToolDefinitions().filter((t) =>
+  // findings.md P2:1887 — aftermath options also respect the per-character
+  // allowlist so restricted tools (e.g. `give_gift`) are not offered here.
+  const aftermathTools = getToolDefinitions(config.characterId).filter((t) =>
     t.name === 'leave_note' || t.name === 'give_gift' || t.name === 'write_document' ||
     t.name === 'move_to_building' ||
     t.name === 'create_object' || t.name === 'give_object' || t.name === 'drop_object' ||
@@ -747,10 +775,13 @@ Otherwise respond [NOTHING].`;
       logger.info({ tool: tc.name, peer: impulse.peerName }, 'Commune aftermath: tool used');
     }
 
+    // findings.md P2:930 — thread prior turn's text through so the
+    // reconstructed assistant message keeps both text and tool_use.
     result = await provider.continueWithToolResults(
       { messages: [{ role: 'user', content: aftermathPrompt }], tools: aftermathTools, maxTokens: 800, temperature: 0.9 },
       result.toolCalls,
-      toolResults
+      toolResults,
+      result.content
     );
   }
 
@@ -771,12 +802,11 @@ async function broadcastLine(
   building: string
 ): Promise<void> {
   try {
+    const headers = getInterlinkHeaders();
+    if (!headers) return; // non-critical broadcast
     await fetch(`${WIRED_LAIN_URL}/api/conversations/event`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${INTERLINK_TOKEN}`,
-      },
+      headers,
       body: JSON.stringify({
         speakerId,
         speakerName,

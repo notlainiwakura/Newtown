@@ -195,11 +195,11 @@ describe('Dream Loop', () => {
   });
 
   it('has TWO distinct LLM calls — fragment generation AND residue compression', () => {
-    // Fragment generation uses maxTokens: 400
-    // Residue compression uses maxTokens: 60
+    // Fragment generation uses maxTokens: 500
+    // Residue compression uses maxTokens: 120
     const tokens = extractMaxTokens(src);
-    expect(tokens).toContain(400);
-    expect(tokens).toContain(60);
+    expect(tokens).toContain(500);
+    expect(tokens).toContain(120);
     expect(tokens.length).toBeGreaterThanOrEqual(2);
   });
 
@@ -771,8 +771,10 @@ describe('Awareness Module', () => {
     expect(src).toContain('Awareness: failed to check peer');
   });
 
-  it('uses LAIN_INTERLINK_TOKEN for auth', () => {
-    expect(src).toContain("LAIN_INTERLINK_TOKEN");
+  it('uses per-character interlink headers for auth', () => {
+    // Per-character tokens (findings.md P1:2289) — auth flows through
+    // getInterlinkHeaders(), not a raw LAIN_INTERLINK_TOKEN env read.
+    expect(src).toContain('getInterlinkHeaders');
   });
 });
 
@@ -1054,7 +1056,7 @@ describe('Doctor Loop', () => {
 
   it('fetches town-wide telemetry from all characters', () => {
     expect(src).toContain('fetchAllCharacterTelemetry');
-    expect(src).toContain('TELEMETRY_SERVICES');
+    expect(src).toContain('getInhabitants');
   });
 
   it('detects stalled loops across characters', () => {
@@ -1180,8 +1182,8 @@ describe('Experiment Loop', () => {
     expect(src).toContain("type: 'experiment_result'");
   });
 
-  it('has budget tracking — daily spend limit', () => {
-    expect(src).toContain('dailyBudgetUsd');
+  it('has budget tracking — monthly spend limit', () => {
+    expect(src).toContain('monthlyBudgetUsd');
     expect(src).toContain('isBudgetExhausted');
     expect(src).toContain('addSpend');
   });
@@ -1242,7 +1244,7 @@ describe('Experiment Loop', () => {
 
   it('shares results with peer characters', () => {
     expect(src).toContain('shareWithPeers');
-    expect(src).toContain('SHARE_PEERS');
+    expect(src).toContain('getInhabitants');
   });
 
   it('generates personal reflection in character voice', () => {
@@ -1611,14 +1613,14 @@ describe('Diary: dual storage guarantee', () => {
 describe('Dreams: dual LLM call guarantee', () => {
   const src = readAgentFile('dreams.ts');
 
-  it('generateDreamFragment uses maxTokens 400', () => {
+  it('generateDreamFragment uses maxTokens 500', () => {
     // Fragment generation prompt includes "2-3 sentences maximum"
-    expect(src).toContain('maxTokens: 400');
+    expect(src).toContain('maxTokens: 500');
   });
 
-  it('saveDreamResidue uses maxTokens 60 for compression', () => {
+  it('saveDreamResidue uses maxTokens 120 for compression', () => {
     // Residue compression: "One sentence only"
-    expect(src).toContain('maxTokens: 60');
+    expect(src).toContain('maxTokens: 120');
   });
 
   it('residue generation is conditional on probability', () => {

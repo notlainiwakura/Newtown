@@ -385,7 +385,7 @@
       <div class="compose-actions">
         <span class="spacer"></span>
         <span id="status"></span>
-        <button class="btn btn-amen" id="amen-btn" onclick="sendEvent()">AMEN</button>
+        <button class="btn btn-amen" id="amen-btn" type="button">AMEN</button>
       </div>
     </div>
   </div>
@@ -398,7 +398,7 @@
 
   <!-- History -->
   <div class="events-section">
-    <div class="section-title" style="cursor:pointer" onclick="toggleHistory()">History <span id="history-arrow">&#9654;</span></div>
+    <div class="section-title" id="history-toggle" style="cursor:pointer">History <span id="history-arrow">&#9654;</span></div>
     <div id="history-events" style="display:none"></div>
   </div>
 
@@ -501,7 +501,7 @@
       if (fx.weather) parts.push('Weather: ' + fx.weather);
       if (parts.length > 0) effectsHtml = `<div class="event-effects">${parts.join(' · ')}</div>`;
 
-      const endBtn = (showEnd && IS_OWNER) ? `<div class="event-actions"><button class="btn btn-end" onclick="endEvent('${e.id}')">END EVENT</button></div>` : '';
+      const endBtn = (showEnd && IS_OWNER) ? `<div class="event-actions"><button class="btn btn-end" type="button" data-event-id="${escapeHtml(e.id)}">END EVENT</button></div>` : '';
       const endedClass = e.status === 'ended' ? ' ended' : '';
       const timeLabel = e.status === 'ended' && e.endedAt
         ? `${formatTime(e.createdAt)} — ended ${formatTime(e.endedAt)}`
@@ -640,6 +640,13 @@
         e.preventDefault();
         sendEvent();
       }
+    });
+    document.getElementById('amen-btn').addEventListener('click', sendEvent);
+    document.getElementById('history-toggle').addEventListener('click', toggleHistory);
+    document.getElementById('active-events').addEventListener('click', (e) => {
+      const btn = e.target.closest('.btn-end[data-event-id]');
+      if (!btn) return;
+      endEvent(btn.dataset.eventId);
     });
 
     loadEvents();

@@ -11,6 +11,8 @@ import { getLogger } from '../utils/logger.js';
 import { eventBus } from '../events/bus.js';
 import { nanoid } from 'nanoid';
 import type { Relationship } from './relationships.js';
+import { getDefaultLocations } from '../config/characters.js';
+import { peekCachedTownWeather } from '../commune/weather.js';
 
 export interface InternalState {
   energy: number;              // 0=exhausted, 1=vibrant
@@ -210,24 +212,38 @@ export function decayPreoccupations(): void {
 }
 
 const BUILDING_MOODS: Record<string, { energy: string; social: string; intellectual: string }> = {
-  pub: { energy: 'mid', social: 'high', intellectual: 'low' },
-  station: { energy: 'mid', social: 'mid', intellectual: 'mid' },
-  'abandoned-house': { energy: 'low', social: 'low', intellectual: 'mid' },
-  field: { energy: 'any', social: 'low', intellectual: 'mid' },
-  windmill: { energy: 'high', social: 'low', intellectual: 'mid' },
-  locksmith: { energy: 'mid', social: 'low', intellectual: 'high' },
-  'mystery-tower': { energy: 'mid', social: 'low', intellectual: 'high' },
-  theater: { energy: 'mid', social: 'high', intellectual: 'mid' },
-  square: { energy: 'mid', social: 'high', intellectual: 'low' },
+  library:    { energy: 'low',  social: 'low',  intellectual: 'high' },
+  bar:        { energy: 'mid',  social: 'high', intellectual: 'low'  },
+  field:      { energy: 'any',  social: 'low',  intellectual: 'mid'  },
+  windmill:   { energy: 'high', social: 'low',  intellectual: 'mid'  },
+  lighthouse: { energy: 'mid',  social: 'low',  intellectual: 'high' },
+  school:     { energy: 'mid',  social: 'mid',  intellectual: 'high' },
+  market:     { energy: 'high', social: 'high', intellectual: 'low'  },
+  locksmith:  { energy: 'mid',  social: 'low',  intellectual: 'mid'  },
+  threshold:  { energy: 'low',  social: 'low',  intellectual: 'low'  },
 };
 
-const DEFAULT_BUILDINGS: Record<string, string> = {
-  'newtown': 'square',
-  'neo': 'station',
-  'plato': 'mystery-tower',
-  'joe': 'square',
-};
+// findings.md P2:2219 — the old hardcoded inhabitant list drifted on
+// generational succession (e.g., John → Jane leaves 'john' here but no
+// 'jane'), leaving the new character with a library fallback instead of
+// their intended comfort place. Source from the manifest so every
+// character — existing, new, or deployment-specific — gets the building
+// their operator configured.
+function getDefaultBuildings(): Record<string, string> {
+  try {
+    return getDefaultLocations();
+  } catch {
+    return {};
+  }
+}
 
+// findings.md P2:2219 — the five-signal model below is effectively a
+// one-signal model: the 0.6 confidence threshold (at the call site in
+// processEvent) only signal 1 (peer-pull, weight 0.4) can cross at max
+// intensity; signals 2-5 max out at 0.55 / 0.50 / 0.40 / 0.45 respectively
+// after the +0.3 confidence offset. Tuning the weights or the threshold
+// is a behavioral change that needs product alignment — tracking here so
+// a future pass can rebalance rather than silently living with the gap.
 export function evaluateMovementDesire(
   state: InternalState,
   preoccupations: Preoccupation[],
@@ -256,8 +272,8 @@ export function evaluateMovementDesire(
 
   // Signal 2: Energy retreat (weight 0.25)
   if (state.energy < 0.3 && state.sociability < 0.4) {
-    const charId = eventBus.characterId;
-    const defaultBuilding = DEFAULT_BUILDINGS[charId] || 'square';
+    const charId = eventBus.characterId ?? '';
+    const defaultBuilding = getDefaultBuildings()[charId] || 'library';
     if (defaultBuilding !== currentBuilding) {
       candidates.push({
         building: defaultBuilding,
@@ -292,7 +308,7 @@ export function evaluateMovementDesire(
 
   // Signal 4: Intellectual pull (weight 0.1)
   if (state.intellectual_arousal > 0.7) {
-    const intellectualBuildings = ['mystery-tower', 'locksmith'];
+    const intellectualBuildings = ['library', 'lighthouse'];
     for (const b of intellectualBuildings) {
       if (b !== currentBuilding) {
         candidates.push({
@@ -441,7 +457,7 @@ Respond with ONLY a JSON object with keys: energy, sociability, intellectual_aro
     const { setCurrentLocation, getCurrentLocation } = await import('../commune/location.js');
     const { getAllRelationships } = await import('./relationships.js');
 
-    const charId = process.env['LAIN_CHARACTER_ID'] || eventBus.characterId;
+    const charId = process.env['LAIN_CHARACTER_ID'] || eventBus.characterId || undefined;
     const loc = getCurrentLocation(charId);
     const lastMoveRaw = getMeta('movement:last_move_at');
     const lastMoveAt = lastMoveRaw ? parseInt(lastMoveRaw, 10) : 0;
@@ -502,11 +518,16 @@ export function startStateDecayLoop(): () => void {
       const state = getCurrentState();
       const decayed = applyDecay(state);
 
-      // Apply weather effects (inline to avoid circular dependency with weather.ts)
+      // findings.md P2:1505 — use peekCachedTownWeather so mortal
+      // characters consume WL's computed weather (populated by the
+      // startTownWeatherRefreshLoop). Previously this read
+      // getMeta('weather:current') from the process-local DB, which
+      // returned null on every process except WL — so weather effects
+      // only landed on Wired Lain's internal state.
+      // findings.md P2:1520 — scale each delta by the computed intensity.
       try {
-        const weatherRaw = getMeta('weather:current');
-        if (weatherRaw) {
-          const weather = JSON.parse(weatherRaw) as { condition: string };
+        const weather = peekCachedTownWeather();
+        if (weather) {
           const WEATHER_EFFECTS: Record<string, Partial<InternalState>> = {
             storm: { energy: -0.04, intellectual_arousal: 0.03 },
             rain: { emotional_weight: 0.03, sociability: -0.02 },
@@ -516,11 +537,13 @@ export function startStateDecayLoop(): () => void {
           };
           const effect = WEATHER_EFFECTS[weather.condition];
           if (effect) {
-            if (effect.energy) decayed.energy += effect.energy;
-            if (effect.sociability) decayed.sociability += effect.sociability;
-            if (effect.intellectual_arousal) decayed.intellectual_arousal += effect.intellectual_arousal;
-            if (effect.emotional_weight) decayed.emotional_weight += effect.emotional_weight;
-            if (effect.valence) decayed.valence += effect.valence;
+            const raw = typeof weather.intensity === 'number' ? weather.intensity : 1;
+            const scale = Math.max(0, Math.min(1, raw));
+            if (effect.energy) decayed.energy += effect.energy * scale;
+            if (effect.sociability) decayed.sociability += effect.sociability * scale;
+            if (effect.intellectual_arousal) decayed.intellectual_arousal += effect.intellectual_arousal * scale;
+            if (effect.emotional_weight) decayed.emotional_weight += effect.emotional_weight * scale;
+            if (effect.valence) decayed.valence += effect.valence * scale;
           }
         }
       } catch { /* non-critical */ }

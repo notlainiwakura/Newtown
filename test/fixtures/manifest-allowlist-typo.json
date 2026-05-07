@@ -1,0 +1,15 @@
+{
+  "town": { "name": "Typo Town", "description": "fixture" },
+  "characters": [
+    {
+      "id": "lain",
+      "name": "Lain",
+      "port": 3001,
+      "server": "character",
+      "defaultLocation": "home",
+      "immortal": true,
+      "workspace": "workspace/characters/lain",
+      "allowedTools": ["get_current_time", "nonexistent_tool"]
+    }
+  ]
+}

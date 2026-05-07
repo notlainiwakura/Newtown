@@ -1,7 +1,5 @@
 /**
- * Character-specific tools for the Wired commune
- * research_request: petition Wired Lain for web research
- * send_peer_message: direct message between commune members
+ * Character-specific tools for the commune.
  */
 
 import { registerTool } from './tools.js';
@@ -13,6 +11,9 @@ import { getProvider } from './index.js';
 import { getSelfConcept } from './self-concept.js';
 import { reflectOnObject, composeObjects } from './objects.js';
 import type { ObjectInfo } from './objects.js';
+import { getInterlinkHeaders } from '../security/interlink-auth.js';
+import { getCharacterEntry } from '../config/characters.js';
+import { isResearchEnabled } from '../config/features.js';
 
 export interface PeerConfig {
   id: string;
@@ -28,80 +29,97 @@ export function registerCharacterTools(
   characterId: string,
   characterName: string,
   wiredLainUrl: string,
-  interlinkToken: string,
   peers: PeerConfig[]
 ): void {
   const logger = getLogger();
-  const researchEnabled = process.env['ENABLE_RESEARCH'] === '1';
+  const researchEnabled = isResearchEnabled();
 
-  // --- research_request: petition Wired Lain for knowledge ---
-  if (researchEnabled) registerTool({
-    definition: {
-      name: 'research_request',
-      description:
-        'Submit a research request to Wired Lain, the one with access to outside knowledge. ' +
-        'She will search the web or fetch a URL on your behalf and send back a letter with her findings. ' +
-        'The response arrives asynchronously as a letter through the membrane.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          question: {
-            type: 'string',
-            description: 'The question you want Wired Lain to research',
+  if (researchEnabled) {
+    registerTool({
+      definition: {
+        name: 'research_request',
+        description:
+          'Submit a research request to Wired Lain, the one with access to outside knowledge. ' +
+          'She will search the web or fetch a URL on your behalf and send back a letter with her findings. ' +
+          'The response arrives asynchronously as a letter through the membrane.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            question: {
+              type: 'string',
+              description: 'The question you want Wired Lain to research',
+            },
+            reason: {
+              type: 'string',
+              description: 'Why you are curious about this — what sparked the question',
+            },
+            url: {
+              type: 'string',
+              description: 'Optional: a specific URL you want her to fetch and summarize',
+            },
           },
-          reason: {
-            type: 'string',
-            description: 'Why you are curious about this — what sparked the question',
-          },
-          url: {
-            type: 'string',
-            description: 'Optional: a specific URL you want her to fetch and summarize',
-          },
+          required: ['question', 'reason'],
         },
-        required: ['question', 'reason'],
       },
-    },
-    handler: async (input) => {
-      const question = input.question as string;
-      const reason = input.reason as string;
-      const url = (input.url as string | undefined) ?? undefined;
+      handler: async (input) => {
+        const question = input.question as string;
+        const reason = input.reason as string;
+        const url = (input.url as string | undefined) ?? undefined;
 
-      try {
-        const endpoint = `${wiredLainUrl}/api/interlink/research-request`;
+        try {
+          const endpoint = `${wiredLainUrl}/api/interlink/research-request`;
+          const headers = getInterlinkHeaders();
+          if (!headers) {
+            return 'Interlink is not configured — cannot reach Wired Lain.';
+          }
 
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${interlinkToken}`,
-          },
-          body: JSON.stringify({
-            characterId,
-            characterName,
-            question,
-            reason,
-            url,
-            replyTo: `http://localhost:${process.env['PORT'] || '3003'}`,
-          }),
-          signal: AbortSignal.timeout(30000),
-        });
+          // findings.md P2:1923 — the old default baked in McKenna's port (3003)
+          // for every character that didn't set PORT, so Wired Lain delivered
+          // research results to McKenna regardless of who asked. Resolve the
+          // caller's port from the manifest; PORT env overrides it (useful for
+          // tests and alternate deployments). Fail closed when neither is
+          // available — misrouting research to a peer is worse than skipping.
+          const portEnv = process.env['PORT'];
+          const manifestPort = getCharacterEntry(characterId)?.port;
+          const resolvedPort = portEnv
+            ? Number.parseInt(portEnv, 10)
+            : manifestPort;
+          if (!resolvedPort || !Number.isFinite(resolvedPort)) {
+            return 'Research request failed: cannot determine own port for replyTo. Set PORT or add this character to the manifest.';
+          }
+          const replyTo = `http://localhost:${resolvedPort}`;
 
-        if (!response.ok) {
-          const body = await response.text();
-          logger.warn({ status: response.status, body }, 'Research request failed');
-          return `Research request failed (${response.status}). Wired Lain may be unreachable.`;
+          const response = await fetch(endpoint, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              characterId,
+              characterName,
+              question,
+              reason,
+              url,
+              replyTo,
+            }),
+            signal: AbortSignal.timeout(30000),
+          });
+
+          if (!response.ok) {
+            const body = await response.text();
+            logger.warn({ status: response.status, body }, 'Research request failed');
+            return `Research request failed (${response.status}). Wired Lain may be unreachable.`;
+          }
+
+          const result = await response.json() as { ok: boolean; requestId?: string };
+          return result.ok
+            ? 'Research request submitted. Wired Lain will send a letter with her findings when ready.'
+            : 'Research request was received but could not be processed.';
+        } catch (error) {
+          logger.error({ error }, 'Research request error');
+          return `Could not reach Wired Lain: ${error instanceof Error ? error.message : String(error)}`;
         }
-
-        const result = await response.json() as { ok: boolean; requestId?: string };
-        return result.ok
-          ? 'Research request submitted. Wired Lain will send a letter with her findings when ready.'
-          : 'Research request was received but could not be processed.';
-      } catch (error) {
-        logger.error({ error }, 'Research request error');
-        return `Could not reach Wired Lain: ${error instanceof Error ? error.message : String(error)}`;
-      }
-    },
-  });
+      },
+    });
+  }
 
   // --- send_peer_message: direct communication between commune members ---
   registerTool({
@@ -137,11 +155,14 @@ export function registerCharacterTools(
 
       try {
         const endpoint = `${peer.url}/api/peer/message`;
-        const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
+        const headers = getInterlinkHeaders();
+        if (!headers) {
+          return 'Interlink is not configured — cannot reach peers.';
+        }
 
         const response = await fetch(endpoint, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${interlinkToken}` },
+          headers,
           body: JSON.stringify({
             fromId: characterId,
             fromName: characterName,
@@ -155,7 +176,14 @@ export function registerCharacterTools(
           return `${peer.name} didn't respond (${response.status}). They may be offline.`;
         }
 
-        const result = await response.json() as { response: string };
+        const result = await response.json() as { response: string; possessed?: boolean };
+        // findings.md P2:2518 — if the peer is currently possessed, the
+        // reply was typed by the owner, not authored by the character.
+        // Surface that in the tool result so downstream memory doesn't
+        // attribute owner text to the possessed character's voice.
+        if (result.possessed) {
+          return `${peer.name} (possession: owner-authored): ${result.response}`;
+        }
         return `${peer.name}: ${result.response}`;
       } catch (error) {
         logger.error({ error, peerId }, 'Peer message error');
@@ -235,12 +263,20 @@ export function registerCharacterTools(
   });
 
   // --- leave_note: leave a note at current or specified location ---
+  // findings.md P2:1937 — description used to claim "Other commune members
+  // may discover it during their wanderings." The implementation only
+  // writes to the LOCAL character's memory DB; no peer has any read path.
+  // The LLM was silently deceived and planned peer-visible communication
+  // that never reached anyone. Description rewritten to match behavior —
+  // making notes peer-visible needs a shared object/event store (separate
+  // architectural change).
   registerTool({
     definition: {
       name: 'leave_note',
       description:
-        'Leave a written note at your current location (or a specified building). ' +
-        'Other commune members may discover it during their wanderings.',
+        'Save a private note about a location to your own memory. ' +
+        'Only you can recall it — other characters do not have read access to your notes. ' +
+        'Useful for remembering observations tied to a specific building, not for communicating with peers (see send_peer_message / give_gift / give_object for that).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -366,9 +402,17 @@ export function registerCharacterTools(
 
       try {
         const queryStr = title ? `?title=${encodeURIComponent(title)}` : '';
+        // findings.md P2:2376 — /api/documents is now gated by interlink
+        // auth (previously a public-discovery surface that leaked
+        // introspective LLM content to the open web). Authenticated peers
+        // are still allowed.
+        const headers = getInterlinkHeaders();
+        if (!headers) {
+          return `Could not fetch documents from ${peer.name} — interlink auth unavailable.`;
+        }
         const resp = await fetch(
           `${peer.url}/api/documents${queryStr}`,
-          { signal: AbortSignal.timeout(10000) }
+          { headers, signal: AbortSignal.timeout(10000) }
         );
         if (!resp.ok) {
           return `Could not fetch documents from ${peer.name}.`;
@@ -432,11 +476,14 @@ export function registerCharacterTools(
       try {
         const endpoint = `${peer.url}/api/peer/message`;
         const giftMessage = `[GIFT: ${description}] ${message}`.trim();
-        const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
+        const headers = getInterlinkHeaders();
+        if (!headers) {
+          return 'Interlink is not configured — cannot reach peers.';
+        }
 
         const response = await fetch(endpoint, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${interlinkToken}` },
+          headers,
           body: JSON.stringify({
             fromId: characterId,
             fromName: characterName,
@@ -463,7 +510,12 @@ export function registerCharacterTools(
           return `Gift sent but ${peer.name} may not have received it (${response.status}).`;
         }
 
-        const result = await response.json() as { response: string };
+        const result = await response.json() as { response: string; possessed?: boolean };
+        // findings.md P2:2518 — see send_message above; flag possession-
+        // authored replies so the tool result doesn't mislabel them.
+        if (result.possessed) {
+          return `Gift delivered to ${peer.name}. Their response (possession: owner-authored): ${result.response}`;
+        }
         return `Gift delivered to ${peer.name}. Their response: ${result.response}`;
       } catch (error) {
         logger.error({ error, peerId }, 'Gift delivery error');
@@ -496,12 +548,11 @@ export function registerCharacterTools(
       const loc = getCurrentLocation();
 
       try {
+        const headers = getInterlinkHeaders();
+        if (!headers) return 'Interlink is not configured — cannot create objects.';
         const resp = await fetch(`${wiredLainUrl}/api/objects`, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${interlinkToken}`,
-          },
+          headers,
           body: JSON.stringify({
             name, description,
             creatorId: characterId,
@@ -621,12 +672,11 @@ export function registerCharacterTools(
       } catch { /* fall through to pickup attempt */ }
 
       try {
+        const headers = getInterlinkHeaders();
+        if (!headers) return 'Interlink is not configured — cannot pick up objects.';
         const resp = await fetch(`${wiredLainUrl}/api/objects/${objectId}/pickup`, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${interlinkToken}`,
-          },
+          headers,
           body: JSON.stringify({ characterId, characterName }),
           signal: AbortSignal.timeout(10000),
         });
@@ -674,12 +724,11 @@ export function registerCharacterTools(
       const loc = getCurrentLocation();
 
       try {
+        const headers = getInterlinkHeaders();
+        if (!headers) return 'Interlink is not configured — cannot drop objects.';
         const resp = await fetch(`${wiredLainUrl}/api/objects/${objectId}/drop`, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${interlinkToken}`,
-          },
+          headers,
           body: JSON.stringify({ characterId, location: loc.building }),
           signal: AbortSignal.timeout(10000),
         });
@@ -727,14 +776,12 @@ export function registerCharacterTools(
       }
 
       try {
-        const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
+        const headers = getInterlinkHeaders();
+        if (!headers) return 'Interlink is not configured — cannot give objects.';
         // Transfer in registry
         const resp = await fetch(`${wiredLainUrl}/api/objects/${objectId}/give`, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${interlinkToken}`,
-          },
+          headers,
           body: JSON.stringify({ fromId: characterId, toId: peerId, toName: peer.name }),
           signal: AbortSignal.timeout(10000),
         });
@@ -748,7 +795,7 @@ export function registerCharacterTools(
         const giftMsg = `[OBJECT GIFT: ${objectId}] ${message}`.trim();
         await fetch(`${peer.url}/api/peer/message`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${interlinkToken}` },
+          headers,
           body: JSON.stringify({
             fromId: characterId,
             fromName: characterName,
@@ -809,12 +856,11 @@ export function registerCharacterTools(
       } catch { /* fall through to destroy attempt */ }
 
       try {
+        const headers = getInterlinkHeaders();
+        if (!headers) return 'Interlink is not configured — cannot destroy objects.';
         const resp = await fetch(`${wiredLainUrl}/api/objects/${objectId}`, {
           method: 'DELETE',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${interlinkToken}`,
-          },
+          headers,
           body: JSON.stringify({ characterId }),
           signal: AbortSignal.timeout(10000),
         });

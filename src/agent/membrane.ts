@@ -87,7 +87,7 @@ Rewrite as a single cohesive paragraph (3-5 sentences). Preserve emotional tone.
 
   const result = await provider.complete({
     messages: [{ role: 'user', content: prompt }],
-    maxTokens: 500,
+    maxTokens: 2048,
     temperature: 0.3,
   });
 

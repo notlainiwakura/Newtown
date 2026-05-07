@@ -31,6 +31,7 @@ import {
 } from './data-workspace.js';
 import { eventBus } from '../events/bus.js';
 import { getCurrentState } from './internal-state.js';
+import { getLabeledSection, parseLabeledSections } from '../utils/structured-output.js';
 
 const CURIOSITY_LOG_FILE = join(process.cwd(), 'logs', 'curiosity-debug.log');
 
@@ -185,18 +186,21 @@ export function startCuriosityLoop(config?: Partial<CuriosityConfig>): () => voi
     scheduleNext(jitter);
   }
 
-  eventBus.on('activity', (event: import('../events/bus.js').SystemEvent) => {
+  // findings.md P2:2209 — store handler ref so restart doesn't leak listeners.
+  const activityHandler = (event: import('../events/bus.js').SystemEvent): void => {
     if (stopped || isRunning) return;
     if (event.sessionKey?.startsWith('state:conversation:end')) {
       maybeRunEarly('conversation ended');
     } else if (event.type === 'state' && event.content?.includes('intellectual')) {
       maybeRunEarly('intellectual state shift');
     }
-  });
+  };
+  eventBus.on('activity', activityHandler);
 
   return () => {
     stopped = true;
     if (timer) clearTimeout(timer);
+    eventBus.off('activity', activityHandler);
     logger.info('Curiosity loop stopped');
   };
 }
@@ -286,9 +290,7 @@ async function phaseInnerThought(
   const recentMessages = getRecentVisitorMessages(20);
   const messagesContext = recentMessages
     .map((m) => {
-      const role = m.role === 'user'
-        ? 'User'
-        : (process.env['LAIN_CHARACTER_NAME'] || 'Newtown');
+      const role = m.role === 'user' ? 'User' : 'Lain';
       const content = m.content.length > 150 ? m.content.slice(0, 150) + '...' : m.content;
       return `${role}: ${content}`;
     })
@@ -300,6 +302,7 @@ async function phaseInnerThought(
     if (stats.memories > 0) {
       const memories = await searchMemories('interesting topics and conversations', 5, 0.1, undefined, {
         sortBy: 'importance',
+        skipAccessBoost: true,
       });
       memoriesContext = memories
         .map((r) => `- ${r.memory.content}`)
@@ -407,17 +410,16 @@ Only respond with [NOTHING] if the conversations and memories above are complete
     return null;
   }
 
-  // Parse SITE and QUERY
-  const siteMatch = response.match(/SITE:\s*(.+)/i);
-  const queryMatch = response.match(/QUERY:\s*(.+)/i);
+  const sections = parseLabeledSections(response, ['SITE', 'QUERY']);
+  const siteMatch = getLabeledSection(sections, 'SITE');
+  const queryMatch = getLabeledSection(sections, 'QUERY');
 
   if (!siteMatch || !queryMatch) {
     logger.debug({ response }, 'Could not parse curiosity thought');
     return null;
   }
-
-  const site = siteMatch[1]!.trim();
-  const query = queryMatch[1]!.trim();
+  const site = siteMatch;
+  const query = queryMatch;
 
   // Validate domain is in whitelist (skip if unrestricted)
   if (!unrestricted) {
@@ -596,23 +598,25 @@ interface DigestResult {
  * Parse structured digest response into fields
  */
 function parseDigestResponse(response: string): DigestResult | null {
-  const summaryMatch = response.match(/SUMMARY:\s*(.+)/i);
-  const whyMatch = response.match(/WHY_IT_MATTERS:\s*(.+)/i);
-  const themesMatch = response.match(/THEMES:\s*(.+)/i);
-  const questionsMatch = response.match(/QUESTIONS:\s*(.+)/i);
-  const dataUrlMatch = response.match(/DATA_URL:\s*(.+)/i);
-  const shareMatch = response.match(/SHARE:\s*(.+)/i);
+  const sections = parseLabeledSections(response, [
+    'SUMMARY',
+    'WHY_IT_MATTERS',
+    'THEMES',
+    'QUESTIONS',
+    'DATA_URL',
+    'SHARE',
+  ]);
+  const summary = getLabeledSection(sections, 'SUMMARY');
 
-  if (!summaryMatch) return null;
+  if (!summary) return null;
 
-  const summary = summaryMatch[1]!.trim();
-  const whyItMatters = whyMatch?.[1]?.trim() || '';
-  const themes = themesMatch?.[1]?.trim().split(/,\s*/).filter(Boolean) || [];
-  const rawQuestions = questionsMatch?.[1]?.trim() || '';
+  const whyItMatters = getLabeledSection(sections, 'WHY_IT_MATTERS') || '';
+  const themes = getLabeledSection(sections, 'THEMES')?.split(/,\s*/).filter(Boolean) || [];
+  const rawQuestions = getLabeledSection(sections, 'QUESTIONS') || '';
   const newQuestions = rawQuestions === 'NONE' ? [] : rawQuestions.split('|').map(q => q.trim()).filter(Boolean);
-  const rawShare = shareMatch?.[1]?.trim() || '';
+  const rawShare = getLabeledSection(sections, 'SHARE') || '';
   const share = rawShare === 'NOTHING' || rawShare.length === 0 ? null : rawShare;
-  const rawDataUrl = dataUrlMatch?.[1]?.trim() || '';
+  const rawDataUrl = getLabeledSection(sections, 'DATA_URL') || '';
   const dataUrl = rawDataUrl === 'NONE' || rawDataUrl.length === 0 ? null : rawDataUrl;
 
   return { summary, whyItMatters, themes, newQuestions, share, dataUrl };
@@ -1118,6 +1122,7 @@ async function linkRelatedDiscoveries(newMemoryId: string, content: string): Pro
   try {
     const results = await searchMemories(content, 5, 0.55, undefined, {
       memoryTypes: ['episode'],
+      skipAccessBoost: true,
     });
 
     // Filter to only curiosity:browse memories, excluding the one we just saved
@@ -1158,6 +1163,7 @@ async function getRecentDiscoveries(limit = 3): Promise<string> {
     const results = await searchMemories('interesting topics and discoveries', limit, 0.1, undefined, {
       memoryTypes: ['episode'],
       sortBy: 'recency',
+      skipAccessBoost: true,
     });
 
     const browseResults = results.filter(r => r.memory.sessionKey === 'curiosity:browse');
@@ -1224,6 +1230,7 @@ async function linkEvolutionChain(memoryId: string, themes: string[]): Promise<v
     const themeQuery = themes.join(' ');
     const results = await searchMemories(themeQuery, 5, 0.4, undefined, {
       memoryTypes: ['episode'],
+      skipAccessBoost: true,
     });
 
     const candidates = results.filter(
@@ -1316,19 +1323,21 @@ MOVE: <building_id> | <reason>`;
 
     const response = result.content.trim();
 
-    if (response.startsWith('STAY')) {
+    const sections = parseLabeledSections(response, ['STAY', 'MOVE']);
+    if (getLabeledSection(sections, 'STAY')) {
       logger.debug({ location: current.building }, 'Movement decision: staying');
       return;
     }
 
-    const moveMatch = response.match(/^MOVE:\s*(\S+)\s*\|\s*(.+)/i);
-    if (!moveMatch) {
+    const moveDecision = getLabeledSection(sections, 'MOVE');
+    const separatorIdx = moveDecision?.indexOf('|') ?? -1;
+    if (!moveDecision || separatorIdx < 0) {
       logger.debug({ response }, 'Could not parse movement decision');
       return;
     }
 
-    const targetId = moveMatch[1]!.trim();
-    const reason = moveMatch[2]!.trim();
+    const targetId = moveDecision.slice(0, separatorIdx).trim().split(/\s+/)[0] ?? '';
+    const reason = moveDecision.slice(separatorIdx + 1).trim();
 
     if (!isValidBuilding(targetId)) {
       logger.debug({ targetId }, 'Invalid building in movement decision');

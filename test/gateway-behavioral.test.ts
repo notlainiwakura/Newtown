@@ -1285,34 +1285,43 @@ describe('Rate limiter behavioral — full pipeline over socket', () => {
     await destroySocket(c2);
   });
 
-  it('connection limit per minute blocks new connections', async () => {
+  // findings.md P2:2616 — the per-minute cap is enforced on successful
+  // auth (canAuthenticate), not on raw connect. Connect-time rejection
+  // only kicks in past the pre-auth DoS backstop (max 1000/min), so
+  // these tests verify the rate limit through the auth path.
+  it('auth limit per minute blocks further authentications', async () => {
+    vi.mocked(getAuthToken).mockResolvedValue('tok');
     config = makeConfig({
       rateLimit: { connectionsPerMinute: 3, requestsPerSecond: 10, burstSize: 20 },
     });
-    await startServer(config, { requireAuth: false });
-    const clients: Socket[] = [];
-    // Connect 3 clients (the limit)
+    await startServer(config, { requireAuth: true });
+    // Exhaust the 3-auth budget
     for (let i = 0; i < 3; i++) {
-      clients.push(await connectClient(config.socketPath));
+      const c = await connectClient(config.socketPath);
+      const r = await sendAndReceive(c, msg('auth', { token: 'tok' }, `ok-${i}`));
+      expect(r.error).toBeUndefined();
+      await destroySocket(c);
     }
-    // 4th connection should get a rate limit response immediately
+    // 4th auth should be rate-limited
     const c4 = await connectClient(config.socketPath);
-    const resp = await readResponse(c4);
-    expect(resp.error?.code).toBe(GatewayErrorCodes.RATE_LIMITED);
-    expect(resp.error?.message).toContain('Too many connections');
-    await Promise.all([...clients, c4].map(destroySocket));
+    const r4 = await sendAndReceive(c4, msg('auth', { token: 'tok' }, 'rl'));
+    expect(r4.error?.code).toBe(GatewayErrorCodes.UNAUTHORIZED);
+    expect(r4.error?.message).toMatch(/rate limit/i);
+    await destroySocket(c4);
   });
 
-  it('connection rate limit includes retryAfter', async () => {
+  it('auth rate limit error message includes retry-after hint', async () => {
+    vi.mocked(getAuthToken).mockResolvedValue('tok');
     config = makeConfig({
       rateLimit: { connectionsPerMinute: 1, requestsPerSecond: 10, burstSize: 20 },
     });
-    await startServer(config, { requireAuth: false });
+    await startServer(config, { requireAuth: true });
     const c1 = await connectClient(config.socketPath);
+    const r1 = await sendAndReceive(c1, msg('auth', { token: 'tok' }, 'a'));
+    expect(r1.error).toBeUndefined();
     const c2 = await connectClient(config.socketPath);
-    const resp = await readResponse(c2);
-    expect(resp.error?.data).toBeDefined();
-    expect((resp.error?.data as Record<string, unknown>)?.['retryAfter']).toBeGreaterThan(0);
+    const r2 = await sendAndReceive(c2, msg('auth', { token: 'tok' }, 'b'));
+    expect(r2.error?.message).toMatch(/retry after \d+s/);
     await destroySocket(c1);
     await destroySocket(c2);
   });
@@ -1479,6 +1488,25 @@ describe('Message size limits — behavioral', () => {
     const smallMsg = msg('echo', { d: 'x'.repeat(100) });
     const resp = await sendAndReceive(client, smallMsg);
     expect(resp.error).toBeUndefined();
+    await destroySocket(client);
+  });
+
+  // findings.md P2:2626 — the old check compared total-buffer-length
+  // to the cap, so a client whose individual messages were well under
+  // the limit would still get kicked once their cumulative unread
+  // bytes crossed it. Now the check happens per-completed-line with
+  // a bounded tail buffer.
+  it('interleaved messages whose cumulative bytes exceed maxMessageLength still succeed when each is small', async () => {
+    config = makeConfig({
+      rateLimit: { connectionsPerMinute: 60, requestsPerSecond: 1000, burstSize: 2000 },
+    });
+    // 500-byte cap per message, ~40 messages = 20kb cumulative.
+    await startServer(config, { requireAuth: false, maxMessageLength: 500 });
+    const client = await connectClient(config.socketPath);
+    for (let i = 0; i < 40; i++) {
+      const resp = await sendAndReceive(client, msg('ping', undefined, `p-${i}`));
+      expect(resp.error).toBeUndefined();
+    }
     await destroySocket(client);
   });
 
@@ -2670,19 +2698,24 @@ describe('Additional rate limiter window and boundary', () => {
     await destroySocket(client);
   });
 
-  it('connection limit of exactly 2 blocks the third', async () => {
+  // findings.md P2:2616 — auth-budget-of-exactly-2 blocks the third auth.
+  it('auth limit of exactly 2 blocks the third authentication', async () => {
+    vi.mocked(getAuthToken).mockResolvedValue('tok');
     resetRateLimiter();
     const config = makeConfig({
       rateLimit: { connectionsPerMinute: 2, requestsPerSecond: 100, burstSize: 200 },
     });
-    await startServer(config, { requireAuth: false });
-    const c1 = await connectClient(config.socketPath);
-    const c2 = await connectClient(config.socketPath);
+    await startServer(config, { requireAuth: true });
+    for (let i = 0; i < 2; i++) {
+      const c = await connectClient(config.socketPath);
+      const r = await sendAndReceive(c, msg('auth', { token: 'tok' }, `a-${i}`));
+      expect(r.error).toBeUndefined();
+      await destroySocket(c);
+    }
     const c3 = await connectClient(config.socketPath);
-    const resp = await readResponse(c3);
-    expect(resp.error?.code).toBe(GatewayErrorCodes.RATE_LIMITED);
-    await destroySocket(c1);
-    await destroySocket(c2);
+    const r3 = await sendAndReceive(c3, msg('auth', { token: 'tok' }, 'third'));
+    expect(r3.error?.code).toBe(GatewayErrorCodes.UNAUTHORIZED);
+    expect(r3.error?.message).toMatch(/rate limit/i);
     await destroySocket(c3);
   });
 
@@ -2700,21 +2733,25 @@ describe('Additional rate limiter window and boundary', () => {
     await destroySocket(client);
   });
 
-  it('connection rejected by rate limit gets a JSON response then disconnects gracefully', async () => {
+  // findings.md P2:2616 — after an auth is rate-limited the socket stays
+  // open (no more forced disconnect tied to connect rejection), and an
+  // earlier authenticated client continues working normally.
+  it('auth rate limit returns JSON error and other clients keep working', async () => {
+    vi.mocked(getAuthToken).mockResolvedValue('tok');
     resetRateLimiter();
     const config = makeConfig({
       rateLimit: { connectionsPerMinute: 1, requestsPerSecond: 100, burstSize: 200 },
     });
-    await startServer(config, { requireAuth: false });
+    await startServer(config, { requireAuth: true });
     const c1 = await connectClient(config.socketPath);
-    const c2 = await connectClient(config.socketPath);
-    const resp = await readResponse(c2);
-    expect(resp.error?.code).toBe(GatewayErrorCodes.RATE_LIMITED);
-    // c2 should be ended by the server
-    await new Promise((r) => setTimeout(r, 100));
-    // c1 should still work
-    const r1 = await sendAndReceive(c1, msg('ping', undefined, 'c1-ok'));
+    const r1 = await sendAndReceive(c1, msg('auth', { token: 'tok' }, 'a'));
     expect(r1.error).toBeUndefined();
+    const c2 = await connectClient(config.socketPath);
+    const r2 = await sendAndReceive(c2, msg('auth', { token: 'tok' }, 'b'));
+    expect(r2.error?.code).toBe(GatewayErrorCodes.UNAUTHORIZED);
+    // c1 should still be able to ping
+    const ping = await sendAndReceive(c1, msg('ping', undefined, 'c1-ok'));
+    expect(ping.error).toBeUndefined();
     await destroySocket(c1);
     await destroySocket(c2);
   });

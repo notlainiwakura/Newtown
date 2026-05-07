@@ -809,16 +809,16 @@ describe('System prompt construction', () => {
       expect(prompt).toContain('## Identity');
     });
 
-    it('contains "Communication Guidelines" section header', () => {
-      const prompt = buildSystemPrompt(testPersona());
+    it('contains "Communication Guidelines" section header when characterId=lain', () => {
+      const prompt = buildSystemPrompt(testPersona(), 'lain');
       expect(prompt).toContain('## Communication Guidelines');
     });
 
-    it('has section separators (---)', () => {
-      const prompt = buildSystemPrompt(testPersona());
-      const separators = prompt.match(/---/g);
-      expect(separators).not.toBeNull();
-      expect(separators!.length).toBeGreaterThanOrEqual(3);
+    it('has 2 section separators for non-Lain characters, 3 for Lain', () => {
+      const nonLain = buildSystemPrompt(testPersona());
+      expect(nonLain.match(/---/g)!.length).toBe(2);
+      const lain = buildSystemPrompt(testPersona(), 'lain');
+      expect(lain.match(/---/g)!.length).toBe(3);
     });
 
     it('soul appears before operating instructions', () => {
@@ -835,36 +835,38 @@ describe('System prompt construction', () => {
       expect(agentsIndex).toBeLessThan(identityIndex);
     });
 
-    it('identity appears before communication guidelines', () => {
-      const prompt = buildSystemPrompt(testPersona());
+    it('identity appears before communication guidelines (Lain only)', () => {
+      const prompt = buildSystemPrompt(testPersona(), 'lain');
       const identityIndex = prompt.indexOf('## Identity');
       const guidelinesIndex = prompt.indexOf('Communication Guidelines');
       expect(identityIndex).toBeLessThan(guidelinesIndex);
     });
 
-    it('communication guidelines include lowercase rule', () => {
-      const prompt = buildSystemPrompt(testPersona());
+    it('communication guidelines include lowercase rule (Lain only)', () => {
+      const prompt = buildSystemPrompt(testPersona(), 'lain');
       expect(prompt).toContain('lowercase');
     });
 
-    it('communication guidelines include ellipsis rule', () => {
-      const prompt = buildSystemPrompt(testPersona());
+    it('communication guidelines include ellipsis rule (Lain only)', () => {
+      const prompt = buildSystemPrompt(testPersona(), 'lain');
       expect(prompt).toContain('...');
     });
 
-    it('communication guidelines mention no exclamation marks', () => {
-      const prompt = buildSystemPrompt(testPersona());
+    it('communication guidelines mention no exclamation marks (Lain only)', () => {
+      const prompt = buildSystemPrompt(testPersona(), 'lain');
       expect(prompt).toContain('exclamation');
     });
 
-    it('communication guidelines mention brief responses', () => {
-      const prompt = buildSystemPrompt(testPersona());
+    it('communication guidelines mention brief responses (Lain only)', () => {
+      const prompt = buildSystemPrompt(testPersona(), 'lain');
       expect(prompt).toContain('brief');
     });
 
-    it('references Lain Iwakura', () => {
-      const prompt = buildSystemPrompt(testPersona());
-      expect(prompt).toContain('Lain Iwakura');
+    it('references Lain Iwakura only when characterId=lain', () => {
+      const lain = buildSystemPrompt(testPersona(), 'lain');
+      expect(lain).toContain('Lain Iwakura');
+      const pkd = buildSystemPrompt(testPersona(), 'pkd');
+      expect(pkd).not.toContain('Lain Iwakura');
     });
   });
 
@@ -964,7 +966,7 @@ describe('System prompt construction', () => {
     });
 
     it('prompt without optional sections is still valid', () => {
-      const prompt = buildSystemPrompt({ soul: 'soul', agents: 'agents', identity: 'identity' });
+      const prompt = buildSystemPrompt({ soul: 'soul', agents: 'agents', identity: 'identity' }, 'lain');
       expect(prompt).toContain('soul');
       expect(prompt).toContain('agents');
       expect(prompt).toContain('identity');
@@ -1438,7 +1440,8 @@ describe('Template system', () => {
       const prompt = buildSystemPrompt(persona);
       expect(prompt).toContain('TestBot');
       expect(prompt).toContain('Operating Instructions');
-      expect(prompt).toContain('Communication Guidelines');
+      // Non-Lain characters must NOT inherit Lain's speech register.
+      expect(prompt).not.toContain('Communication Guidelines');
     });
   });
 
@@ -1450,7 +1453,8 @@ describe('Template system', () => {
       const prompt = buildSystemPrompt(persona);
       expect(prompt).toContain('Operating Instructions');
       expect(prompt).toContain('Identity');
-      expect(prompt).toContain('Communication Guidelines');
+      // Template prompt (no characterId) does NOT include Lain's Communication Guidelines.
+      expect(prompt).not.toContain('Communication Guidelines');
     });
 
     it('template-based prompt is non-trivial length', async () => {
@@ -2322,8 +2326,8 @@ describe('System prompt and context integration', () => {
       expect(agentsPos).toBeGreaterThan(firstSep);
     });
 
-    it('communication guidelines are the last section in base prompt', () => {
-      const prompt = buildSystemPrompt({ soul: 's', agents: 'a', identity: 'i' });
+    it('communication guidelines are the last section in base prompt (Lain only)', () => {
+      const prompt = buildSystemPrompt({ soul: 's', agents: 'a', identity: 'i' }, 'lain');
       const guidelinesPos = prompt.indexOf('Communication Guidelines');
       const lastSep = prompt.lastIndexOf('---');
       // Guidelines come after the last separator
@@ -2447,7 +2451,6 @@ describe('System prompt and context integration', () => {
       expect(prompt).toContain('agents');
       expect(prompt).toContain('identity');
       expect(prompt).toContain('Operating Instructions');
-      expect(prompt).toContain('Communication Guidelines');
     });
 
     it('self-concept appears before internal state in enhanced prompt', () => {
@@ -2625,7 +2628,7 @@ describe('Character identity additional tests', () => {
       it(`prompt for "${char.identity.split('\n')[0]}" has standard sections`, () => {
         const prompt = buildSystemPrompt(char);
         expect(prompt).toContain('Operating Instructions');
-        expect(prompt).toContain('Communication Guidelines');
+        // Communication Guidelines are Lain-specific and gated on characterId.
       });
     }
 
@@ -2703,7 +2706,8 @@ describe('End-to-end persona to prompt pipeline', () => {
     expect(prompt).toContain('Be helpful and test things');
     expect(prompt).toContain('E2E Bot');
     expect(prompt).toContain('Operating Instructions');
-    expect(prompt).toContain('Communication Guidelines');
+    // No characterId passed — the Lain-specific block is correctly omitted.
+    expect(prompt).not.toContain('Communication Guidelines');
   });
 
   it('loads persona, builds prompt, creates conversation, and produces provider messages', async () => {
@@ -2944,9 +2948,11 @@ describe('End-to-end persona to prompt pipeline', () => {
     const persona = await loadPersona({ workspacePath: dir });
     const prompt = buildSystemPrompt(persona);
 
-    // Even with empty persona, the system prompt has the fixed guidelines
-    expect(prompt).toContain('Communication Guidelines');
+    // Even with empty persona, the system prompt has the fixed scaffolding
+    // (section headers). Communication Guidelines is Lain-only, so it's
+    // absent here since no characterId was passed.
     expect(prompt).toContain('Operating Instructions');
+    expect(prompt).not.toContain('Communication Guidelines');
 
     const key = `e2e-empty-${Date.now()}`;
     const conv = getConversation(key, prompt);

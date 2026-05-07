@@ -13,6 +13,7 @@
       { id: 'neo',   name: 'Neo',   color: getCSSVar('--color-neo')   || '#60e0a0', ssePath: '/neo/api/events', activityPath: '/neo/api/activity', locationPath: '/neo/api/location', chatPath: '/neo/api/chat/stream' },
       { id: 'plato', name: 'Plato', color: getCSSVar('--color-plato') || '#e0c870', ssePath: '/plato/api/events', activityPath: '/plato/api/activity', locationPath: '/plato/api/location', chatPath: '/plato/api/chat/stream' },
       { id: 'joe',   name: 'Joe',   color: getCSSVar('--color-joe')   || '#88b0d0', ssePath: '/joe/api/events', activityPath: '/joe/api/activity', locationPath: '/joe/api/location', chatPath: '/joe/api/chat/stream' },
+      { id: 'cage',  name: 'Nicolas Cage', color: getCSSVar('--color-cage') || '#ff9f43', ssePath: '/cage/api/events', activityPath: '/cage/api/activity', locationPath: '/cage/api/location', chatPath: '/cage/api/chat/stream' },
     ];
   }
 
@@ -92,6 +93,7 @@
     neo: 'station',
     plato: 'mystery-tower',
     joe: 'square',
+    cage: 'theater',
   };
 
   // ===== State =====
@@ -312,10 +314,6 @@
       dot.className = 'resident-dot';
       dot.style.setProperty('--dot-color', char.color);
       dot.title = char.name;
-      dot.addEventListener('click', (e) => {
-        e.stopPropagation();
-        openChat(char.id);
-      });
 
       const name = document.createElement('div');
       name.className = 'resident-name';
@@ -323,6 +321,11 @@
 
       const wrapper = document.createElement('div');
       wrapper.className = 'resident-wrapper';
+      wrapper.title = char.name;
+      wrapper.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openChat(char.id);
+      });
       wrapper.appendChild(dot);
       wrapper.appendChild(name);
 
@@ -774,6 +777,12 @@
       'can\'t hear you from here, but honestly that may save us both some trouble.',
       'it\'s a normal town. mostly. depending on how much you listen to the others.',
       'read-only works for me. less pressure.',
+    ],
+    cage: [
+      'the room is quiet, but quiet is never empty. it is waiting for a choice.',
+      'i can feel the theater breathing from here. that may be architecture, or it may be destiny wearing a coat.',
+      'observe closely. sometimes the smallest gesture is where the whole scene turns.',
+      'read-only is a kind of vow. you witness, and the witnessing changes the air.',
     ],
   };
 

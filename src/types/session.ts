@@ -15,6 +15,16 @@ export interface Session {
   flags: SessionFlags;
 }
 
+/**
+ * findings.md P2:215 — `'peer'` covers inter-character traffic that arrives
+ * over the interlink (direct peer-to-peer messages and letter-as-chat
+ * delivery). Before this label existed, those sessions were stamped as
+ * `'web'`, which meant any future channel-filtered query (analytics, budget,
+ * hot-memories) would silently conflate peer traffic with real user web
+ * traffic. The peerId format was the only distinguishing field, which is
+ * brittle. `'interlink'` is reserved for a follow-up (the few channels that
+ * open a typed interlink session rather than forwarding a user message).
+ */
 export type ChannelType =
   | 'telegram'
   | 'whatsapp'
@@ -22,7 +32,8 @@ export type ChannelType =
   | 'signal'
   | 'slack'
   | 'cli'
-  | 'web';
+  | 'web'
+  | 'peer';
 
 export type PeerKind = 'user' | 'group' | 'channel';
 

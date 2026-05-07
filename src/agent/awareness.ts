@@ -8,6 +8,7 @@
 import { getLogger } from '../utils/logger.js';
 import { getRelationshipContext } from './relationships.js';
 import type { PeerConfig } from './character-tools.js';
+import { getInterlinkHeaders } from '../security/interlink-auth.js';
 
 /**
  * Build a prompt block describing who else is in the same building.
@@ -18,7 +19,7 @@ export async function buildAwarenessContext(
   peers: PeerConfig[]
 ): Promise<string> {
   const logger = getLogger();
-  const token = process.env['LAIN_INTERLINK_TOKEN'];
+  const headers = getInterlinkHeaders();
   const lines: string[] = [];
 
   await Promise.all(peers.map(async (peer) => {
@@ -33,10 +34,10 @@ export async function buildAwarenessContext(
 
       // 2. Fetch peer's internal state (requires interlink auth)
       let stateSummary = '';
-      if (token) {
+      if (headers) {
         try {
           const stateResp = await fetch(`${peer.url}/api/internal-state`, {
-            headers: { 'Authorization': `Bearer ${token}` },
+            headers,
             signal: AbortSignal.timeout(5000),
           });
           if (stateResp.ok) {

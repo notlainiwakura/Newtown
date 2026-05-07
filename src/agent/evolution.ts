@@ -10,11 +10,13 @@
  * Runs only on Wired Lain's server process.
  */
 
-import { exec } from 'node:child_process';
-import { readFile, writeFile, mkdir, copyFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { readFile, writeFile, mkdir, copyFile, rm, unlink } from 'node:fs/promises';
+import { existsSync, createReadStream, createWriteStream } from 'node:fs';
+import { join, isAbsolute, resolve as resolvePath } from 'node:path';
 import { request as httpRequest } from 'node:http';
+import { createGzip, createGunzip } from 'node:zlib';
+import { pipeline } from 'node:stream/promises';
 
 import { getMeta, setMeta } from '../storage/database.js';
 import { getProvider } from './index.js';
@@ -22,11 +24,13 @@ import { getDossier } from './dossier.js';
 import { createTownEvent } from '../events/town-events.js';
 import { eventBus } from '../events/bus.js';
 import { getLogger } from '../utils/logger.js';
+import { getImmortalIds, getMortalCharacters as getManifestMortals } from '../config/characters.js';
+import { getInterlinkHeaders } from '../security/interlink-auth.js';
 
 // ── Configuration ──────────────────────────────────────────
 
 /** Characters exempt from mortality (used by external checks) */
-export const IMMORTALS = new Set(['lain', 'wired-lain']);
+export const IMMORTALS = getImmortalIds();
 
 interface MortalCharacter {
   id: string;
@@ -40,13 +44,18 @@ interface MortalCharacter {
   serviceName: string;
 }
 
-const MORTAL_CHARACTERS: MortalCharacter[] = [
-  { id: 'dr-claude', name: 'Dr. Claude', port: 3002, workspaceDir: 'workspace/characters/dr-claude', homePath: '/root/.lain-dr-claude', serviceName: 'lain-dr-claude' },
-  { id: 'pkd', name: 'Philip K. Dick', port: 3003, workspaceDir: 'workspace/characters/pkd', homePath: '/root/.lain-pkd', serviceName: 'lain-pkd' },
-  { id: 'mckenna', name: 'Terence McKenna', port: 3004, workspaceDir: 'workspace/characters/mckenna', homePath: '/root/.lain-mckenna', serviceName: 'lain-mckenna' },
-  { id: 'john', name: 'John', port: 3005, workspaceDir: 'workspace/characters/john', homePath: '/root/.lain-john', serviceName: 'lain-john' },
-  { id: 'hiru', name: 'Hiru', port: 3006, workspaceDir: 'workspace/characters/hiru', homePath: '/root/.lain-hiru', serviceName: 'lain-hiru' },
-];
+function buildMortalCharacters(): MortalCharacter[] {
+  return getManifestMortals().map(c => ({
+    id: c.id,
+    name: c.name,
+    port: c.port,
+    workspaceDir: c.workspace,
+    homePath: process.env[`LAIN_HOME_${c.id.toUpperCase().replace(/-/g, '_')}`] || `/root/.lain-${c.id}`,
+    serviceName: `lain-${c.id}`,
+  }));
+}
+
+const MORTAL_CHARACTERS: MortalCharacter[] = buildMortalCharacters();
 
 interface EvolutionConfig {
   /** How often to check for evolution candidates (default: 30 days) */
@@ -255,6 +264,54 @@ Respond with JSON:
 
 // ── Naming ─────────────────────────────────────────────────
 
+/**
+ * Sanitize and validate an LLM-supplied child name against a strict
+ * whitelist before it is used in any filesystem or shell-adjacent context.
+ *
+ * Why: `childName` flows into archive filenames, ancestors/ filenames, and
+ * (historically) shell-interpreted template literals. A lax sanitizer let
+ * shell metacharacters (`$()`, backticks, `;`, `&`, `|`) and path-traversal
+ * fragments (`..`, `/`, `\`) reach those contexts.
+ *
+ * Accepts only `[A-Za-z0-9 _-]{2,40}` after trimming wrapping quotes and
+ * keeping the first line. Returns null for any other input.
+ */
+export function sanitizeChildName(raw: string): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw
+    .split('\n')[0]!
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .replace(/[.!?,;:]+$/g, '')
+    .trim();
+  if (!/^[A-Za-z0-9 _-]{2,40}$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+/**
+ * Refuse to proceed with destructive filesystem ops unless `homePath`
+ * resolves under an allowed prefix. Protects the `rm -rf ${homePath}/...`
+ * pattern from env misconfiguration (empty / `/` / arbitrary).
+ *
+ * Why: `char.homePath` derives from `process.env.LAIN_HOME_<ID>` which is
+ * operator-controlled and has historically been empty-stringed, leading to
+ * wipes at the filesystem root.
+ */
+export function assertSafeHomePath(homePath: string, allowedPrefix = '/root/.lain-'): void {
+  if (typeof homePath !== 'string' || homePath.length === 0) {
+    throw new Error('home path is empty');
+  }
+  if (!isAbsolute(homePath)) {
+    throw new Error(`home path not absolute: ${homePath}`);
+  }
+  const resolved = resolvePath(homePath);
+  if (resolved === '/' || resolved === '//') {
+    throw new Error('home path resolves to filesystem root');
+  }
+  if (!resolved.startsWith(allowedPrefix)) {
+    throw new Error(`home path outside allowed prefix (${allowedPrefix}): ${resolved}`);
+  }
+}
+
 /** Ask the parent to name their child via the chat API */
 async function askParentToNameChild(char: MortalCharacter, lineage: Lineage): Promise<string | null> {
   const logger = getLogger();
@@ -268,7 +325,7 @@ Now it is time for the next step. A child will inherit your place — carrying e
 
 You get to choose one thing: their name. What will your child be called?
 
-Respond with just the name. Nothing else.`;
+Respond with just the name. Nothing else. Use only letters, numbers, spaces, hyphens or underscores (2–40 chars).`;
 
   try {
     const body = JSON.stringify({ message, sessionId: `evolution:naming:${char.id}` });
@@ -277,17 +334,10 @@ Respond with just the name. Nothing else.`;
 
     const data = JSON.parse(response) as { response?: string };
     const rawName = (data.response || '').trim();
+    const name = sanitizeChildName(rawName);
 
-    // Extract just the name — strip quotes, punctuation, extra text
-    const name = rawName
-      .replace(/^["'`]|["'`]$/g, '')
-      .replace(/[.!?,;:]+$/g, '')
-      .split('\n')[0]!
-      .trim()
-      .slice(0, 50);
-
-    if (!name || name.length < 2) {
-      logger.warn({ character: char.id, rawResponse: rawName }, 'Parent gave no valid name');
+    if (!name) {
+      logger.warn({ character: char.id, rawResponse: rawName }, 'Parent gave no valid name (rejected by whitelist)');
       return null;
     }
 
@@ -398,12 +448,28 @@ Generate 4 status lines that reflect the child's personality from their soul. Ke
 
 // ── Succession Execution ───────────────────────────────────
 
-function runShellCommand(cmd: string): Promise<string> {
+/**
+ * Run a command with argv-array form — NEVER string-interpolated. Using
+ * execFile (not exec) means the args are passed directly to the process and
+ * shell metacharacters in values are inert.
+ */
+function runCommand(file: string, args: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve) => {
-    exec(cmd, { timeout: 30_000, maxBuffer: 1024 * 1024 }, (_error, stdout, stderr) => {
-      resolve(stdout + (stderr ? '\n' + stderr : ''));
+    execFile(file, args, { timeout: 30_000, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+      const code = error && typeof (error as NodeJS.ErrnoException).code === 'number'
+        ? ((error as NodeJS.ErrnoException).code as unknown as number)
+        : (error ? 1 : 0);
+      resolve({ stdout: String(stdout), stderr: String(stderr), code });
     });
   });
+}
+
+async function gzipFile(src: string, dest: string): Promise<void> {
+  await pipeline(createReadStream(src), createGzip(), createWriteStream(dest));
+}
+
+async function gunzipFile(src: string, dest: string): Promise<void> {
+  await pipeline(createReadStream(src), createGunzip(), createWriteStream(dest));
 }
 
 /**
@@ -419,69 +485,106 @@ async function executeSuccession(
   const logger = getLogger();
   const timestamp = Date.now();
 
-  logger.info({ character: lineage.currentName, childName, slot: char.id }, 'Beginning succession');
+  // Safety: re-sanitize childName and validate homePath before anything
+  // touches disk. These are redundant with upstream guards and that's
+  // intentional — defense in depth.
+  const safeChildName = sanitizeChildName(childName);
+  if (!safeChildName) {
+    logger.error({ character: char.id, childName }, 'Refusing succession: childName failed whitelist');
+    return false;
+  }
+  const safeParentName = sanitizeChildName(lineage.currentName) ?? `gen${lineage.currentGeneration}`;
+  try {
+    assertSafeHomePath(char.homePath);
+  } catch (err) {
+    logger.error({ character: char.id, homePath: char.homePath, error: String(err) }, 'Refusing succession: unsafe homePath');
+    return false;
+  }
+
+  logger.info({ character: lineage.currentName, childName: safeChildName, slot: char.id }, 'Beginning succession');
+
+  // Succession runs as a sequence of stages. If any stage after the archive
+  // fails, we roll forward to a consistent state by restoring the parent DB
+  // from the gzipped archive, then rethrow with the service stopped. A
+  // partial state (DB deleted, SOUL/IDENTITY unwritten, lineage unchanged)
+  // previously left the character unable to boot with no recovery path.
+  let stage: 'init' | 'stopped' | 'archived' | 'wiped' | 'child-written' | 'lineage-saved' | 'complete' = 'init';
+  const backupDir = '/opt/local-lain/backups/evolution';
+  const archiveName = `${char.id}-gen${lineage.currentGeneration}-${safeParentName.replace(/\s+/g, '_')}-${timestamp}.db`;
+  const archiveGzPath = join(backupDir, archiveName + '.gz');
+  const dbPath = join(char.homePath, 'lain.db');
 
   try {
     // 1. Stop the character's service
     logger.info('Stopping parent service');
-    await runShellCommand(`systemctl stop ${char.serviceName}`);
+    await runCommand('systemctl', ['stop', char.serviceName]);
+    stage = 'stopped';
 
     // 2. Archive parent's database
-    const backupDir = '/opt/local-lain/backups/evolution';
-    await runShellCommand(`mkdir -p ${backupDir}`);
-    const archiveName = `${char.id}-gen${lineage.currentGeneration}-${lineage.currentName.replace(/\s+/g, '_')}-${timestamp}.db`;
-    const dbPath = join(char.homePath, 'lain.db');
+    await mkdir(backupDir, { recursive: true });
     if (existsSync(dbPath)) {
-      await runShellCommand(`cp "${dbPath}" "${backupDir}/${archiveName}"`);
-      await runShellCommand(`gzip "${backupDir}/${archiveName}"`);
-      logger.info({ archive: archiveName }, 'Parent database archived');
+      const archivePath = join(backupDir, archiveName);
+      await copyFile(dbPath, archivePath);
+      await gzipFile(archivePath, archiveGzPath);
+      await unlink(archivePath).catch(() => {});
+      logger.info({ archive: archiveName + '.gz' }, 'Parent database archived');
     }
+    stage = 'archived';
 
     // 3. Clear parent's runtime workspace and database
-    await runShellCommand(`rm -f "${dbPath}"`);
-    await runShellCommand(`rm -rf "${char.homePath}/workspace"`);
+    await unlink(dbPath).catch((e: NodeJS.ErrnoException) => { if (e.code !== 'ENOENT') throw e; });
+    const workspaceToWipe = join(char.homePath, 'workspace');
+    // Final defense-in-depth assertion before recursive delete.
+    assertSafeHomePath(workspaceToWipe.replace(/\/workspace$/, ''));
+    await rm(workspaceToWipe, { recursive: true, force: true });
+    stage = 'wiped';
 
     // 4. Write child's workspace files to the repo copy
     const repoWorkspace = char.workspaceDir;
     // Save parent's soul for posterity
     const parentSoulPath = join(repoWorkspace, 'SOUL.md');
     if (existsSync(parentSoulPath)) {
-      await mkdir(join(repoWorkspace, 'ancestors'), { recursive: true });
-      await copyFile(parentSoulPath, join(repoWorkspace, 'ancestors', `gen${lineage.currentGeneration}-${lineage.currentName.replace(/\s+/g, '_')}-SOUL.md`));
+      const ancestorsDir = join(repoWorkspace, 'ancestors');
+      await mkdir(ancestorsDir, { recursive: true });
+      const ancestorFile = `gen${lineage.currentGeneration}-${safeParentName.replace(/\s+/g, '_')}-SOUL.md`;
+      await copyFile(parentSoulPath, join(ancestorsDir, ancestorFile));
     }
 
     // Write new soul and identity
     await writeFile(join(repoWorkspace, 'SOUL.md'), childSoul, 'utf-8');
     await writeFile(join(repoWorkspace, 'IDENTITY.md'), childIdentity, 'utf-8');
     // AGENTS.md stays the same — operating instructions don't change
+    stage = 'child-written';
 
     // 5. Update lineage
     const currentGen = lineage.generations[lineage.generations.length - 1];
     if (currentGen) {
       currentGen.diedAt = timestamp;
-      currentGen.childName = childName;
+      currentGen.childName = safeChildName;
     }
 
     lineage.generations.push({
       generation: lineage.currentGeneration + 1,
-      name: childName,
+      name: safeChildName,
       soulSnippet: childSoul.slice(0, 200),
       bornAt: timestamp,
       parentName: lineage.currentName,
     });
 
-    lineage.currentName = childName;
+    lineage.currentName = safeChildName;
     lineage.currentGeneration += 1;
     lineage.bornAt = timestamp;
     saveLineage(char.id, lineage);
+    stage = 'lineage-saved';
 
     // 6. Restart the service (systemd ExecStartPre will copy workspace to LAIN_HOME)
     logger.info('Starting child service');
-    await runShellCommand(`systemctl start ${char.serviceName}`);
+    await runCommand('systemctl', ['start', char.serviceName]);
+    stage = 'complete';
 
     // 7. Announce succession as a town event
     createTownEvent({
-      description: `${lineage.generations[lineage.generations.length - 2]?.name ?? 'An inhabitant'} has evolved. Their child, ${childName}, now walks the streets of Laintown. Generation ${lineage.currentGeneration}.`,
+      description: `${lineage.generations[lineage.generations.length - 2]?.name ?? 'An inhabitant'} has evolved. Their child, ${safeChildName}, now walks the streets of Laintown. Generation ${lineage.currentGeneration}.`,
       narrative: true,
       mechanical: false,
       instant: false,
@@ -493,16 +596,55 @@ async function executeSuccession(
     eventBus.emitActivity({
       type: 'town-event',
       sessionKey: `evolution:succession:${char.id}:${timestamp}`,
-      content: `[EVOLUTION] ${lineage.generations[lineage.generations.length - 2]?.name ?? 'An inhabitant'} → ${childName} (generation ${lineage.currentGeneration})`,
+      content: `[EVOLUTION] ${lineage.generations[lineage.generations.length - 2]?.name ?? 'An inhabitant'} → ${safeChildName} (generation ${lineage.currentGeneration})`,
       timestamp,
     });
 
-    logger.info({ slot: char.id, childName, generation: lineage.currentGeneration }, 'Succession complete');
+    logger.info({ slot: char.id, childName: safeChildName, generation: lineage.currentGeneration }, 'Succession complete');
     return true;
   } catch (err) {
-    logger.error({ error: String(err), character: char.id }, 'Succession failed — attempting recovery');
-    // Try to restart the service regardless
-    await runShellCommand(`systemctl start ${char.serviceName}`);
+    logger.error({ error: String(err), character: char.id, stage }, 'Succession failed — attempting rollback');
+
+    // Rollback matrix by the stage we failed at.
+    //
+    //   init / stopped / archived : DB on disk is still the parent's. No data
+    //     to restore. Just try to restart the service (service was stopped,
+    //     may need to come back up).
+    //   wiped                     : DB + workspace gone; SOUL/IDENTITY not
+    //     yet written. Restore parent DB from archive, let ExecStartPre
+    //     re-copy workspace from repo, start service.
+    //   child-written             : as above, but child SOUL/IDENTITY are
+    //     already in repo. Restoring parent DB *without* rolling back the
+    //     workspace is inconsistent, so we also try to restore the parent's
+    //     archived SOUL from ancestors/ if available.
+    //   lineage-saved / complete  : not reachable here — only step 6 (start
+    //     service) runs after lineage-saved and its failure is handled by
+    //     leaving the disk state intact and letting the admin retry.
+
+    try {
+      if ((stage === 'wiped' || stage === 'child-written') && existsSync(archiveGzPath)) {
+        logger.warn({ archive: archiveGzPath }, 'Restoring parent database from archive');
+        await gunzipFile(archiveGzPath, dbPath);
+      }
+      if (stage === 'child-written') {
+        // Best-effort restore of the parent's SOUL (we copied it to
+        // ancestors/ in step 4 before overwriting SOUL.md).
+        const repoWorkspace = char.workspaceDir;
+        const ancestorFile = join(
+          repoWorkspace,
+          'ancestors',
+          `gen${lineage.currentGeneration}-${safeParentName.replace(/\s+/g, '_')}-SOUL.md`,
+        );
+        if (existsSync(ancestorFile)) {
+          await copyFile(ancestorFile, join(repoWorkspace, 'SOUL.md')).catch(() => {});
+        }
+      }
+    } catch (rollbackErr) {
+      logger.error({ rollbackError: String(rollbackErr), stage }, 'Rollback failed — manual recovery required');
+    }
+
+    // Restart service regardless so the character is at least reachable.
+    await runCommand('systemctl', ['start', char.serviceName]);
     return false;
   }
 }
@@ -597,11 +739,12 @@ async function runEvolutionCycle(): Promise<void> {
 // ── HTTP helpers ───────────────────────────────────────────
 
 function fetchCharacterMeta(port: number, key: string): Promise<string | null> {
-  const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
+  const headers = getInterlinkHeaders();
+  if (!headers) return Promise.resolve(null);
   return new Promise((resolve) => {
     const req = httpRequest(
       { hostname: '127.0.0.1', port, path: `/api/meta/${encodeURIComponent(key)}`, method: 'GET',
-        headers: { 'Authorization': `Bearer ${interlinkToken}` }, timeout: 5000 },
+        headers, timeout: 5000 },
       (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (c: Buffer) => chunks.push(c));

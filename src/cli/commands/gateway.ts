@@ -20,6 +20,7 @@ import {
 } from '../utils/prompts.js';
 import { initAgent, shutdownAgents } from '../../agent/index.js';
 import { registerChatMethod } from '../../gateway/router.js';
+import { getAllCharacters, getAgentConfigFor } from '../../config/characters.js';
 
 /**
  * Start the gateway in foreground mode
@@ -44,12 +45,23 @@ export async function startGateway(): Promise<void> {
     // Initialize database
     await initDatabase(paths.database, config.security.keyDerivation);
 
-    // Initialize agents
-    displayInfo('Initializing agents...');
-    for (const agentConfig of config.agents) {
-      await initAgent(agentConfig);
-      logger.info({ agentId: agentConfig.id }, 'Agent initialized');
+    // findings.md P2:171 — gateway serves a single character. Resolution:
+    //   1. `LAIN_GATEWAY_AGENT_ID` env var (explicit override)
+    //   2. First character from characters.json
+    // Agent runtime is single-tenant (see agent/index.ts:167-176), so the
+    // legacy iteration of `config.agents` never initialized more than one.
+    displayInfo('Initializing agent...');
+    const gatewayAgentId =
+      process.env['LAIN_GATEWAY_AGENT_ID'] ?? getAllCharacters()[0]?.id;
+    if (!gatewayAgentId) {
+      displayError(
+        'No characters.json entry available and LAIN_GATEWAY_AGENT_ID is unset — gateway has nothing to serve.',
+      );
+      process.exit(1);
     }
+    const agentConfig = getAgentConfigFor(gatewayAgentId);
+    await initAgent(agentConfig);
+    logger.info({ agentId: agentConfig.id }, 'Agent initialized');
 
     // Register chat method
     registerChatMethod();
@@ -112,14 +124,30 @@ export async function startDaemon(): Promise<void> {
 
     child.unref();
 
-    // Wait a moment and check if it started
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    // findings.md P2:115 — cold-boot races. First DB init, keychain
+    // unlock prompts, and slow disks can push daemon startup past a
+    // fixed 1 s wait. Poll the pid file on a short interval until the
+    // daemon is observed, or until a hard deadline elapses.
+    const DAEMON_STARTUP_TIMEOUT_MS = Number(
+      process.env['LAIN_DAEMON_STARTUP_TIMEOUT_MS'] ?? 10_000,
+    );
+    const POLL_INTERVAL_MS = 200;
+    const deadline = Date.now() + DAEMON_STARTUP_TIMEOUT_MS;
 
-    const pid = await getServerPid(paths.pidFile);
-    if (pid && isProcessRunning(pid)) {
+    let pid: number | null = null;
+    while (Date.now() < deadline) {
+      const found = await getServerPid(paths.pidFile);
+      if (found && isProcessRunning(found)) {
+        pid = found;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    }
+
+    if (pid !== null) {
       displaySuccess(`Gateway daemon started (PID: ${pid})`);
     } else {
-      displayError('Failed to start daemon');
+      displayError(`Failed to start daemon (no pid after ${DAEMON_STARTUP_TIMEOUT_MS}ms)`);
       process.exit(1);
     }
   } catch (error) {

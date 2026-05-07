@@ -40,6 +40,7 @@ export const DEFAULT_LOCATIONS: Record<string, BuildingId> = {
   'neo': 'station',
   'plato': 'mystery-tower',
   'joe': 'square',
+  'cage': 'theater',
 };
 
 /** Type guard for valid building IDs */

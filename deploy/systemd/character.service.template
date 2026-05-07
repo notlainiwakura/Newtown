@@ -1,0 +1,33 @@
+[Unit]
+Description=@@TOWN_NAME@@ @@CHAR_NAME@@ Character Server
+After=network.target
+PartOf=lain.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@@WORKING_DIR@@
+ExecStartPre=/bin/bash -c 'fuser -k @@PORT@@/tcp 2>/dev/null || true'
+ExecStartPre=/bin/bash -c 'mkdir -p @@LAIN_HOME@@/workspace && [ -d @@WORKSPACE@@ ] && cp -r @@WORKSPACE@@/* @@LAIN_HOME@@/workspace/ || true'
+ExecStart=/usr/bin/node dist/index.js character @@CHAR_ID@@ --port @@PORT@@
+Restart=on-failure
+RestartSec=5
+
+Environment=NODE_ENV=production
+Environment=LAIN_HOME=@@LAIN_HOME@@
+Environment=LAIN_CHARACTER_ID=@@CHAR_ID@@
+Environment="LAIN_CHARACTER_NAME=@@CHAR_NAME@@"
+Environment=PORT=@@PORT@@
+Environment=LAIN_SANDBOX_ISOLATION=systemd
+Environment=LAIN_SANDBOX_BASE_DIR=/var/lib/lain-sandbox
+EnvironmentFile=@@WORKING_DIR@@/.env
+EnvironmentFile=@@WORKING_DIR@@/deploy/env/@@SERVICE_NAME@@.env
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=@@SERVICE_NAME@@
+
+[Install]
+WantedBy=lain.target

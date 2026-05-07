@@ -19,7 +19,7 @@ import {
   unregisterConnection,
   getConnectionCount,
 } from './rate-limiter.js';
-import { deauthenticate, clearAuthentications } from './auth.js';
+import { deauthenticate, clearAuthentications, sweepIdleConnections, touchConnection } from './auth.js';
 
 interface ServerState {
   server: Server | null;
@@ -28,6 +28,8 @@ interface ServerState {
   startTime: number;
   requireAuth: boolean;
   maxMessageLength: number;
+  // findings.md P2:2636 — janitor handle for the idle-connection sweep.
+  idleSweepTimer: NodeJS.Timeout | null;
 }
 
 const state: ServerState = {
@@ -37,7 +39,13 @@ const state: ServerState = {
   startTime: 0,
   requireAuth: true,
   maxMessageLength: 100000,
+  idleSweepTimer: null,
 };
+
+// findings.md P2:2636 — sweep every 5 minutes. Evicts any
+// authenticated connection whose lastActivityAt is older than the
+// default TTL (30 min). Cheap enough to always run.
+const IDLE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
 /**
  * Start the gateway server
@@ -76,22 +84,46 @@ export async function startServer(
     logger.error({ error }, 'Gateway server error');
   });
 
-  // Start listening
-  await new Promise<void>((resolve, reject) => {
-    state.server!.listen(config.socketPath, () => {
-      resolve();
+  // findings.md P2:2646 — `listen()` creates the socket file with the
+  // current process umask, opening a race window where another process
+  // on a shared-home multi-user host can connect() before the trailing
+  // chmod tightens it. Lower the umask for the duration of listen() so
+  // the socket is born with the correct permissions, then restore. The
+  // post-listen chmod remains as defense-in-depth.
+  const previousUmask = process.umask(0o777 & ~config.socketPermissions);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      state.server!.listen(config.socketPath, () => {
+        resolve();
+      });
+
+      state.server!.once('error', reject);
     });
+  } finally {
+    process.umask(previousUmask);
+  }
 
-    state.server!.once('error', reject);
-  });
-
-  // Set socket permissions
+  // Belt-and-suspenders: tighten perms after listen in case a parent
+  // directory or mount option loosened them.
   await chmod(config.socketPath, config.socketPermissions);
 
   // Write PID file
   await writeFile(config.pidFile, process.pid.toString());
 
   state.startTime = Date.now();
+
+  // findings.md P2:2636 — start the idle-sweep janitor. unref() so
+  // tests/CLI can exit cleanly without stopServer() hanging on it.
+  state.idleSweepTimer = setInterval(() => {
+    const evicted = sweepIdleConnections();
+    if (evicted > 0) {
+      logger.info({ evicted }, 'Swept idle gateway connections');
+    }
+  }, IDLE_SWEEP_INTERVAL_MS);
+  if (typeof state.idleSweepTimer.unref === 'function') {
+    state.idleSweepTimer.unref();
+  }
+
   logger.info({ socketPath: config.socketPath }, 'Gateway server started');
 }
 
@@ -105,7 +137,11 @@ export async function stopServer(): Promise<void> {
     return;
   }
 
-  // Close all connections
+  if (state.idleSweepTimer) {
+    clearInterval(state.idleSweepTimer);
+    state.idleSweepTimer = null;
+  }
+
   for (const [connectionId, socket] of state.connections) {
     socket.destroy();
     unregisterConnection(connectionId);
@@ -237,7 +273,16 @@ function handleConnection(socket: Socket): void {
   socket.on('data', (data) => {
     buffer += data.toString();
 
-    // Check message size limit
+    // findings.md P2:2626 — the old check compared total-buffer-length
+    // against `maxMessageLength`, so legitimate interleaved traffic
+    // whose combined bytes crossed the boundary got dropped even though
+    // no single message was oversized. Check per-line instead: any
+    // completed line over the cap is rejected individually, and the
+    // unterminated tail is bounded so a malicious client can't grow
+    // the buffer forever by withholding newlines.
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+
     if (buffer.length > state.maxMessageLength) {
       sendResponse(socket, {
         id: 'system',
@@ -250,14 +295,20 @@ function handleConnection(socket: Socket): void {
       return;
     }
 
-    // Process complete messages (newline delimited)
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
-
     for (const line of lines) {
-      if (line.trim()) {
-        processMessage(connectionId, socket, line.trim());
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (trimmed.length > state.maxMessageLength) {
+        sendResponse(socket, {
+          id: 'system',
+          error: {
+            code: GatewayErrorCodes.MESSAGE_TOO_LARGE,
+            message: 'Message too large',
+          },
+        });
+        continue;
       }
+      processMessage(connectionId, socket, trimmed);
     }
   });
 
@@ -317,7 +368,10 @@ async function processMessage(
 
   logger.debug({ connectionId, method: message.method }, 'Processing message');
 
-  // Handle message
+  // findings.md P2:2636 — bump lastActivityAt so legit active sessions
+  // aren't swept out by the idle janitor.
+  touchConnection(connectionId);
+
   const response = await handleMessage(connectionId, message, state.requireAuth);
   sendResponse(socket, response);
 }

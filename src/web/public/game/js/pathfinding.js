@@ -1,5 +1,5 @@
 /**
- * NEWTOWN GAME — A* Pathfinding
+ * LAINTOWN GAME — A* Pathfinding
  * Finds tile-by-tile paths on the collision map grid.
  * Used by CharacterManager for inter-building walking animation.
  */
@@ -46,7 +46,14 @@ function findPath(collision, sx, sy, ex, ey) {
   gScore[startKey] = 0;
   open.push({ x: sx, y: sy, f: heuristic(sx, sy) });
 
+  // findings.md P2:3256 — bound iterations so unreachable targets or a
+  // collision-map bug can't lock the main thread. 2 * grid area is a
+  // comfortable ceiling: a valid A* will touch each cell at most once.
+  const maxIterations = rows * cols * 2;
+  let iterations = 0;
+
   while (open.length > 0) {
+    if (++iterations > maxIterations) return [];
     let bestIdx = 0;
     for (let i = 1; i < open.length; i++) {
       if (open[i].f < open[bestIdx].f) bestIdx = i;

@@ -3,7 +3,7 @@
  * Provides persistent memory across conversations
  */
 
-import type { Provider } from '../providers/index.js';
+import type { Provider, ModelInfo } from '../providers/index.js';
 import { getLogger } from '../utils/logger.js';
 import {
   saveMessage,
@@ -20,6 +20,7 @@ import {
   getEntityMemories,
   getResonanceMemory,
   getGroupsForMemory,
+  USER_SESSION_PREFIXES,
   type Memory,
   type MemorySortBy,
   type StoredMessage,
@@ -60,10 +61,23 @@ export { addTriple, queryTriples, addEntity, getEntity, detectContradictions, ge
 export { listWings, listRooms, getWing, getWingByName } from './palace.js';
 
 /**
- * Extract user ID from session key or metadata
- * Session keys often contain user identifiers
+ * Extract user ID from session key or metadata.
+ *
+ * findings.md P2:787 — the previous implementation blindly returned
+ * `sessionKey.split(':')[1]` for any key with two-plus segments. That
+ * hallucinated a userId out of every background-loop session:
+ * `diary:2026-04-19` → userId `"2026-04-19"`, `commune:pkd` → userId
+ * `"pkd"`. Downstream `getMessagesForUser` / `searchMemories(userId)` /
+ * `getMemoriesForUser` then scoped to fabricated users and returned
+ * empty or mis-scoped results.
+ *
+ * Fix: allow-list user session prefixes (`USER_SESSION_PREFIXES` in
+ * store.ts — web, telegram, user, chat, owner). Only those shapes yield
+ * a userId. Everything else — background loops, peer conversations,
+ * letters, char-namespaced variants like `lain:letter:...` — returns
+ * null. Metadata-provided userId / senderId still wins when present.
  */
-function extractUserId(sessionKey: string, metadata?: Record<string, unknown>): string | null {
+export function extractUserId(sessionKey: string, metadata?: Record<string, unknown>): string | null {
   // Check if userId is explicitly provided in metadata
   if (metadata?.userId && typeof metadata.userId === 'string') {
     return metadata.userId;
@@ -72,13 +86,13 @@ function extractUserId(sessionKey: string, metadata?: Record<string, unknown>): 
     return metadata.senderId;
   }
 
-  // Extract from session key patterns like "web:YbYf4Q90" or "telegram:123456"
+  // Only recognize known user-session shapes.
   const parts = sessionKey.split(':');
-  if (parts.length >= 2 && parts[1]) {
-    return parts[1];
-  }
-
-  return null;
+  const prefix = parts[0];
+  if (!prefix) return null;
+  if (!USER_SESSION_PREFIXES.includes(prefix)) return null;
+  const id = parts[1];
+  return id && id.length > 0 ? id : null;
 }
 
 /**
@@ -303,8 +317,33 @@ export async function processConversationEnd(
       return; // Not enough messages
     }
 
-    // Extract key memories with user context
-    const extractedIds = await extractMemories(provider, messages, sessionKey, userId ?? undefined);
+    // Extract key memories with user context.
+    // findings.md P2:511 — distinguish parse failures from empty
+    // results. The extractor throws `ExtractionParseError` when the
+    // LLM response is malformed; we log that distinctly at `warn`
+    // (still visible, still continues) so an operator reading logs
+    // can tell "no memories today" apart from "LLM is returning
+    // garbage". Other extractor errors (timeouts, network, provider)
+    // are already swallowed to `[]` upstream.
+    let extractedIds: string[] = [];
+    try {
+      extractedIds = await extractMemories(provider, messages, sessionKey, userId ?? undefined);
+    } catch (err) {
+      const { ExtractionParseError } = await import('../utils/errors.js');
+      if (err instanceof ExtractionParseError) {
+        logger.warn(
+          {
+            sessionKey,
+            userId,
+            errorCode: err.code,
+            rawResponsePreview: err.rawResponse.slice(0, 400),
+          },
+          'Memory extraction returned unparseable response; skipping this batch',
+        );
+      } else {
+        throw err;
+      }
+    }
     logger.info({ count: extractedIds.length, sessionKey, userId }, 'Memories extracted');
 
     // Auto-assign new memories to coherence groups
@@ -336,10 +375,26 @@ export async function processConversationEnd(
       }
     }
 
+    // findings.md P2:854 — the internal-state hook previously swallowed
+    // all errors silently. If the dynamic import failed or updateState
+    // threw, the 6-axis emotional model stopped evolving and nothing
+    // logged why. Now we log at warn (non-fatal: extraction/summary
+    // already succeeded; only this side-effect failed) with the module
+    // path so an operator can see the stall.
     try {
       const { updateState } = await import('../agent/internal-state.js');
       await updateState({ type: 'conversation:end', summary: `Conversation ended after ${messages.length} messages` });
-    } catch { /* non-critical */ }
+    } catch (err) {
+      logger.warn(
+        {
+          err: String(err),
+          module: '../agent/internal-state.js',
+          sessionKey,
+          userId,
+        },
+        'Internal-state conversation:end hook failed — emotional state did not update for this turn',
+      );
+    }
   } catch (error) {
     logger.error({ error, sessionKey }, 'Failed to process conversation end');
   } finally {
@@ -377,6 +432,89 @@ function refreshWingNameCache(): void {
   }
 }
 
+// findings.md P2:850 — detectContradictions() is O(N²) over the active
+// KG and getResonanceMemory() does ORDER BY RANDOM() on the full
+// memories table in one of its strategies. Both are invoked on every
+// user turn inside buildMemoryContext. On a 15k-row DB with thousands
+// of triples this adds noticeable per-message latency/CPU.
+//
+// Cache both at module scope with a 5-minute TTL. The inputs change
+// slowly: contradictions only shift when a new KG triple lands;
+// resonance rotates strategies hourly anyway so a 5-min cache still
+// lets the strategy change pick up fresh picks the next hour. Cache
+// keys include the userId scope for resonance since that filter is
+// user-specific.
+const HOT_PATH_CACHE_TTL_MS = 5 * 60 * 1000;
+
+type ContradictionsResult = ReturnType<typeof detectContradictions>;
+let contradictionsCache: { at: number; value: ContradictionsResult } | null = null;
+
+function cachedDetectContradictions(): ContradictionsResult {
+  const now = Date.now();
+  if (contradictionsCache && now - contradictionsCache.at < HOT_PATH_CACHE_TTL_MS) {
+    return contradictionsCache.value;
+  }
+  const value = detectContradictions();
+  contradictionsCache = { at: now, value };
+  return value;
+}
+
+const resonanceCache = new Map<string, { at: number; value: Memory | null }>();
+
+function cachedGetResonanceMemory(userId: string | undefined): Memory | null {
+  const key = userId ?? '__all__';
+  const now = Date.now();
+  const hit = resonanceCache.get(key);
+  if (hit && now - hit.at < HOT_PATH_CACHE_TTL_MS) {
+    return hit.value;
+  }
+  const value = getResonanceMemory(userId);
+  resonanceCache.set(key, { at: now, value });
+  return value;
+}
+
+// findings.md P2:864 — the memory-context budget used to be a
+// hardcoded 7000 tokens regardless of provider. That wastes headroom
+// on modern 200k-window models and could overflow on a future
+// 32k-window model. `resolveContextTokenBudget` derives the budget
+// from (in order):
+//   1. `LAIN_MEMORY_CONTEXT_TOKENS` env override — for operators
+//      tuning budget without redeploying;
+//   2. `provider.getModelInfo().contextWindow` — scaled to a modest
+//      fraction (6%) to leave room for the rest of the system prompt,
+//      conversation history, tool definitions, and completion output;
+//   3. the legacy 7000 default — if no provider is passed and no env
+//      override is set, callers keep the historical behaviour.
+// The fraction is deliberately conservative: a 200k-window model
+// lifts the budget to 12k (up from 7k) without encroaching on the
+// other context consumers.
+const FALLBACK_CONTEXT_TOKENS = 7000;
+const CONTEXT_WINDOW_FRACTION = 0.06;
+const MIN_CONTEXT_TOKENS = 2000;
+const MAX_REASONABLE_CONTEXT_TOKENS = 32000;
+
+function resolveContextTokenBudget(provider?: Provider): number {
+  const envOverride = process.env['LAIN_MEMORY_CONTEXT_TOKENS'];
+  if (envOverride) {
+    const n = parseInt(envOverride, 10);
+    if (Number.isFinite(n) && n >= MIN_CONTEXT_TOKENS) return n;
+  }
+  if (provider) {
+    try {
+      const info: ModelInfo = provider.getModelInfo();
+      const scaled = Math.floor(info.contextWindow * CONTEXT_WINDOW_FRACTION);
+      const clamped = Math.max(
+        MIN_CONTEXT_TOKENS,
+        Math.min(MAX_REASONABLE_CONTEXT_TOKENS, scaled),
+      );
+      return clamped;
+    } catch {
+      // Fall through to default
+    }
+  }
+  return FALLBACK_CONTEXT_TOKENS;
+}
+
 
 /**
  * Build system prompt addition with memory context
@@ -388,14 +526,16 @@ function refreshWingNameCache(): void {
  */
 export async function buildMemoryContext(
   userMessage: string,
-  sessionKey: string
+  sessionKey: string,
+  provider?: Provider,
 ): Promise<string> {
   const logger = getLogger();
   const userId = extractUserId(sessionKey);
   let context = '';
   let usedTokens = 0;
 
-  const MAX_CONTEXT_TOKENS = 7000;
+  // findings.md P2:864 — provider-aware budget (falls back to legacy 7000).
+  const MAX_CONTEXT_TOKENS = resolveContextTokenBudget(provider);
 
   // Refresh wing name lookup for palace-aware labels
   refreshWingNameCache();
@@ -661,7 +801,7 @@ export async function buildMemoryContext(
   // ── Layer 4: Resonance (~500 tokens) ──
   if (usedTokens < MAX_CONTEXT_TOKENS - 200) {
     try {
-      const resonance = getResonanceMemory(userId ?? undefined);
+      const resonance = cachedGetResonanceMemory(userId ?? undefined);
       if (resonance) {
         const ageMs = Date.now() - resonance.createdAt;
         const ageDays = Math.floor(ageMs / (1000 * 60 * 60 * 24));
@@ -688,7 +828,7 @@ export async function buildMemoryContext(
   // ── Contradictions (bonus, ~200 tokens) ──
   if (usedTokens < MAX_CONTEXT_TOKENS - 200) {
     try {
-      const contradictions = detectContradictions();
+      const contradictions = cachedDetectContradictions();
       if (contradictions.length > 0) {
         const lines = contradictions.slice(0, 3).map((c) => {
           return `- "${c.subject}" ${c.predicate}: "${c.tripleA.object}" vs "${c.tripleB.object}"`;

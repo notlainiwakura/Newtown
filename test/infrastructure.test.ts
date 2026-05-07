@@ -88,15 +88,31 @@ function getPort(svc: ServiceFile): number | null {
   return portMatch ? parseInt(portMatch[1], 10) : null;
 }
 
+// Oneshot services (not long-running daemons — no restart policy, no target membership)
+const ONESHOT_SERVICES = ['lain-healthcheck', 'lain-backup'];
+
+// Known service → character ID mapping
+const SERVICE_CHARACTER_MAP: Record<string, string> = {
+  'lain-wired': 'wired-lain',
+  'lain-main': 'lain',
+  'lain-pkd': 'pkd',
+  'lain-mckenna': 'mckenna',
+  'lain-john': 'john',
+  'lain-hiru': 'hiru',
+};
+
 // Load all service files
 const allServiceFiles = readdirSync(SYSTEMD_DIR)
   .filter((f) => f.endsWith('.service'))
   .map((f) => parseServiceFile(join(SYSTEMD_DIR, f)));
 
-// Long-running daemon services (excludes oneshot services like healthcheck)
+// Long-running daemon services (excludes oneshot services like healthcheck, backup)
 const serviceFiles = allServiceFiles.filter(
-  (s) => !['lain-healthcheck'].includes(s.name),
+  (s) => !ONESHOT_SERVICES.includes(s.name),
 );
+
+// Whether character-specific services exist (only in wired-lain, not empty platform)
+const hasCharacterServices = serviceFiles.some((s) => SERVICE_CHARACTER_MAP[s.name] !== undefined);
 
 // Load lain.target
 const targetRaw = readFileSync(join(SYSTEMD_DIR, 'lain.target'), 'utf-8');
@@ -119,16 +135,6 @@ if (servicesArrayMatch) {
 // Load start.sh for port/env cross-checking
 const startRaw = readFileSync(join(ROOT, 'start.sh'), 'utf-8');
 
-// Known service → character ID mapping
-const SERVICE_CHARACTER_MAP: Record<string, string> = {
-  'lain-wired': 'wired-lain',
-  'lain-main': 'lain',
-  'lain-pkd': 'pkd',
-  'lain-mckenna': 'mckenna',
-  'lain-john': 'john',
-  'lain-hiru': 'hiru',
-};
-
 // Expected port assignments (single source of truth)
 const EXPECTED_PORTS: Record<string, number> = {
   'lain-wired': 3000,
@@ -143,9 +149,6 @@ const EXPECTED_PORTS: Record<string, number> = {
 
 // Services that don't bind to a port via --port flag
 const PORTLESS_SERVICES = ['lain-telegram', 'lain-gateway', 'lain-voice', 'lain-healthcheck'];
-
-// Oneshot services (not long-running daemons — no restart policy, no target membership)
-const ONESHOT_SERVICES = ['lain-healthcheck'];
 
 // ─────────────────────────────────────────────────────────
 // 1. WATCHDOG SAFETY — Type=simple must not use WatchdogSec
@@ -253,7 +256,7 @@ describe('Restart Policy', () => {
 // 4. LAIN_HOME ISOLATION — Each character has its own database
 //    (shared DB is the #1 recurring production bug)
 // ─────────────────────────────────────────────────────────
-describe('LAIN_HOME Isolation', () => {
+describe.skipIf(!hasCharacterServices)('LAIN_HOME Isolation', () => {
   const characterServices = serviceFiles.filter(
     (s) => SERVICE_CHARACTER_MAP[s.name] !== undefined,
   );
@@ -303,7 +306,7 @@ describe('LAIN_HOME Isolation', () => {
 // ─────────────────────────────────────────────────────────
 // 5. INTERLINK TARGETS — Sisters must point at each other
 // ─────────────────────────────────────────────────────────
-describe('Interlink Targets', () => {
+describe.skipIf(!hasCharacterServices)('Interlink Targets', () => {
   it('Wired Lain interlink target points to Lain port', () => {
     const wired = serviceFiles.find((s) => s.name === 'lain-wired');
     const env = getServiceEnv(wired!);
@@ -432,7 +435,7 @@ describe('lain.target Completeness', () => {
 // 8. status.sh CONSISTENCY — Port numbers and service names
 //    must match between status.sh and service files
 // ─────────────────────────────────────────────────────────
-describe('status.sh Consistency', () => {
+describe.skipIf(!hasCharacterServices)('status.sh Consistency', () => {
   it('every service in status.sh has a corresponding service file', () => {
     const svcNames = serviceFiles.map((s) => s.name);
     for (const entry of statusServices) {
@@ -466,7 +469,7 @@ describe('status.sh Consistency', () => {
 // 9. start.sh CONSISTENCY — Ports, LAIN_HOME, and character
 //    IDs must match between start.sh and service files
 // ─────────────────────────────────────────────────────────
-describe('start.sh Consistency', () => {
+describe.skipIf(!hasCharacterServices)('start.sh Consistency', () => {
   it('default port assignments in start.sh match service files', () => {
     const portDefaults: Record<string, number> = {};
     for (const match of startRaw.matchAll(
@@ -491,7 +494,7 @@ describe('start.sh Consistency', () => {
 //     processes on their port before starting (ExecStartPre)
 //     (caused recurring EADDRINUSE crashes for Lain)
 // ─────────────────────────────────────────────────────────
-describe('Stale Port Cleanup', () => {
+describe.skipIf(!hasCharacterServices)('Stale Port Cleanup', () => {
   const httpServices = serviceFiles.filter(
     (s) => getPort(s) !== null,
   );
@@ -564,7 +567,7 @@ describe('Service Structure', () => {
 // 11. DEPENDENCY ORDERING — Services that depend on others
 //     must declare After= correctly
 // ─────────────────────────────────────────────────────────
-describe('Dependency Ordering', () => {
+describe.skipIf(!hasCharacterServices)('Dependency Ordering', () => {
   it('Lain starts after Wired Lain', () => {
     const lain = serviceFiles.find((s) => s.name === 'lain-main');
     expect(lain!.unit['After']).toContain('lain-wired.service');
@@ -595,7 +598,7 @@ describe('Dependency Ordering', () => {
 // 12. WORKSPACE CONFIGURATION — Characters with ExecStartPre
 //     must have corresponding workspace directories
 // ─────────────────────────────────────────────────────────
-describe('Workspace Configuration', () => {
+describe.skipIf(!hasCharacterServices)('Workspace Configuration', () => {
   const servicesWithWorkspaceCopy = serviceFiles.filter((s) =>
     (s.service['ExecStartPre'] ?? []).some((cmd) => cmd.includes('workspace/characters/')),
   );
@@ -624,7 +627,7 @@ describe('Workspace Configuration', () => {
 //     Some services set LAIN_CHARACTER_ID explicitly, others
 //     use the CLI command name (e.g. "pkd" → node dist/index.js pkd)
 // ─────────────────────────────────────────────────────────
-describe('Character ID Consistency', () => {
+describe.skipIf(!hasCharacterServices)('Character ID Consistency', () => {
   for (const [svcName, charId] of Object.entries(SERVICE_CHARACTER_MAP)) {
     it(`${svcName}: identifies as "${charId}" via env var or CLI command`, () => {
       const svc = serviceFiles.find((s) => s.name === svcName);
@@ -651,7 +654,7 @@ describe('Character ID Consistency', () => {
 // 14. CHARACTER SERVERS — Must have provider config
 //     (PKD, McKenna, John, Hiru)
 // ─────────────────────────────────────────────────────────
-describe('Character Server Provider Config', () => {
+describe.skipIf(!hasCharacterServices)('Character Server Provider Config', () => {
   const characters = ['lain-pkd', 'lain-mckenna', 'lain-john', 'lain-hiru'];
 
   it.each(characters)(
@@ -706,8 +709,8 @@ describe('Healthcheck System', () => {
   it('healthcheck.sh checks all daemon services', () => {
     const content = readFileSync(join(ROOT, 'deploy', 'healthcheck.sh'), 'utf-8');
     for (const svc of serviceFiles) {
-      // healthcheck only monitors daemon services, not itself
-      if (ONESHOT_SERVICES.includes(svc.name)) continue;
+      // healthcheck only monitors Node.js daemon services, not itself or external services
+      if (ONESHOT_SERVICES.includes(svc.name) || svc.name === 'lain-voice') continue;
       expect(content, `healthcheck.sh doesn't check ${svc.name}`).toContain(svc.name);
     }
   });

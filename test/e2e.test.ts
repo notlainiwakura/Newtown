@@ -563,12 +563,12 @@ describe('Security', () => {
       expect(result.blocked).toBe(true);
     });
 
-    it('should escape structural framing characters', async () => {
+    // findings.md P2:1222 — structural framing is a no-op; tags pass through verbatim.
+    it('findings.md P2:1222 — structural framing preserves tags and separators verbatim', async () => {
       const { sanitize } = await import('../src/security/sanitizer.js');
-      const result = sanitize('Normal message with <tags> and --- separators');
-      if (!result.blocked) {
-        expect(result.sanitized).not.toContain('<tags>');
-      }
+      const result = sanitize('Normal message with <tags>', { warnPatterns: false, blockPatterns: false });
+      expect(result.blocked).toBe(false);
+      expect(result.sanitized).toBe('Normal message with <tags>');
     });
   });
 
@@ -664,15 +664,11 @@ describe('Tool System', () => {
     expect(letterTool?.description).toContain('sister');
   });
 
-  it('should mark telegram_call as requiring approval', async () => {
-    const { toolRequiresApproval } = await import('../src/agent/tools.js');
-    expect(toolRequiresApproval('telegram_call')).toBe(true);
-  });
-
-  it('should not require approval for safe tools', async () => {
-    const { toolRequiresApproval } = await import('../src/agent/tools.js');
-    expect(toolRequiresApproval('get_current_time')).toBe(false);
-    expect(toolRequiresApproval('calculate')).toBe(false);
+  it('does not export a dead toolRequiresApproval helper (P1 findings.md)', async () => {
+    // Removed because executeTool never consulted it — the flag gave
+    // false confidence that telegram_call was gated when it was not.
+    const mod = await import('../src/agent/tools.js') as Record<string, unknown>;
+    expect(mod['toolRequiresApproval']).toBeUndefined();
   });
 });
 
@@ -682,21 +678,19 @@ describe('Tool System', () => {
 
 describe('Configuration', () => {
   it('should return valid default config', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
+    // findings.md P2:171 — `agents` moved from LainConfig into characters.json.
+    const { getDefaultConfig, DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
     const config = getDefaultConfig();
     expect(config).toBeTruthy();
-    expect(config.agents).toBeTruthy();
-    expect(config.agents.length).toBeGreaterThan(0);
-    expect(config.agents[0]?.providers?.length).toBeGreaterThan(0);
+    expect((config as Record<string, unknown>)['agents']).toBeUndefined();
+    expect(DEFAULT_PROVIDERS.length).toBeGreaterThan(0);
   });
 
-  it('should have 3 provider tiers in default config', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    const config = getDefaultConfig();
-    const providers = config.agents[0]?.providers ?? [];
-    expect(providers.length).toBe(3);
+  it('should have 3 provider tiers in default provider chain', async () => {
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    expect(DEFAULT_PROVIDERS.length).toBe(3);
     // personality, memory, light
-    expect(providers[0]?.type).toBe('anthropic');
+    expect(DEFAULT_PROVIDERS[0]?.type).toBe('anthropic');
   });
 
   it('should resolve paths with LAIN_HOME override', async () => {

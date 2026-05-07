@@ -13,6 +13,8 @@
 import { getProvider } from './index.js';
 import { getLogger } from '../utils/logger.js';
 import { getMeta, setMeta, query } from '../storage/database.js';
+import { getDossierSubjects as manifestDossierSubjects } from '../config/characters.js';
+import { getInterlinkHeaders } from '../security/interlink-auth.js';
 
 export interface DossierConfig {
   intervalMs: number;
@@ -26,15 +28,20 @@ const DEFAULT_CONFIG: DossierConfig = {
 
 const CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000; // Check every 12 hours
 
-/** Characters Wired Lain maintains dossiers for */
-const DOSSIER_SUBJECTS = [
-  { id: 'lain', name: 'Lain', port: 3001 },
-  { id: 'dr-claude', name: 'Dr. Claude', port: 3002 },
-  { id: 'pkd', name: 'Philip K. Dick', port: 3003 },
-  { id: 'mckenna', name: 'Terence McKenna', port: 3004 },
-  { id: 'john', name: 'John', port: 3005 },
-  { id: 'hiru', name: 'Hiru', port: 3006 },
-];
+/**
+ * Characters Wired Lain maintains dossiers for.
+ *
+ * Manifest-driven. Built lazily so the manifest is not loaded at module-load
+ * time — this protects test setups that mock `fs.readFileSync` or
+ * `../config/characters.js` from firing during import.
+ */
+function dossierSubjects(): Array<{ id: string; name: string; port: number }> {
+  return manifestDossierSubjects('wired-lain').map((c) => ({
+    id: c.id,
+    name: c.name,
+    port: c.port,
+  }));
+}
 
 // ── Data gathering ─────────────────────────────────────────
 
@@ -112,10 +119,11 @@ async function getCommuneHistory(port: number): Promise<CommuneRecord[]> {
  */
 async function getTelemetry(port: number): Promise<TelemetryData | null> {
   try {
-    const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
+    const headers = getInterlinkHeaders();
+    if (!headers) return null;
     const resp = await fetch(`http://localhost:${port}/api/telemetry`, {
       signal: AbortSignal.timeout(5000),
-      headers: { 'Authorization': `Bearer ${interlinkToken}` },
+      headers,
     });
     if (!resp.ok) return null;
     return await resp.json() as TelemetryData;
@@ -254,7 +262,7 @@ export function getDossier(characterId: string): string | null {
  */
 export function getAllDossiers(): Record<string, string> {
   const result: Record<string, string> = {};
-  for (const subject of DOSSIER_SUBJECTS) {
+  for (const subject of dossierSubjects()) {
     const dossier = getDossier(subject.id);
     if (dossier) result[subject.id] = dossier;
   }
@@ -270,8 +278,9 @@ async function runDossierCycle(): Promise<void> {
   const logger = getLogger();
   logger.info('Starting dossier synthesis cycle');
 
+  const subjects = dossierSubjects();
   let updated = 0;
-  for (const subject of DOSSIER_SUBJECTS) {
+  for (const subject of subjects) {
     try {
       const dossier = await synthesizeDossier(subject);
       if (dossier) {
@@ -291,7 +300,7 @@ async function runDossierCycle(): Promise<void> {
     }
   }
 
-  logger.info({ updated, total: DOSSIER_SUBJECTS.length }, 'Dossier cycle complete');
+  logger.info({ updated, total: subjects.length }, 'Dossier cycle complete');
 }
 
 /**
@@ -312,7 +321,7 @@ export function startDossierLoop(config?: Partial<DossierConfig>): () => void {
     {
       interval: `${(cfg.intervalMs / 86400000).toFixed(0)}d`,
       checkInterval: `${(CHECK_INTERVAL_MS / 3600000).toFixed(0)}h`,
-      subjects: DOSSIER_SUBJECTS.map((s) => s.id),
+      subjects: dossierSubjects().map((s) => s.id),
     },
     'Starting dossier loop'
   );

@@ -34,8 +34,9 @@ vi.mock('../src/utils/logger.js', () => ({
 // ─── imports ──────────────────────────────────────────────────────────────────
 
 import { sanitize, type SanitizationConfig } from '../src/security/sanitizer.js';
-import { isPrivateIP, checkSSRF, sanitizeURL, isAllowedDomain, isBlockedDomain } from '../src/security/ssrf.js';
-import { deriveOwnerCookie, isOwner } from '../src/web/owner-auth.js';
+import { isPrivateIP, checkSSRF } from '../src/security/ssrf.js';
+import { isOwner } from '../src/web/owner-auth.js';
+import { makeV2Cookie, makeV2CookieValue, OWNER_COOKIE_NAME } from './fixtures/owner-cookie-v2.js';
 import type { IncomingMessage } from 'node:http';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -191,17 +192,20 @@ describe.each(urlSchemes)('URL scheme "$scheme" (safe=$safe)', ({ scheme, safe }
 
 const TEST_TOKEN = 'my-secret-owner-token';
 
-const tokenFormats: Array<{ label: string; buildCookie: (valid: string) => string; shouldPass: boolean }> = [
-  { label: 'correct-cookie',          buildCookie: (v) => `lain_owner=${v}`,                   shouldPass: true },
-  { label: 'wrong-value',             buildCookie: (_) => 'lain_owner=deadbeef00',              shouldPass: false },
-  { label: 'empty-value',             buildCookie: (_) => 'lain_owner=',                        shouldPass: false },
-  { label: 'missing-cookie',          buildCookie: (_) => 'session=abc',                        shouldPass: false },
-  { label: 'correct-among-others',    buildCookie: (v) => `a=1; lain_owner=${v}; b=2`,          shouldPass: true },
-  { label: 'uppercase-hex',           buildCookie: (v) => `lain_owner=${v.toUpperCase()}`,      shouldPass: false }, // regex requires [a-f0-9]
-  { label: 'prefixed-value',          buildCookie: (v) => `lain_owner=prefix_${v}`,             shouldPass: false },
-  { label: 'truncated-value',         buildCookie: (v) => `lain_owner=${v.slice(0, 10)}`,       shouldPass: false },
-  { label: 'extra-spaces',            buildCookie: (v) => `lain_owner = ${v}`,                  shouldPass: false },
-  { label: 'no-cookie-header',        buildCookie: (_) => '',                                   shouldPass: false },
+// findings.md P2:2348 — v2 cookie shape is `payload.sig`, so each format
+// builder receives the full cookie value (payload.sig) rather than the raw
+// signature hash that v1 used.
+const tokenFormats: Array<{ label: string; buildCookie: (value: string) => string; shouldPass: boolean }> = [
+  { label: 'correct-cookie',          buildCookie: (v) => `${OWNER_COOKIE_NAME}=${v}`,                               shouldPass: true },
+  { label: 'wrong-value',             buildCookie: (_) => `${OWNER_COOKIE_NAME}=bogus.deadbeef00`,                   shouldPass: false },
+  { label: 'empty-value',             buildCookie: (_) => `${OWNER_COOKIE_NAME}=`,                                   shouldPass: false },
+  { label: 'missing-cookie',          buildCookie: (_) => 'session=abc',                                             shouldPass: false },
+  { label: 'correct-among-others',    buildCookie: (v) => `a=1; ${OWNER_COOKIE_NAME}=${v}; b=2`,                     shouldPass: true },
+  { label: 'legacy-v1-rejected',      buildCookie: (_) => `lain_owner=${'a'.repeat(64)}`,                            shouldPass: false },
+  { label: 'prefixed-value',          buildCookie: (v) => `${OWNER_COOKIE_NAME}=prefix_${v}`,                        shouldPass: false },
+  { label: 'truncated-value',         buildCookie: (v) => `${OWNER_COOKIE_NAME}=${v.slice(0, 10)}`,                  shouldPass: false },
+  { label: 'extra-spaces',            buildCookie: (v) => `${OWNER_COOKIE_NAME} = ${v}`,                             shouldPass: false },
+  { label: 'no-cookie-header',        buildCookie: (_) => '',                                                        shouldPass: false },
 ];
 
 describe('auth token × cookie validation', () => {
@@ -212,7 +216,7 @@ describe('auth token × cookie validation', () => {
   });
 
   it.each(tokenFormats)('format "$label" → shouldPass=$shouldPass', ({ buildCookie, shouldPass }) => {
-    const validCookieValue = deriveOwnerCookie(TEST_TOKEN);
+    const validCookieValue = makeV2CookieValue(TEST_TOKEN);
     const cookieHeader = buildCookie(validCookieValue) || undefined;
     const req = makeReq(cookieHeader);
     expect(isOwner(req)).toBe(shouldPass);
@@ -231,7 +235,7 @@ describe('auth token × no env var', () => {
   });
 });
 
-describe('auth token × deriveOwnerCookie properties', () => {
+describe('v2 cookie builder properties', () => {
   it.each([
     { token: 'short',              label: 'short-token' },
     { token: 'a'.repeat(64),       label: 'long-token' },
@@ -243,11 +247,13 @@ describe('auth token × deriveOwnerCookie properties', () => {
     { token: '',                   label: 'empty' },
     { token: '\n\t\r',             label: 'control-chars' },
     { token: 'a',                  label: 'single-char' },
-  ])('$label: derivation is deterministic and hex', ({ token }) => {
-    const c1 = deriveOwnerCookie(token);
-    const c2 = deriveOwnerCookie(token);
+  ])('$label: signature is deterministic for fixed payload', ({ token }) => {
+    const fixedOpts = { nonce: 'n', iat: 1_700_000_000_000 };
+    const c1 = makeV2CookieValue(token, fixedOpts);
+    const c2 = makeV2CookieValue(token, fixedOpts);
     expect(c1).toBe(c2);
-    expect(c1).toMatch(/^[a-f0-9]+$/);
+    // Shape: <base64url-payload>.<hex-sig>
+    expect(c1).toMatch(/^[A-Za-z0-9_\-]+\.[a-f0-9]+$/);
   });
 });
 
@@ -279,14 +285,14 @@ const xssPayloads: Array<{ label: string; payload: string }> = [
   { label: 'style-expression',     payload: '<p style="xss:expression(alert(1))">x</p>' },
 ];
 
-describe('XSS payloads × structuralFraming=true', () => {
-  it.each(xssPayloads)('$label: angle brackets are escaped in sanitized output', ({ payload }) => {
+// findings.md P2:1222 — structuralFraming is now a no-op: HTML-escaping
+// provided zero LLM-safety benefit (LLMs don't render HTML) and corrupted
+// stored user content. Both values preserve the input verbatim. XSS
+// defense lives at the UI render layer, not in the LLM sanitizer.
+describe('XSS payloads × structuralFraming=true (findings.md P2:1222: no-op)', () => {
+  it.each(xssPayloads)('$label: payload preserved verbatim', ({ payload }) => {
     const result = sanitize(payload, { blockPatterns: false, warnPatterns: false, structuralFraming: true });
-    expect(result.sanitized).not.toContain('<script');
-    expect(result.sanitized).not.toContain('<img');
-    expect(result.sanitized).not.toContain('<iframe');
-    // All < should become &lt;
-    expect(result.sanitized).not.toMatch(/<[a-z]/i);
+    expect(result.sanitized).toBe(payload);
   });
 });
 
@@ -338,43 +344,12 @@ describe('SQL injection × blockPatterns=false', () => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 7. Path traversal patterns  (12 patterns)
+// 7. Path traversal patterns — findings.md P2:1305 removed sanitizeURL
+//    from the exported surface, so the path-traversal × sanitizeURL
+//    matrix went with it. SSRF scheme/host enforcement lives in
+//    checkSSRF (covered elsewhere) and in safeFetch's internal use of
+//    the now-private sanitizeURL helper.
 // ═════════════════════════════════════════════════════════════════════════════
-
-// sanitizeURL should return null for non-http(s), strip credentials, normalise hostname.
-// We verify behaviour across path-traversal-style hostnames/paths.
-const pathTraversalCases: Array<{ label: string; url: string; expectNull: boolean }> = [
-  { label: 'dotdot-in-path',        url: 'http://example.com/../etc/passwd',         expectNull: false }, // URL normalisation keeps it valid
-  { label: 'encoded-dotdot',        url: 'http://example.com/%2e%2e/etc/passwd',     expectNull: false },
-  { label: 'double-encoded-dotdot', url: 'http://example.com/%252e%252e/etc',        expectNull: false },
-  { label: 'backslash-traversal',   url: 'http://example.com\\evil.com/path',        expectNull: false }, // browsers normalise, URL API may too
-  { label: 'file-scheme-dotdot',    url: 'file:///etc/passwd',                       expectNull: true },
-  { label: 'file-dotdot',           url: 'file:///../etc/passwd',                    expectNull: true },
-  { label: 'null-byte-path',        url: 'http://example.com/path\x00extra',         expectNull: false }, // Node URL API encodes null bytes rather than rejecting
-  { label: 'credentials-in-url',    url: 'http://user:pass@example.com/path',        expectNull: false }, // stripped by sanitizeURL
-  { label: 'valid-http',            url: 'http://example.com/path',                  expectNull: false },
-  { label: 'valid-https',           url: 'https://example.com/path?q=1',             expectNull: false },
-  { label: 'data-scheme',           url: 'data:text/html,<h1>test</h1>',             expectNull: true },
-  { label: 'javascript-scheme',     url: 'javascript:alert(1)',                      expectNull: true },
-];
-
-describe('path traversal × sanitizeURL', () => {
-  it.each(pathTraversalCases)('$label → null=$expectNull', ({ url, expectNull }) => {
-    const result = sanitizeURL(url);
-    if (expectNull) {
-      expect(result).toBeNull();
-    } else {
-      // non-null: returned URL must be valid and have no credentials
-      expect(result).not.toBeNull();
-      if (result) {
-        expect(() => new URL(result)).not.toThrow();
-        const parsed = new URL(result);
-        expect(parsed.username).toBe('');
-        expect(parsed.password).toBe('');
-      }
-    }
-  });
-});
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 8. Unicode attack vectors  (15 unicode tricks)
@@ -410,37 +385,7 @@ describe('unicode attack vectors × sanitizer', () => {
   });
 });
 
-// ─── Bonus: isAllowedDomain / isBlockedDomain matrix ─────────────────────────
-
-const domainAllowlistCases: Array<{ url: string; allowedDomains: string[]; expected: boolean; label: string }> = [
-  { label: 'exact-match',      url: 'https://example.com/path',     allowedDomains: ['example.com'],        expected: true },
-  { label: 'subdomain-match',  url: 'https://sub.example.com/path', allowedDomains: ['example.com'],        expected: true },
-  { label: 'deep-subdomain',   url: 'https://a.b.example.com',      allowedDomains: ['example.com'],        expected: true },
-  { label: 'no-match',         url: 'https://evil.com/path',        allowedDomains: ['example.com'],        expected: false },
-  { label: 'empty-list',       url: 'https://example.com',          allowedDomains: [],                     expected: false },
-  { label: 'multiple-allowed', url: 'https://cdn.evil.com',         allowedDomains: ['example.com','ok.com'], expected: false },
-  { label: 'multi-match',      url: 'https://ok.com/page',          allowedDomains: ['example.com','ok.com'], expected: true },
-  { label: 'invalid-url',      url: 'not-a-url',                    allowedDomains: ['example.com'],        expected: false },
-];
-
-describe('isAllowedDomain matrix', () => {
-  it.each(domainAllowlistCases)('$label → $expected', ({ url, allowedDomains, expected }) => {
-    expect(isAllowedDomain(url, allowedDomains)).toBe(expected);
-  });
-});
-
-const domainBlocklistCases: Array<{ url: string; blocklist: string[]; expected: boolean; label: string }> = [
-  { label: 'blocked-exact',    url: 'https://malware.com/dl',       blocklist: ['malware.com'],              expected: true },
-  { label: 'blocked-subdomain',url: 'https://sub.malware.com',      blocklist: ['malware.com'],              expected: true },
-  { label: 'not-blocked',      url: 'https://safe.com',             blocklist: ['malware.com'],              expected: false },
-  { label: 'empty-blocklist',  url: 'https://anything.com',         blocklist: [],                           expected: false },
-  { label: 'invalid-url',      url: 'bad-url',                      blocklist: ['malware.com'],              expected: true }, // invalid = blocked
-  { label: 'partial-name',     url: 'https://notmalware.com',       blocklist: ['malware.com'],              expected: false },
-  { label: 'multi-blocklist',  url: 'https://evil.org',             blocklist: ['malware.com', 'evil.org'], expected: true },
-];
-
-describe('isBlockedDomain matrix', () => {
-  it.each(domainBlocklistCases)('$label → $expected', ({ url, blocklist, expected }) => {
-    expect(isBlockedDomain(url, blocklist)).toBe(expected);
-  });
-});
+// findings.md P2:1305 — isAllowedDomain / isBlockedDomain matrices
+// removed alongside the dead exports they tested. A per-character
+// allow/blocklist policy was never wired in; the placeholder functions
+// were reachable from tests only.

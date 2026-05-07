@@ -1828,8 +1828,7 @@ describe('Configuration properties', () => {
     expect(config.security.tokenLength).toBeGreaterThanOrEqual(16);
     expect(config.security.maxMessageLength).toBeGreaterThan(0);
     expect(config.security.keyDerivation.algorithm).toBe('argon2id');
-    expect(config.agents).toBeDefined();
-    expect(config.agents.length).toBeGreaterThan(0);
+    // findings.md P2:171 — `agents` moved out of LainConfig; see DEFAULT_PROVIDERS.
     expect(config.logging).toBeDefined();
     expect(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).toContain(config.logging.level);
   });
@@ -1841,21 +1840,14 @@ describe('Configuration properties', () => {
     expect(JSON.stringify(a)).toBe(JSON.stringify(b));
   });
 
-  it('each agent has valid id, name, providers', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    const config = getDefaultConfig();
-    for (const agent of config.agents) {
-      expect(typeof agent.id).toBe('string');
-      expect(agent.id.length).toBeGreaterThan(0);
-      expect(typeof agent.name).toBe('string');
-      expect(agent.name.length).toBeGreaterThan(0);
-      expect(typeof agent.enabled).toBe('boolean');
-      expect(agent.providers.length).toBeGreaterThan(0);
-      for (const provider of agent.providers) {
-        expect(['anthropic', 'openai', 'google']).toContain(provider.type);
-        expect(typeof provider.model).toBe('string');
-        expect(provider.model.length).toBeGreaterThan(0);
-      }
+  it('DEFAULT_PROVIDERS entries have valid shape', async () => {
+    // findings.md P2:171 — replaces the old `config.agents[*].providers` walk.
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    expect(DEFAULT_PROVIDERS.length).toBeGreaterThan(0);
+    for (const provider of DEFAULT_PROVIDERS) {
+      expect(['anthropic', 'openai', 'google']).toContain(provider.type);
+      expect(typeof provider.model).toBe('string');
+      expect(provider.model.length).toBeGreaterThan(0);
     }
   });
 
@@ -1920,7 +1912,8 @@ describe('Configuration properties', () => {
     const { ValidationError } = await import('../src/utils/errors.js');
     const { getDefaultConfig } = await import('../src/config/defaults.js');
     const base = getDefaultConfig();
-    for (const key of ['version', 'gateway', 'security', 'agents', 'logging'] as const) {
+    // findings.md P2:171 — `agents` removed from LainConfig.
+    for (const key of ['version', 'gateway', 'security', 'logging'] as const) {
       const copy = { ...base } as Record<string, unknown>;
       delete copy[key];
       expect(() => validate(copy), `missing ${key}`).toThrow(ValidationError);
@@ -2042,7 +2035,8 @@ describe('Event bus properties', () => {
       expect(received!.character).toBe(charId);
       eventBus.removeListener('activity', listener);
     }
-    eventBus.setCharacterId(origId);
+    // Restore whatever id was set before the test (may be null under P2:295).
+    if (origId != null) eventBus.setCharacterId(origId);
   });
 
   it('parseEventType maps known prefixes correctly (10 random)', async () => {
@@ -2168,7 +2162,8 @@ describe('Event bus properties', () => {
 
   it('characterId is accessible', async () => {
     const { eventBus } = await import('../src/events/bus.js');
-    expect(typeof eventBus.characterId).toBe('string');
+    // findings.md P2:295 — `string | null` after the default was removed.
+    expect(['string', 'object']).toContain(typeof eventBus.characterId);
   });
 });
 
@@ -2177,32 +2172,9 @@ describe('Event bus properties', () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe('URL sanitization properties', () => {
-  it('sanitized URL is always a valid URL or null (50 random)', async () => {
-    const { sanitizeURL } = await import('../src/security/ssrf.js');
-    const rng = mkRng(0x70000001);
-    const schemes = ['http', 'https', 'ftp', 'file', 'data'];
-    const hosts = ['example.com', '192.168.1.1', 'localhost', '8.8.8.8', 'test.org'];
-    for (let i = 0; i < 50; i++) {
-      const url = `${rng.pick(schemes)}://${rng.pick(hosts)}:${rng.i(1, 65535)}/${rng.word()}`;
-      const result = sanitizeURL(url);
-      if (result !== null) {
-        expect(() => new URL(result)).not.toThrow();
-      }
-    }
-  });
-
-  it('sanitizing a safe URL twice returns the same result (idempotent, 20 random)', async () => {
-    const { sanitizeURL } = await import('../src/security/ssrf.js');
-    const rng = mkRng(0x70000002);
-    for (let i = 0; i < 20; i++) {
-      const url = `https://${rng.word()}.com/${rng.word()}`;
-      const first = sanitizeURL(url);
-      if (first !== null) {
-        const second = sanitizeURL(first);
-        expect(second).toBe(first);
-      }
-    }
-  });
+  // findings.md P2:1305 — sanitizeURL is no longer exported; safeFetch
+  // consumes it internally. Scheme/credential/private-IP enforcement is
+  // tested against the public API (checkSSRF) below.
 
   it('private IPs are never returned as safe by checkSSRF (30 random)', async () => {
     const { checkSSRF } = await import('../src/security/ssrf.js');
@@ -2217,42 +2189,6 @@ describe('URL sanitization properties', () => {
       const result = await checkSSRF(`http://${ip}:${rng.i(1, 65535)}/`);
       expect(result.safe, `http://${ip}`).toBe(false);
     }
-  });
-
-  it('scheme is always http or https after sanitization (30 random)', async () => {
-    const { sanitizeURL } = await import('../src/security/ssrf.js');
-    const rng = mkRng(0x70000004);
-    const schemes = ['http', 'https', 'ftp', 'file', 'javascript', 'data', 'gopher'];
-    for (let i = 0; i < 30; i++) {
-      const url = `${rng.pick(schemes)}://${rng.word()}.com/${rng.word()}`;
-      const result = sanitizeURL(url);
-      if (result !== null) {
-        const parsed = new URL(result);
-        expect(['http:', 'https:']).toContain(parsed.protocol);
-      }
-    }
-  });
-
-  it('sanitizeURL strips credentials (10 random)', async () => {
-    const { sanitizeURL } = await import('../src/security/ssrf.js');
-    const rng = mkRng(0x70000005);
-    for (let i = 0; i < 10; i++) {
-      const user = rng.word();
-      const pass = rng.word();
-      const host = `${rng.word()}.com`;
-      const url = `https://${user}:${pass}@${host}/`;
-      const result = sanitizeURL(url);
-      expect(result).not.toBeNull();
-      expect(result!).not.toContain(pass);
-      expect(result!).not.toContain(`${user}:`);
-    }
-  });
-
-  it('sanitizeURL normalizes hostname to lowercase', async () => {
-    const { sanitizeURL } = await import('../src/security/ssrf.js');
-    const result = sanitizeURL('https://EXAMPLE.COM/path');
-    expect(result).not.toBeNull();
-    expect(new URL(result!).hostname).toBe('example.com');
   });
 
   it('isPrivateIP identifies all RFC1918 ranges (comprehensive)', async () => {
@@ -2283,51 +2219,8 @@ describe('URL sanitization properties', () => {
     }
   });
 
-  it('non-http schemes return null from sanitizeURL', async () => {
-    const { sanitizeURL } = await import('../src/security/ssrf.js');
-    for (const scheme of ['file', 'ftp', 'javascript', 'data', 'gopher']) {
-      expect(sanitizeURL(`${scheme}://example.com/`)).toBeNull();
-    }
-  });
-
-  it('garbage strings return null from sanitizeURL (20 random)', async () => {
-    const { sanitizeURL } = await import('../src/security/ssrf.js');
-    const rng = mkRng(0x70000009);
-    for (let i = 0; i < 20; i++) {
-      const result = sanitizeURL(rng.str(50));
-      // Either null or a valid URL
-      if (result !== null) {
-        expect(() => new URL(result)).not.toThrow();
-      }
-    }
-  });
-
-  it('isAllowedDomain exact and subdomain matching (10 cases)', async () => {
-    const { isAllowedDomain } = await import('../src/security/ssrf.js');
-    const allowed = ['example.com', 'api.internal.com'];
-    expect(isAllowedDomain('https://example.com/path', allowed)).toBe(true);
-    expect(isAllowedDomain('https://sub.example.com/path', allowed)).toBe(true);
-    expect(isAllowedDomain('https://evil.com/path', allowed)).toBe(false);
-    expect(isAllowedDomain('https://notexample.com/path', allowed)).toBe(false);
-    expect(isAllowedDomain('https://api.internal.com/v1', allowed)).toBe(true);
-    expect(isAllowedDomain('https://sub.api.internal.com/v1', allowed)).toBe(true);
-    expect(isAllowedDomain('https://internal.com/v1', allowed)).toBe(false);
-    expect(isAllowedDomain('not-a-url', allowed)).toBe(false);
-    expect(isAllowedDomain('', allowed)).toBe(false);
-    expect(isAllowedDomain('https://EXAMPLE.COM/', allowed)).toBe(true);
-  });
-
-  it('isBlockedDomain blocks exact and subdomain matches (10 cases)', async () => {
-    const { isBlockedDomain } = await import('../src/security/ssrf.js');
-    const blocklist = ['evil.com', 'malware.org'];
-    expect(isBlockedDomain('https://evil.com/', blocklist)).toBe(true);
-    expect(isBlockedDomain('https://sub.evil.com/', blocklist)).toBe(true);
-    expect(isBlockedDomain('https://malware.org/payload', blocklist)).toBe(true);
-    expect(isBlockedDomain('https://goodsite.com/', blocklist)).toBe(false);
-    expect(isBlockedDomain('https://notevil.com/', blocklist)).toBe(false);
-    expect(isBlockedDomain('invalid-url', blocklist)).toBe(true); // Invalid URLs are blocked
-    expect(isBlockedDomain('', blocklist)).toBe(true);
-  });
+  // findings.md P2:1305 — dead-export tests (sanitizeURL scheme/garbage,
+  // isAllowedDomain, isBlockedDomain) removed with the exports themselves.
 
   it('checkSSRF allows known safe public URLs (5 tests)', async () => {
     const { checkSSRF } = await import('../src/security/ssrf.js');
@@ -2344,20 +2237,8 @@ describe('URL sanitization properties', () => {
     expect((await checkSSRF('http://metadata.google.internal/')).safe).toBe(false);
   });
 
-  it('sanitizeURL handles URLs with query strings and fragments', async () => {
-    const { sanitizeURL } = await import('../src/security/ssrf.js');
-    const result = sanitizeURL('https://example.com/path?q=test&foo=bar#section');
-    expect(result).not.toBeNull();
-    expect(result).toContain('example.com');
-    expect(result).toContain('q=test');
-  });
-
-  it('sanitizeURL preserves port numbers', async () => {
-    const { sanitizeURL } = await import('../src/security/ssrf.js');
-    const result = sanitizeURL('https://example.com:8443/path');
-    expect(result).not.toBeNull();
-    expect(result).toContain('8443');
-  });
+  // findings.md P2:1305 — sanitizeURL query/port tests removed; function
+  // is internal-only now.
 
   it('100 random IPv4 addresses: isPrivateIP never throws', async () => {
     const { isPrivateIP } = await import('../src/security/ssrf.js');
@@ -3174,10 +3055,13 @@ describe('Location runtime properties', () => {
     }
   });
 
-  it('getCurrentLocation returns positive timestamp', async () => {
-    const { getCurrentLocation } = await import('../src/commune/location.js');
+  it('getCurrentLocation returns non-negative timestamp', async () => {
+    // findings.md P2:1402 — un-persisted fallback uses timestamp:0.
+    const { getCurrentLocation, setCurrentLocation } = await import('../src/commune/location.js');
     const { eventBus } = await import('../src/events/bus.js');
     eventBus.setCharacterId('ts-test');
+    // After an explicit move the timestamp reflects Date.now().
+    setCurrentLocation('library', 'ts-test');
     const loc = getCurrentLocation();
     expect(loc.timestamp).toBeGreaterThan(0);
   });
@@ -3578,14 +3462,14 @@ describe('Input sanitizer runtime properties', () => {
     expect(result.blocked).toBe(false);
   });
 
-  it('structural framing escapes HTML tags (10 random)', async () => {
+  // findings.md P2:1222 — structural framing is a no-op; tags are preserved verbatim.
+  it('structural framing preserves HTML tags verbatim (10 random, findings.md P2:1222)', async () => {
     const { sanitize } = await import('../src/security/sanitizer.js');
     const rng = mkRng(0xD0000002);
     for (let i = 0; i < 10; i++) {
       const tag = `<${rng.word()}>${rng.str(20)}</${rng.word()}>`;
       const result = sanitize(tag, { blockPatterns: false, warnPatterns: false });
-      expect(result.sanitized).not.toContain('<' + rng.word());
-      expect(result.sanitized).toContain('&lt;');
+      expect(result.sanitized).toBe(tag);
     }
   });
 
@@ -3637,55 +3521,8 @@ describe('Input sanitizer runtime properties', () => {
     }
   });
 
-  it('analyzeRisk returns valid risk levels (20 random)', async () => {
-    const { analyzeRisk } = await import('../src/security/sanitizer.js');
-    const rng = mkRng(0xD0000004);
-    const validLevels = ['low', 'medium', 'high'];
-    for (let i = 0; i < 20; i++) {
-      const result = analyzeRisk(rng.str(100));
-      expect(validLevels).toContain(result.riskLevel);
-      expect(Array.isArray(result.indicators)).toBe(true);
-    }
-  });
-
-  it('escapeSpecialChars escapes all dangerous characters', async () => {
-    const { escapeSpecialChars } = await import('../src/security/sanitizer.js');
-    const input = 'hello "world" \'test\' `code` $var {braces}';
-    const result = escapeSpecialChars(input);
-    // Escaped forms are present
-    expect(result).toContain('\\"');
-    expect(result).toContain('\\`');
-    expect(result).toContain('\\$');
-    expect(result).toContain('\\{');
-    expect(result).toContain('\\}');
-    // Verify the result length is longer (escaping adds characters)
-    expect(result.length).toBeGreaterThan(input.length);
-    expect(result).toContain('\\$var');
-  });
-
-  it('isNaturalLanguage returns true for normal text', async () => {
-    const { isNaturalLanguage } = await import('../src/security/sanitizer.js');
-    expect(isNaturalLanguage('Hello, this is a normal sentence.')).toBe(true);
-    expect(isNaturalLanguage('The quick brown fox jumps over the lazy dog.')).toBe(true);
-  });
-
-  it('isNaturalLanguage returns false for code-like content', async () => {
-    const { isNaturalLanguage } = await import('../src/security/sanitizer.js');
-    expect(isNaturalLanguage('{{{{{{{{{}}}}}}}}}}')).toBe(false);
-    expect(isNaturalLanguage('A'.repeat(51))).toBe(false); // One "very long word"
-  });
-
-  it('wrapUserContent wraps in user_message tags', async () => {
-    const { wrapUserContent } = await import('../src/security/sanitizer.js');
-    const rng = mkRng(0xD0000005);
-    for (let i = 0; i < 5; i++) {
-      const content = rng.str(40);
-      const wrapped = wrapUserContent(content);
-      expect(wrapped).toContain('<user_message>');
-      expect(wrapped).toContain('</user_message>');
-      expect(wrapped).toContain(content);
-    }
-  });
+  // findings.md P2:1250 — analyzeRisk / escapeSpecialChars / isNaturalLanguage /
+  // wrapUserContent property-based tests removed with the dead functions.
 
   it('unicode input never crashes sanitize (10 examples)', async () => {
     const { sanitize } = await import('../src/security/sanitizer.js');

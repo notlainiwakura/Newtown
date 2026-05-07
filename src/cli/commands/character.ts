@@ -1,83 +1,74 @@
 /**
- * Character commands â€” Start character server instances
+ * Character commands — Start character server instances from manifest
  */
 
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { startCharacterServer, type CharacterConfig } from '../../web/character-server.js';
 import { displayError } from '../utils/prompts.js';
+import { getCharacterEntry, getPeersFor } from '../../config/characters.js';
 import type { PeerConfig } from '../../agent/character-tools.js';
 
-const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const SRC_DIR = join(__dirname, '..', '..', '..');
-
-function parsePeerConfig(): PeerConfig[] {
+export function parsePeerConfig(characterId: string): PeerConfig[] {
   const raw = process.env['PEER_CONFIG'];
-  if (!raw) return [];
-  try {
-    return JSON.parse(raw) as PeerConfig[];
-  } catch {
-    console.warn('Warning: Could not parse PEER_CONFIG env var');
-    return [];
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      const validated = validatePeerConfigShape(parsed);
+      if (validated) return validated;
+      // findings.md P2:66 — previously `JSON.parse(raw) as PeerConfig[]`
+      // silently handed malformed env to downstream loops, which then
+      // crashed in startDesireLoop / startCommuneLoop with opaque
+      // "peers[i].url is undefined"-style errors. Warn + fall back.
+      console.warn(
+        'Warning: PEER_CONFIG env var has wrong shape (expected array of {id,name,url}); falling back to manifest',
+      );
+    } catch {
+      console.warn('Warning: Could not parse PEER_CONFIG env var');
+    }
   }
+  return getPeersFor(characterId);
 }
 
-function buildCharacterConfig(
-  id: string,
-  name: string,
-  port: number
-): CharacterConfig {
-  return {
-    id,
-    name,
-    port,
-    publicDir: join(SRC_DIR, 'src', 'web', 'public'),
-    peers: parsePeerConfig(),
+function validatePeerConfigShape(value: unknown): PeerConfig[] | null {
+  if (!Array.isArray(value)) return null;
+  for (const entry of value) {
+    if (
+      !entry ||
+      typeof entry !== 'object' ||
+      typeof (entry as { id?: unknown }).id !== 'string' ||
+      typeof (entry as { name?: unknown }).name !== 'string' ||
+      typeof (entry as { url?: unknown }).url !== 'string'
+    ) {
+      return null;
+    }
+  }
+  return value as PeerConfig[];
+}
+
+export async function startCharacterById(characterId: string, portOverride?: number): Promise<void> {
+  const entry = getCharacterEntry(characterId);
+  if (!entry) {
+    displayError(`Unknown character: ${characterId}. Add it to characters.json first.`);
+    process.exit(1);
+  }
+
+  const config: CharacterConfig = {
+    id: entry.id,
+    name: entry.name,
+    port: portOverride ?? entry.port,
+    peers: parsePeerConfig(entry.id),
   };
-}
 
-export async function startNeo(port: number = 3003): Promise<void> {
-  try {
-    const config = buildCharacterConfig('neo', 'Neo', port);
-    await startCharacterServer(config);
-  } catch (error) {
-    displayError(`Failed to start Neo server: ${error}`);
-    process.exit(1);
-  }
-}
+  process.env['LAIN_CHARACTER_ID'] = entry.id;
+  process.env['LAIN_CHARACTER_NAME'] = entry.name;
 
-export async function startPlato(port: number = 3004): Promise<void> {
-  try {
-    const config = buildCharacterConfig('plato', 'Plato', port);
-    await startCharacterServer(config);
-  } catch (error) {
-    displayError(`Failed to start Plato server: ${error}`);
-    process.exit(1);
-  }
-}
-
-export async function startJoe(port: number = 3005): Promise<void> {
-  try {
-    const config = buildCharacterConfig('joe', 'Joe', port);
+  if (entry.possessable) {
     config.possessable = true;
+  }
+
+  try {
     await startCharacterServer(config);
   } catch (error) {
-    displayError(`Failed to start Joe server: ${error}`);
+    displayError(`Failed to start ${entry.name} server: ${error}`);
     process.exit(1);
   }
-}
-
-const CHARACTER_MAP: Record<string, (port: number) => Promise<void>> = {
-  neo: startNeo,
-  plato: startPlato,
-  joe: startJoe,
-};
-
-export async function startCharacter(characterId: string, port: number): Promise<void> {
-  const starter = CHARACTER_MAP[characterId];
-  if (!starter) {
-    displayError(`Unknown character: ${characterId}. Available: ${Object.keys(CHARACTER_MAP).join(', ')}`);
-    process.exit(1);
-  }
-  await starter(port);
 }

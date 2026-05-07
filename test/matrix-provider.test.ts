@@ -42,11 +42,17 @@ const {
   };
 });
 
-vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: { create: mockAnthropicCreate, stream: mockAnthropicStream },
-  })),
-}));
+vi.mock('@anthropic-ai/sdk', async () => {
+  // findings.md P2:838 — preserve real APIError exports so the provider's
+  // `err instanceof APIError` retry classification works under test.
+  const actual = await vi.importActual<typeof import('@anthropic-ai/sdk')>('@anthropic-ai/sdk');
+  return {
+    ...actual,
+    default: vi.fn().mockImplementation(() => ({
+      messages: { create: mockAnthropicCreate, stream: mockAnthropicStream },
+    })),
+  };
+});
 
 vi.mock('openai', () => ({
   default: vi.fn().mockImplementation(() => ({
@@ -58,6 +64,12 @@ vi.mock('@google/generative-ai', () => ({
   GoogleGenerativeAI: vi.fn().mockImplementation(() => ({
     getGenerativeModel: mockGetGenerativeModel,
   })),
+  FunctionCallingMode: {
+    MODE_UNSPECIFIED: 'MODE_UNSPECIFIED',
+    AUTO: 'AUTO',
+    ANY: 'ANY',
+    NONE: 'NONE',
+  },
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -214,7 +226,10 @@ describe('finish-reason mapping', () => {
     { raw: 'STOP',       expected: 'stop' },
     { raw: 'MAX_TOKENS', expected: 'length' },
     { raw: 'SAFETY',     expected: 'content_filter' },
-    { raw: 'OTHER',      expected: 'stop' },
+    // findings.md P2:940 — unrecognized Google enum members map to 'unknown'
+    // so callers can branch on genuinely novel signals instead of seeing
+    // them collapse to 'stop'.
+    { raw: 'OTHER',      expected: 'unknown' },
     { raw: undefined,    expected: 'stop' },
   ];
 

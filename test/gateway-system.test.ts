@@ -101,11 +101,15 @@ function uid() {
 describe('Gateway Auth — authenticate()', () => {
   beforeEach(() => {
     clearAuthentications();
+    // findings.md P2:2616 — authenticate() now consumes canAuthenticate()
+    // budget, so we must reset rate-limiter state between tests.
+    resetRateLimiter();
     vi.mocked(getAuthToken).mockReset();
   });
 
   afterEach(() => {
     clearAuthentications();
+    resetRateLimiter();
   });
 
   it('succeeds with correct token', async () => {
@@ -190,8 +194,8 @@ describe('Gateway Auth — authenticate()', () => {
 });
 
 describe('Gateway Auth — isAuthenticated()', () => {
-  beforeEach(() => clearAuthentications());
-  afterEach(() => clearAuthentications());
+  beforeEach(() => { clearAuthentications(); resetRateLimiter(); });
+  afterEach(() => { clearAuthentications(); resetRateLimiter(); });
 
   it('returns false for unknown connectionId', () => {
     expect(isAuthenticated('nobody')).toBe(false);
@@ -214,8 +218,8 @@ describe('Gateway Auth — isAuthenticated()', () => {
 });
 
 describe('Gateway Auth — getConnection()', () => {
-  beforeEach(() => clearAuthentications());
-  afterEach(() => clearAuthentications());
+  beforeEach(() => { clearAuthentications(); resetRateLimiter(); });
+  afterEach(() => { clearAuthentications(); resetRateLimiter(); });
 
   it('returns undefined for unknown id', () => {
     expect(getConnection('nobody')).toBeUndefined();
@@ -230,8 +234,8 @@ describe('Gateway Auth — getConnection()', () => {
 });
 
 describe('Gateway Auth — setConnectionAgent()', () => {
-  beforeEach(() => clearAuthentications());
-  afterEach(() => clearAuthentications());
+  beforeEach(() => { clearAuthentications(); resetRateLimiter(); });
+  afterEach(() => { clearAuthentications(); resetRateLimiter(); });
 
   it('returns false for unknown connectionId', () => {
     expect(setConnectionAgent('nobody', 'pkd')).toBe(false);
@@ -263,8 +267,8 @@ describe('Gateway Auth — setConnectionAgent()', () => {
 });
 
 describe('Gateway Auth — deauthenticate()', () => {
-  beforeEach(() => clearAuthentications());
-  afterEach(() => clearAuthentications());
+  beforeEach(() => { clearAuthentications(); resetRateLimiter(); });
+  afterEach(() => { clearAuthentications(); resetRateLimiter(); });
 
   it('returns false for unknown connectionId', () => {
     expect(deauthenticate('nobody')).toBe(false);
@@ -287,8 +291,8 @@ describe('Gateway Auth — deauthenticate()', () => {
 });
 
 describe('Gateway Auth — getAuthenticatedConnections() / count', () => {
-  beforeEach(() => clearAuthentications());
-  afterEach(() => clearAuthentications());
+  beforeEach(() => { clearAuthentications(); resetRateLimiter(); });
+  afterEach(() => { clearAuthentications(); resetRateLimiter(); });
 
   it('returns empty array when no connections', () => {
     expect(getAuthenticatedConnections()).toEqual([]);
@@ -320,8 +324,8 @@ describe('Gateway Auth — getAuthenticatedConnections() / count', () => {
 });
 
 describe('Gateway Auth — clearAuthentications()', () => {
-  beforeEach(() => clearAuthentications());
-  afterEach(() => clearAuthentications());
+  beforeEach(() => { clearAuthentications(); resetRateLimiter(); });
+  afterEach(() => { clearAuthentications(); resetRateLimiter(); });
 
   it('clears all connections', async () => {
     vi.mocked(getAuthToken).mockResolvedValue('tok');
@@ -337,6 +341,93 @@ describe('Gateway Auth — clearAuthentications()', () => {
     await authenticate(id, 'tok');
     clearAuthentications();
     expect(isAuthenticated(id)).toBe(false);
+  });
+});
+
+// findings.md P2:2636 — auth records should carry a token fingerprint
+// and an activity timestamp so audit logs can distinguish operators
+// and idle sessions can be swept even when the peer SIGKILLs.
+describe('Gateway Auth — session TTL + identity (P2:2636)', () => {
+  beforeEach(() => { clearAuthentications(); resetRateLimiter(); });
+  afterEach(() => { clearAuthentications(); resetRateLimiter(); });
+
+  it('authenticate() records a token fingerprint', async () => {
+    vi.mocked(getAuthToken).mockResolvedValue('tok');
+    const conn = await authenticate(uid(), 'tok');
+    expect(conn.tokenFingerprint).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it('different tokens yield different fingerprints', async () => {
+    const { fingerprintToken } = await import('../src/gateway/auth.js');
+    expect(fingerprintToken('tok-a')).not.toBe(fingerprintToken('tok-b'));
+  });
+
+  it('same token yields the same fingerprint (stable)', async () => {
+    const { fingerprintToken } = await import('../src/gateway/auth.js');
+    expect(fingerprintToken('tok-a')).toBe(fingerprintToken('tok-a'));
+  });
+
+  it('authenticate() initialises lastActivityAt', async () => {
+    vi.mocked(getAuthToken).mockResolvedValue('tok');
+    const before = Date.now();
+    const conn = await authenticate(uid(), 'tok');
+    expect(conn.lastActivityAt).toBeGreaterThanOrEqual(before);
+    expect(conn.lastActivityAt).toBeLessThanOrEqual(Date.now());
+  });
+
+  it('touchConnection() updates lastActivityAt', async () => {
+    const { touchConnection, getConnection } = await import('../src/gateway/auth.js');
+    vi.mocked(getAuthToken).mockResolvedValue('tok');
+    const id = uid();
+    await authenticate(id, 'tok');
+    const beforeTouch = getConnection(id)?.lastActivityAt ?? 0;
+    await new Promise((r) => setTimeout(r, 10));
+    touchConnection(id);
+    const afterTouch = getConnection(id)?.lastActivityAt ?? 0;
+    expect(afterTouch).toBeGreaterThan(beforeTouch);
+  });
+
+  it('touchConnection() is a no-op for unknown connection id', async () => {
+    const { touchConnection } = await import('../src/gateway/auth.js');
+    expect(() => touchConnection('nonexistent')).not.toThrow();
+  });
+
+  it('sweepIdleConnections() evicts connections older than TTL', async () => {
+    const { sweepIdleConnections, getConnection } = await import('../src/gateway/auth.js');
+    vi.mocked(getAuthToken).mockResolvedValue('tok');
+    const id = uid();
+    const conn = await authenticate(id, 'tok');
+    // Artificially age the connection.
+    conn.lastActivityAt = Date.now() - 10_000;
+    const evicted = sweepIdleConnections(5_000);
+    expect(evicted).toBe(1);
+    expect(getConnection(id)).toBeUndefined();
+  });
+
+  it('sweepIdleConnections() keeps freshly-active connections', async () => {
+    const { sweepIdleConnections, getConnection } = await import('../src/gateway/auth.js');
+    vi.mocked(getAuthToken).mockResolvedValue('tok');
+    const id = uid();
+    await authenticate(id, 'tok');
+    const evicted = sweepIdleConnections(60_000);
+    expect(evicted).toBe(0);
+    expect(getConnection(id)).toBeDefined();
+  });
+
+  it('sweepIdleConnections() reports count and evicts multiple at once', async () => {
+    const { sweepIdleConnections, getAuthenticatedConnectionCount } = await import('../src/gateway/auth.js');
+    vi.mocked(getAuthToken).mockResolvedValue('tok');
+    const id1 = uid();
+    const id2 = uid();
+    const id3 = uid();
+    const c1 = await authenticate(id1, 'tok');
+    const c2 = await authenticate(id2, 'tok');
+    await authenticate(id3, 'tok');
+    c1.lastActivityAt = Date.now() - 10_000;
+    c2.lastActivityAt = Date.now() - 10_000;
+    const evicted = sweepIdleConnections(5_000);
+    expect(evicted).toBe(2);
+    expect(getAuthenticatedConnectionCount()).toBe(1);
   });
 });
 
@@ -357,55 +448,88 @@ describe('Gateway Auth — refreshTokenCache()', () => {
 // 2. RATE LIMITER
 // ═════════════════════════════════════════════════════════════════════════════
 
-describe('Rate Limiter — canConnect()', () => {
+// findings.md P2:2616 — canConnect() used to enforce `connectionsPerMinute`
+// directly, which meant an unauth'd connect storm locked legit users
+// out until the window rolled. Now canConnect() enforces only the cheap
+// pre-auth quota (max(1000, connectionsPerMinute*10)); the configured
+// per-minute limit is enforced on successful auth via canAuthenticate().
+describe('Rate Limiter — canAuthenticate()', () => {
+  beforeEach(async () => {
+    resetRateLimiter();
+    configureRateLimiter({ connectionsPerMinute: 5, requestsPerSecond: 10, burstSize: 20 });
+  });
+  afterEach(() => resetRateLimiter());
+
+  it('allows the first authenticated connection', async () => {
+    const { canAuthenticate } = await import('../src/gateway/rate-limiter.js');
+    expect(canAuthenticate().allowed).toBe(true);
+  });
+
+  it('allows exactly connectionsPerMinute authenticated connections', async () => {
+    const { canAuthenticate } = await import('../src/gateway/rate-limiter.js');
+    for (let i = 0; i < 5; i++) expect(canAuthenticate().allowed).toBe(true);
+  });
+
+  it('rejects the (connectionsPerMinute + 1)th authenticated connection', async () => {
+    const { canAuthenticate } = await import('../src/gateway/rate-limiter.js');
+    for (let i = 0; i < 5; i++) canAuthenticate();
+    expect(canAuthenticate().allowed).toBe(false);
+  });
+
+  it('includes retryAfter when rejected', async () => {
+    const { canAuthenticate } = await import('../src/gateway/rate-limiter.js');
+    for (let i = 0; i < 5; i++) canAuthenticate();
+    const result = canAuthenticate();
+    expect(result.retryAfter).toBeGreaterThan(0);
+  });
+
+  it('retryAfter is in seconds (≤ 60)', async () => {
+    const { canAuthenticate } = await import('../src/gateway/rate-limiter.js');
+    for (let i = 0; i < 5; i++) canAuthenticate();
+    expect(canAuthenticate().retryAfter).toBeLessThanOrEqual(60);
+  });
+
+  it('resetRateLimiter allows authentications again after exhaustion', async () => {
+    const { canAuthenticate } = await import('../src/gateway/rate-limiter.js');
+    for (let i = 0; i < 5; i++) canAuthenticate();
+    resetRateLimiter();
+    configureRateLimiter({ connectionsPerMinute: 5, requestsPerSecond: 10, burstSize: 20 });
+    expect(canAuthenticate().allowed).toBe(true);
+  });
+
+  it('high limit allows many authentications', async () => {
+    const { canAuthenticate } = await import('../src/gateway/rate-limiter.js');
+    resetRateLimiter();
+    configureRateLimiter({ connectionsPerMinute: 1000, requestsPerSecond: 10, burstSize: 20 });
+    for (let i = 0; i < 100; i++) expect(canAuthenticate().allowed).toBe(true);
+  });
+
+  it('limit of 1 only allows 1 authentication', async () => {
+    const { canAuthenticate } = await import('../src/gateway/rate-limiter.js');
+    resetRateLimiter();
+    configureRateLimiter({ connectionsPerMinute: 1, requestsPerSecond: 10, burstSize: 20 });
+    expect(canAuthenticate().allowed).toBe(true);
+    expect(canAuthenticate().allowed).toBe(false);
+  });
+});
+
+describe('Rate Limiter — canConnect() pre-auth budget', () => {
   beforeEach(() => {
     resetRateLimiter();
     configureRateLimiter({ connectionsPerMinute: 5, requestsPerSecond: 10, burstSize: 20 });
   });
   afterEach(() => resetRateLimiter());
 
-  it('allows the first connection', () => {
-    expect(canConnect().allowed).toBe(true);
+  it('pre-auth budget is way bigger than connectionsPerMinute (legit users not locked out by connect storms)', () => {
+    // With connectionsPerMinute=5, pre-auth budget floors at 1000/min.
+    for (let i = 0; i < 200; i++) expect(canConnect().allowed).toBe(true);
   });
 
-  it('allows exactly connectionsPerMinute connections', () => {
-    for (let i = 0; i < 5; i++) expect(canConnect().allowed).toBe(true);
-  });
-
-  it('rejects the (connectionsPerMinute + 1)th connection', () => {
-    for (let i = 0; i < 5; i++) canConnect();
-    expect(canConnect().allowed).toBe(false);
-  });
-
-  it('includes retryAfter when rejected', () => {
-    for (let i = 0; i < 5; i++) canConnect();
-    const result = canConnect();
-    expect(result.retryAfter).toBeGreaterThan(0);
-  });
-
-  it('retryAfter is in seconds (≤ 60)', () => {
-    for (let i = 0; i < 5; i++) canConnect();
-    expect(canConnect().retryAfter).toBeLessThanOrEqual(60);
-  });
-
-  it('resetRateLimiter allows connections again after exhaustion', () => {
-    for (let i = 0; i < 5; i++) canConnect();
-    resetRateLimiter();
-    configureRateLimiter({ connectionsPerMinute: 5, requestsPerSecond: 10, burstSize: 20 });
-    expect(canConnect().allowed).toBe(true);
-  });
-
-  it('high limit allows many connections', () => {
-    resetRateLimiter();
-    configureRateLimiter({ connectionsPerMinute: 1000, requestsPerSecond: 10, burstSize: 20 });
-    for (let i = 0; i < 100; i++) expect(canConnect().allowed).toBe(true);
-  });
-
-  it('limit of 1 only allows 1 connection', () => {
-    resetRateLimiter();
-    configureRateLimiter({ connectionsPerMinute: 1, requestsPerSecond: 10, burstSize: 20 });
-    expect(canConnect().allowed).toBe(true);
-    expect(canConnect().allowed).toBe(false);
+  it('does NOT drain the authenticated-connection budget', async () => {
+    const { canAuthenticate } = await import('../src/gateway/rate-limiter.js');
+    for (let i = 0; i < 100; i++) canConnect();
+    // All 5 authenticated slots must still be available.
+    for (let i = 0; i < 5; i++) expect(canAuthenticate().allowed).toBe(true);
   });
 });
 
@@ -591,23 +715,25 @@ describe('Rate Limiter — getRateLimitStatus()', () => {
 describe('Rate Limiter — configureRateLimiter()', () => {
   afterEach(() => resetRateLimiter());
 
-  it('new config takes effect immediately', () => {
+  it('new config takes effect immediately (authenticated budget)', async () => {
+    const { canAuthenticate } = await import('../src/gateway/rate-limiter.js');
     resetRateLimiter();
     configureRateLimiter({ connectionsPerMinute: 1, requestsPerSecond: 1, burstSize: 1 });
-    canConnect(); // use the 1 allowed
-    expect(canConnect().allowed).toBe(false);
+    canAuthenticate(); // use the 1 allowed
+    expect(canAuthenticate().allowed).toBe(false);
   });
 
-  it('can raise the limit', () => {
+  it('can raise the limit (authenticated budget)', async () => {
+    const { canAuthenticate } = await import('../src/gateway/rate-limiter.js');
     resetRateLimiter();
     configureRateLimiter({ connectionsPerMinute: 2, requestsPerSecond: 10, burstSize: 20 });
-    canConnect();
-    canConnect();
-    expect(canConnect().allowed).toBe(false);
+    canAuthenticate();
+    canAuthenticate();
+    expect(canAuthenticate().allowed).toBe(false);
 
     resetRateLimiter();
     configureRateLimiter({ connectionsPerMinute: 100, requestsPerSecond: 10, burstSize: 20 });
-    for (let i = 0; i < 50; i++) expect(canConnect().allowed).toBe(true);
+    for (let i = 0; i < 50; i++) expect(canAuthenticate().allowed).toBe(true);
   });
 });
 
@@ -720,7 +846,8 @@ describe('Router — built-in methods', () => {
 });
 
 describe('Router — auth method handling', () => {
-  afterEach(() => clearAuthentications());
+  beforeEach(() => { clearAuthentications(); resetRateLimiter(); });
+  afterEach(() => { clearAuthentications(); resetRateLimiter(); });
 
   it('returns INVALID_PARAMS when token param is missing', async () => {
     const r = await handleMessage('c', msg('auth', {}), true);
@@ -1117,7 +1244,8 @@ describe('Edge cases — router', () => {
 });
 
 describe('Edge cases — auth concurrent authentication', () => {
-  afterEach(() => clearAuthentications());
+  beforeEach(() => { clearAuthentications(); resetRateLimiter(); });
+  afterEach(() => { clearAuthentications(); resetRateLimiter(); });
 
   it('authenticating the same connectionId twice results in a single entry', async () => {
     vi.mocked(getAuthToken).mockResolvedValue('tok');

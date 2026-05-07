@@ -62,6 +62,7 @@ vi.mock('../src/memory/embeddings.js', () => ({
   }),
   serializeEmbedding: vi.fn().mockImplementation((arr: Float32Array) => Buffer.from(arr.buffer)),
   deserializeEmbedding: vi.fn().mockImplementation((buf: Buffer) => new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4)),
+  CURRENT_EMBEDDING_MODEL: 'Xenova/all-MiniLM-L6-v2',
 }));
 
 // ── Mock palace module (requires palace_wings table setup that's tricky in test) ──
@@ -482,6 +483,31 @@ describe('Conversation data flow', () => {
     const msgs = getRecentVisitorMessages(50);
     expect(msgs).toHaveLength(1);
     expect(msgs[0]!.content).toBe('visitor msg');
+  });
+
+  it('getRecentVisitorMessages excludes every BACKGROUND_PREFIX as a middle segment (findings.md P2:818)', async () => {
+    // Regression lock: the filter must catch background prefixes whether
+    // they sit at the start of the session key or in the middle (e.g.
+    // char-namespaced variants like `lain:letter:sent`, `wired:diary:daily`).
+    const { saveMessage, getRecentVisitorMessages } = await import('../src/memory/store.js');
+    const { BACKGROUND_PREFIXES } = await import('../src/memory/store.js');
+    const now = Date.now();
+    // One real visitor for contrast.
+    saveMessage({ sessionKey: 'web:lonely-visitor', userId: 'lv', role: 'user', content: 'only visitor', timestamp: now, metadata: {} });
+    // Char-namespace each background prefix.
+    BACKGROUND_PREFIXES.forEach((prefix, i) => {
+      saveMessage({
+        sessionKey: `lain:${prefix}:foo`,
+        userId: null,
+        role: 'assistant',
+        content: `bg-${prefix}`,
+        timestamp: now + i + 1,
+        metadata: {},
+      });
+    });
+    const msgs = getRecentVisitorMessages(200);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]!.content).toBe('only visitor');
   });
 
   // --- Activity event emission ---

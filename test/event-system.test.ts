@@ -12,13 +12,21 @@ import { EventEmitter } from 'node:events';
 vi.mock('../src/storage/database.js', () => ({
   getDatabase: vi.fn(),
 }));
+// Stable spy object so tests can inspect warn/debug calls across the module.
+const mockLogger = {
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+};
 vi.mock('../src/utils/logger.js', () => ({
-  getLogger: () => ({
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  }),
+  getLogger: () => mockLogger,
+}));
+// Provide a minimal inhabitant list so notifyInhabitants makes fetch calls.
+vi.mock('../src/config/characters.js', () => ({
+  getInhabitants: () => [
+    { id: 'lain', name: 'Lain', port: 3001, server: 'character', defaultLocation: 'home', workspace: 'lain' },
+  ],
 }));
 // Prevent real HTTP calls from notifyInhabitants
 vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true }));
@@ -27,6 +35,7 @@ import {
   parseEventType,
   isBackgroundEvent,
   eventBus,
+  UNSET_CHARACTER,
   type SystemEvent,
 } from '../src/events/bus.js';
 
@@ -36,7 +45,9 @@ import {
   getAllTownEvents,
   endTownEvent,
   expireStaleEvents,
+  startExpireStaleEventsLoop,
   getActiveEffects,
+  _resetInterlinkWarnForTests,
   type TownEvent,
   type CreateEventParams,
 } from '../src/events/town-events.js';
@@ -238,17 +249,15 @@ describe('EventBus', () => {
   const originalId = eventBus.characterId;
 
   afterEach(() => {
-    eventBus.setCharacterId(originalId);
+    // findings.md P2:295 — characterId is `string | null`; only restore when
+    // there was a real value before this test ran.
+    if (originalId != null) eventBus.setCharacterId(originalId);
     eventBus.removeAllListeners();
   });
 
   // ── characterId ───────────────────────────────────────────────────────────
 
   describe('characterId', () => {
-    it('has a default characterId of "lain"', () => {
-      expect(eventBus.characterId).toBe('lain');
-    });
-
     it('can set characterId', () => {
       eventBus.setCharacterId('pkd');
       expect(eventBus.characterId).toBe('pkd');
@@ -263,6 +272,51 @@ describe('EventBus', () => {
     it('accepts empty string as characterId', () => {
       eventBus.setCharacterId('');
       expect(eventBus.characterId).toBe('');
+    });
+  });
+
+  // ── P2:295 — null default + warn-once when emit before set ────────────────
+
+  describe('emitActivity before setCharacterId (P2:295)', () => {
+    it('tags events with the UNSET_CHARACTER sentinel when setCharacterId was never called', () => {
+      mockLogger.warn.mockClear();
+      eventBus._resetForTests();
+      const received: SystemEvent[] = [];
+      eventBus.on('activity', (e: SystemEvent) => received.push(e));
+      eventBus.emitActivity({ type: 'diary', sessionKey: 'diary:1', content: 'x', timestamp: 1 });
+      expect(received).toHaveLength(1);
+      expect(received[0]!.character).toBe(UNSET_CHARACTER);
+      // Critically: NOT silently tagged as 'lain' (the old default behaviour).
+      expect(received[0]!.character).not.toBe('lain');
+    });
+
+    it('warns at warn level with eventType + sessionKey on the first unset emission', () => {
+      mockLogger.warn.mockClear();
+      eventBus._resetForTests();
+      eventBus.emitActivity({ type: 'diary', sessionKey: 'diary:1', content: 'x', timestamp: 1 });
+      expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+      const [ctx, msg] = mockLogger.warn.mock.calls[0]!;
+      expect(ctx).toMatchObject({ eventType: 'diary', sessionKey: 'diary:1' });
+      expect(String(msg)).toContain('setCharacterId');
+    });
+
+    it('only warns once across many unset emissions', () => {
+      mockLogger.warn.mockClear();
+      eventBus._resetForTests();
+      for (let i = 0; i < 25; i++) {
+        eventBus.emitActivity({ type: 'chat', sessionKey: `s:${i}`, content: 'x', timestamp: i });
+      }
+      expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops warning once setCharacterId has been called (and does not warn on real ids)', () => {
+      mockLogger.warn.mockClear();
+      eventBus._resetForTests();
+      eventBus.setCharacterId('pkd');
+      for (let i = 0; i < 5; i++) {
+        eventBus.emitActivity({ type: 'diary', sessionKey: `d:${i}`, content: 'x', timestamp: i });
+      }
+      expect(mockLogger.warn).not.toHaveBeenCalled();
     });
   });
 
@@ -287,6 +341,7 @@ describe('EventBus', () => {
     });
 
     it('merges event fields with the character', () => {
+      eventBus.setCharacterId('lain');
       const listener = vi.fn();
       eventBus.on('activity', listener);
       const ts = Date.now();
@@ -751,14 +806,190 @@ describe('Town Events — rowToEvent / createTownEvent', () => {
     });
 
     it('notifies inhabitants via fetch (fire-and-forget)', async () => {
-      const fetchMock = vi.fn().mockResolvedValue({ ok: true });
-      vi.stubGlobal('fetch', fetchMock);
-      const db = makeMockDb();
-      vi.mocked(getDatabase).mockReturnValue(db as never);
-      createTownEvent({ description: 'Test notification' });
-      // Allow microtasks to flush
-      await new Promise((r) => setTimeout(r, 10));
-      expect(fetchMock).toHaveBeenCalled();
+      // Per-character interlink auth (findings.md P1:2289) — notifyInhabitants
+      // skips the remote call when either LAIN_CHARACTER_ID or
+      // LAIN_INTERLINK_TOKEN is unset, because getInterlinkHeaders() returns
+      // null and the fetch is guarded on that.
+      const prevId = process.env['LAIN_CHARACTER_ID'];
+      const prevTok = process.env['LAIN_INTERLINK_TOKEN'];
+      process.env['LAIN_CHARACTER_ID'] = 'wired-lain';
+      process.env['LAIN_INTERLINK_TOKEN'] = 'test-master-token';
+      try {
+        const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+        vi.stubGlobal('fetch', fetchMock);
+        const db = makeMockDb();
+        vi.mocked(getDatabase).mockReturnValue(db as never);
+        createTownEvent({ description: 'Test notification' });
+        // Allow microtasks to flush
+        await new Promise((r) => setTimeout(r, 10));
+        expect(fetchMock).toHaveBeenCalled();
+      } finally {
+        if (prevId === undefined) delete process.env['LAIN_CHARACTER_ID'];
+        else process.env['LAIN_CHARACTER_ID'] = prevId;
+        if (prevTok === undefined) delete process.env['LAIN_INTERLINK_TOKEN'];
+        else process.env['LAIN_INTERLINK_TOKEN'] = prevTok;
+      }
+    });
+
+    // findings.md P2:263 — missing interlink config and per-peer rejections
+    // used to go to `logger.debug`, which is invisible under the default
+    // `info` level. Town events would reach zero inhabitants with nothing
+    // actionable in the logs.
+    describe('notifyInhabitants logs at warn when unreachable (findings.md P2:263)', () => {
+      beforeEach(() => {
+        mockLogger.warn.mockClear();
+        mockLogger.debug.mockClear();
+        _resetInterlinkWarnForTests();
+      });
+
+      it('warns once when LAIN_INTERLINK_TOKEN is missing and skips fetch', async () => {
+        const prevId = process.env['LAIN_CHARACTER_ID'];
+        const prevTok = process.env['LAIN_INTERLINK_TOKEN'];
+        process.env['LAIN_CHARACTER_ID'] = 'wired-lain';
+        delete process.env['LAIN_INTERLINK_TOKEN'];
+        try {
+          const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+          vi.stubGlobal('fetch', fetchMock);
+          const db = makeMockDb();
+          vi.mocked(getDatabase).mockReturnValue(db as never);
+
+          createTownEvent({ description: 'first' });
+          createTownEvent({ description: 'second' });
+          createTownEvent({ description: 'third' });
+          await new Promise((r) => setTimeout(r, 10));
+
+          expect(fetchMock).not.toHaveBeenCalled();
+          expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+          const [ctx, msg] = mockLogger.warn.mock.calls[0] as [
+            { hasInterlinkToken: boolean; hasCharacterId: boolean },
+            string,
+          ];
+          expect(msg).toMatch(/Town event notification skipped/);
+          expect(ctx.hasInterlinkToken).toBe(false);
+          expect(ctx.hasCharacterId).toBe(true);
+        } finally {
+          if (prevId === undefined) delete process.env['LAIN_CHARACTER_ID'];
+          else process.env['LAIN_CHARACTER_ID'] = prevId;
+          if (prevTok === undefined) delete process.env['LAIN_INTERLINK_TOKEN'];
+          else process.env['LAIN_INTERLINK_TOKEN'] = prevTok;
+        }
+      });
+
+      it('warns once when LAIN_CHARACTER_ID is missing and skips fetch', async () => {
+        const prevId = process.env['LAIN_CHARACTER_ID'];
+        const prevTok = process.env['LAIN_INTERLINK_TOKEN'];
+        delete process.env['LAIN_CHARACTER_ID'];
+        process.env['LAIN_INTERLINK_TOKEN'] = 'test-master-token';
+        try {
+          const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+          vi.stubGlobal('fetch', fetchMock);
+          const db = makeMockDb();
+          vi.mocked(getDatabase).mockReturnValue(db as never);
+
+          createTownEvent({ description: 'first' });
+          await new Promise((r) => setTimeout(r, 10));
+
+          expect(fetchMock).not.toHaveBeenCalled();
+          expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+          const [ctx] = mockLogger.warn.mock.calls[0] as [
+            { hasInterlinkToken: boolean; hasCharacterId: boolean },
+            string,
+          ];
+          expect(ctx.hasCharacterId).toBe(false);
+        } finally {
+          if (prevId === undefined) delete process.env['LAIN_CHARACTER_ID'];
+          else process.env['LAIN_CHARACTER_ID'] = prevId;
+          if (prevTok === undefined) delete process.env['LAIN_INTERLINK_TOKEN'];
+          else process.env['LAIN_INTERLINK_TOKEN'] = prevTok;
+        }
+      });
+
+      it('warns at warn level when a peer returns a non-ok status', async () => {
+        const prevId = process.env['LAIN_CHARACTER_ID'];
+        const prevTok = process.env['LAIN_INTERLINK_TOKEN'];
+        process.env['LAIN_CHARACTER_ID'] = 'wired-lain';
+        process.env['LAIN_INTERLINK_TOKEN'] = 'test-master-token';
+        try {
+          const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 401 });
+          vi.stubGlobal('fetch', fetchMock);
+          const db = makeMockDb();
+          vi.mocked(getDatabase).mockReturnValue(db as never);
+
+          createTownEvent({ description: 'peer-401' });
+          await new Promise((r) => setTimeout(r, 10));
+
+          expect(fetchMock).toHaveBeenCalledTimes(1);
+          expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+          const [ctx, msg] = mockLogger.warn.mock.calls[0] as [
+            { inhabitant: string; status: number; eventId: string },
+            string,
+          ];
+          expect(msg).toMatch(/rejected by inhabitant/);
+          expect(ctx.inhabitant).toBe('lain');
+          expect(ctx.status).toBe(401);
+          expect(typeof ctx.eventId).toBe('string');
+        } finally {
+          if (prevId === undefined) delete process.env['LAIN_CHARACTER_ID'];
+          else process.env['LAIN_CHARACTER_ID'] = prevId;
+          if (prevTok === undefined) delete process.env['LAIN_INTERLINK_TOKEN'];
+          else process.env['LAIN_INTERLINK_TOKEN'] = prevTok;
+        }
+      });
+
+      it('warns at warn level when fetch throws (network error)', async () => {
+        const prevId = process.env['LAIN_CHARACTER_ID'];
+        const prevTok = process.env['LAIN_INTERLINK_TOKEN'];
+        process.env['LAIN_CHARACTER_ID'] = 'wired-lain';
+        process.env['LAIN_INTERLINK_TOKEN'] = 'test-master-token';
+        try {
+          const fetchMock = vi.fn().mockRejectedValue(new Error('ECONNREFUSED'));
+          vi.stubGlobal('fetch', fetchMock);
+          const db = makeMockDb();
+          vi.mocked(getDatabase).mockReturnValue(db as never);
+
+          createTownEvent({ description: 'peer-down' });
+          await new Promise((r) => setTimeout(r, 10));
+
+          expect(fetchMock).toHaveBeenCalledTimes(1);
+          expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+          const [ctx, msg] = mockLogger.warn.mock.calls[0] as [
+            { inhabitant: string; reason: string; eventId: string },
+            string,
+          ];
+          expect(msg).toMatch(/Could not notify inhabitant/);
+          expect(ctx.inhabitant).toBe('lain');
+          expect(ctx.reason).toBe('ECONNREFUSED');
+        } finally {
+          if (prevId === undefined) delete process.env['LAIN_CHARACTER_ID'];
+          else process.env['LAIN_CHARACTER_ID'] = prevId;
+          if (prevTok === undefined) delete process.env['LAIN_INTERLINK_TOKEN'];
+          else process.env['LAIN_INTERLINK_TOKEN'] = prevTok;
+        }
+      });
+
+      it('does not warn on the happy path (peer returns 200)', async () => {
+        const prevId = process.env['LAIN_CHARACTER_ID'];
+        const prevTok = process.env['LAIN_INTERLINK_TOKEN'];
+        process.env['LAIN_CHARACTER_ID'] = 'wired-lain';
+        process.env['LAIN_INTERLINK_TOKEN'] = 'test-master-token';
+        try {
+          const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+          vi.stubGlobal('fetch', fetchMock);
+          const db = makeMockDb();
+          vi.mocked(getDatabase).mockReturnValue(db as never);
+
+          createTownEvent({ description: 'happy' });
+          await new Promise((r) => setTimeout(r, 10));
+
+          expect(fetchMock).toHaveBeenCalledTimes(1);
+          expect(mockLogger.warn).not.toHaveBeenCalled();
+        } finally {
+          if (prevId === undefined) delete process.env['LAIN_CHARACTER_ID'];
+          else process.env['LAIN_CHARACTER_ID'] = prevId;
+          if (prevTok === undefined) delete process.env['LAIN_INTERLINK_TOKEN'];
+          else process.env['LAIN_INTERLINK_TOKEN'] = prevTok;
+        }
+      });
     });
   });
 
@@ -886,6 +1117,79 @@ describe('Town Events — rowToEvent / createTownEvent', () => {
     });
   });
 
+  // findings.md P2:285 — shared scheduler so every town_events writer
+  // (web + character servers) runs expireStaleEvents on a timer.
+  describe('startExpireStaleEventsLoop (findings.md P2:285)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('calls expireStaleEvents on the configured interval', () => {
+      const db = makeMockDb();
+      db._runResult.changes = 0;
+      vi.mocked(getDatabase).mockReturnValue(db as never);
+
+      const stop = startExpireStaleEventsLoop(60_000);
+      try {
+        expect(db.prepare).not.toHaveBeenCalledWith(expect.stringContaining('UPDATE town_events SET status'));
+        vi.advanceTimersByTime(60_000);
+        // One tick → one UPDATE call.
+        const updateCalls = db.prepare.mock.calls.filter((c: unknown[]) =>
+          typeof c[0] === 'string' && c[0].includes('UPDATE town_events SET status'),
+        );
+        expect(updateCalls.length).toBe(1);
+        vi.advanceTimersByTime(60_000);
+        const updateCallsAfter = db.prepare.mock.calls.filter((c: unknown[]) =>
+          typeof c[0] === 'string' && c[0].includes('UPDATE town_events SET status'),
+        );
+        expect(updateCallsAfter.length).toBe(2);
+      } finally {
+        stop();
+      }
+    });
+
+    it('stop() halts further ticks', () => {
+      const db = makeMockDb();
+      db._runResult.changes = 0;
+      vi.mocked(getDatabase).mockReturnValue(db as never);
+
+      const stop = startExpireStaleEventsLoop(60_000);
+      vi.advanceTimersByTime(60_000);
+      const baseline = db.prepare.mock.calls.filter((c: unknown[]) =>
+        typeof c[0] === 'string' && c[0].includes('UPDATE town_events SET status'),
+      ).length;
+      stop();
+      vi.advanceTimersByTime(60_000 * 10);
+      const after = db.prepare.mock.calls.filter((c: unknown[]) =>
+        typeof c[0] === 'string' && c[0].includes('UPDATE town_events SET status'),
+      ).length;
+      expect(after).toBe(baseline);
+    });
+
+    it('logs at warn level when expireStaleEvents throws, does not crash', () => {
+      const db = makeMockDb();
+      db.prepare.mockImplementationOnce(() => {
+        throw new Error('kaboom');
+      });
+      vi.mocked(getDatabase).mockReturnValue(db as never);
+      mockLogger.warn.mockClear();
+
+      const stop = startExpireStaleEventsLoop(60_000);
+      try {
+        vi.advanceTimersByTime(60_000);
+        expect(mockLogger.warn).toHaveBeenCalled();
+        const [ctx, msg] = mockLogger.warn.mock.calls[0] as [{ error: string }, string];
+        expect(msg).toMatch(/expireStaleEvents failed/);
+        expect(ctx.error).toMatch(/kaboom/);
+      } finally {
+        stop();
+      }
+    });
+  });
+
   // ── getActiveEffects ──────────────────────────────────────────────────────
 
   describe('getActiveEffects', () => {
@@ -918,16 +1222,21 @@ describe('Town Events — rowToEvent / createTownEvent', () => {
       expect(new Set(effects.blockedBuildings).size).toBe(effects.blockedBuildings!.length);
     });
 
-    it('last mechanical event wins for forceLocation', () => {
+    it('newest mechanical event wins for forceLocation (P1 findings.md:13)', () => {
+      // getActiveTownEvents() returns ORDER BY created_at DESC — newest first.
+      // Rows must be passed in that order here, then getActiveEffects() must
+      // resolve to the NEWEST event's forceLocation (e2 = 'park'), not the
+      // oldest. Regression: the previous forward-iteration loop made the last
+      // iteration (oldest event) win, which was the exact opposite of intent.
       const now = Date.now();
       const rows = [
-        { id: 'e1', description: 'E1', narrative: 0, mechanical: 1, instant: 0, persistent: 0,
-          natural_event: 0, liminal: 0, source: null,
-          effects: JSON.stringify({ forceLocation: 'cafe' }),
-          status: 'active', created_at: now, expires_at: null, ended_at: null },
-        { id: 'e2', description: 'E2', narrative: 0, mechanical: 1, instant: 0, persistent: 0,
+        { id: 'e2', description: 'E2 (newer)', narrative: 0, mechanical: 1, instant: 0, persistent: 0,
           natural_event: 0, liminal: 0, source: null,
           effects: JSON.stringify({ forceLocation: 'park' }),
+          status: 'active', created_at: now + 1000, expires_at: null, ended_at: null },
+        { id: 'e1', description: 'E1 (older)', narrative: 0, mechanical: 1, instant: 0, persistent: 0,
+          natural_event: 0, liminal: 0, source: null,
+          effects: JSON.stringify({ forceLocation: 'cafe' }),
           status: 'active', created_at: now, expires_at: null, ended_at: null },
       ];
       const db = makeMockDb(rows);
@@ -936,16 +1245,16 @@ describe('Town Events — rowToEvent / createTownEvent', () => {
       expect(effects.forceLocation).toBe('park');
     });
 
-    it('last mechanical event wins for weather', () => {
+    it('newest mechanical event wins for weather (P1 findings.md:13)', () => {
       const now = Date.now();
       const rows = [
-        { id: 'e1', description: 'E1', narrative: 0, mechanical: 1, instant: 0, persistent: 0,
-          natural_event: 0, liminal: 0, source: null,
-          effects: JSON.stringify({ weather: 'rain' }),
-          status: 'active', created_at: now, expires_at: null, ended_at: null },
-        { id: 'e2', description: 'E2', narrative: 0, mechanical: 1, instant: 0, persistent: 0,
+        { id: 'e2', description: 'E2 (newer)', narrative: 0, mechanical: 1, instant: 0, persistent: 0,
           natural_event: 0, liminal: 0, source: null,
           effects: JSON.stringify({ weather: 'storm' }),
+          status: 'active', created_at: now + 1000, expires_at: null, ended_at: null },
+        { id: 'e1', description: 'E1 (older)', narrative: 0, mechanical: 1, instant: 0, persistent: 0,
+          natural_event: 0, liminal: 0, source: null,
+          effects: JSON.stringify({ weather: 'rain' }),
           status: 'active', created_at: now, expires_at: null, ended_at: null },
       ];
       const db = makeMockDb(rows);

@@ -1,5 +1,5 @@
 /**
- * NEWTOWN GAME — Dialog System
+ * LAINTOWN GAME — Dialog System
  * Typewriter text rendering and SSE streaming for RPG text boxes.
  */
 

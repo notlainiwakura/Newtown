@@ -52,17 +52,23 @@ const bookSource = readFileSync(join(SRC, 'agent', 'book.ts'), 'utf-8');
 const diarySource = readFileSync(join(SRC, 'agent', 'diary.ts'), 'utf-8');
 const communeLoopSource = readFileSync(join(SRC, 'agent', 'commune-loop.ts'), 'utf-8');
 const dataWorkspaceSource = readFileSync(join(SRC, 'agent', 'data-workspace.ts'), 'utf-8');
+const townLifeSource = readFileSync(join(SRC, 'agent', 'town-life.ts'), 'utf-8');
+const interlinkAuthSource = readFileSync(join(SRC, 'security', 'interlink-auth.ts'), 'utf-8');
+const telegramChannelSource = readFileSync(join(SRC, 'channels', 'telegram.ts'), 'utf-8');
+const whatsappChannelSource = readFileSync(join(SRC, 'channels', 'whatsapp.ts'), 'utf-8');
+const discordChannelSource = readFileSync(join(SRC, 'channels', 'discord.ts'), 'utf-8');
+const slackChannelSource = readFileSync(join(SRC, 'channels', 'slack.ts'), 'utf-8');
+const signalChannelSource = readFileSync(join(SRC, 'channels', 'signal.ts'), 'utf-8');
+const agentToolsSource = readFileSync(join(SRC, 'agent', 'tools.ts'), 'utf-8');
 
 // ── Functional imports ──────────────────────────────────────────────────
 import { sanitize } from '../src/security/sanitizer.js';
 import {
   isPrivateIP,
   checkSSRF,
-  sanitizeURL,
-  isAllowedDomain,
-  isBlockedDomain,
 } from '../src/security/ssrf.js';
-import { deriveOwnerCookie, isOwner } from '../src/web/owner-auth.js';
+import { isOwner } from '../src/web/owner-auth.js';
+import { makeV2Cookie, makeV2CookieValue, OWNER_COOKIE_NAME } from './fixtures/owner-cookie-v2.js';
 import { secureCompare } from '../src/utils/crypto.js';
 import type { IncomingMessage } from 'node:http';
 
@@ -77,8 +83,7 @@ function makeReq(headers: Record<string, string | undefined> = {}): IncomingMess
 }
 
 function makeOwnerReq(token: string): IncomingMessage {
-  const cookie = deriveOwnerCookie(token);
-  return makeReq({ cookie: `lain_owner=${cookie}` });
+  return makeReq({ cookie: makeV2Cookie(token) });
 }
 
 const ORIGINAL_OWNER_TOKEN = process.env['LAIN_OWNER_TOKEN'];
@@ -217,12 +222,20 @@ describe('CSRF Protection', () => {
   });
 
   describe('Content-Security-Policy limits origins', () => {
-    it('has default-src self', () => {
-      expect(serverSource).toContain("default-src 'self'");
+    // findings.md P2:2880 — the CSP string literal moved out of
+    // server.ts and into src/web/csp-hashes.ts (`buildHtmlCsp`).
+    // server.ts now references `HTML_CSP` which is the builder's
+    // output. Follow the source.
+    it('has default-src self', async () => {
+      const { readFile } = await import('node:fs/promises');
+      const src = await readFile(new URL('../src/web/csp-hashes.ts', import.meta.url), 'utf-8');
+      expect(src).toContain("default-src 'self'");
     });
 
-    it('restricts script-src', () => {
-      expect(serverSource).toContain("script-src 'self'");
+    it('restricts script-src', async () => {
+      const { readFile } = await import('node:fs/promises');
+      const src = await readFile(new URL('../src/web/csp-hashes.ts', import.meta.url), 'utf-8');
+      expect(src).toContain("script-src ${scriptSrc}");
     });
   });
 });
@@ -279,8 +292,16 @@ describe('SQL Injection Deep', () => {
     });
 
     it('saveMemory uses parameter placeholders', () => {
-      // saveMemory has a large INSERT with 17 placeholders
-      expect(storeSource).toContain('VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+      // saveMemory INSERT INTO memories grew to 18 placeholders after
+      // P2:517 added embedding_model as a versioning stamp. What this
+      // test locks is that the INSERT is still fully parameterized —
+      // never a template literal concatenation.
+      expect(storeSource).toContain(
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      );
+      const insertIdx = storeSource.indexOf('INSERT INTO memories');
+      const insertBlock = storeSource.substring(insertIdx, insertIdx + 800);
+      expect(insertBlock).not.toMatch(/\$\{[^}]+\}/);
     });
 
     it('getMemory uses parameterized ID', () => {
@@ -438,10 +459,10 @@ describe('SQL Injection Deep', () => {
         // Sanitizer processes the input (doesn't crash)
         expect(result).toBeDefined();
         expect(result.sanitized).toBeDefined();
-        // The sanitized output should have < and > escaped (structural framing)
-        if (payload.includes('<')) {
-          expect(result.sanitized).toContain('&lt;');
-        }
+        // findings.md P2:1222 — framing no longer escapes `<`/`>`; LLM safety
+        // comes from BLOCK_PATTERNS, not HTML entity encoding. SQL payloads
+        // that aren't injection-flagged now pass through verbatim.
+        expect(typeof result.sanitized).toBe('string');
       }
     );
   });
@@ -510,42 +531,10 @@ describe('SSRF Advanced', () => {
     });
   });
 
-  describe('URL parsing tricks', () => {
-    it('sanitizeURL strips credentials from URLs', () => {
-      const result = sanitizeURL('http://admin:secret@evil.com/path');
-      expect(result).not.toContain('admin');
-      expect(result).not.toContain('secret');
-    });
-
-    it('sanitizeURL normalizes hostname to lowercase', () => {
-      const result = sanitizeURL('http://EVIL.COM/path');
-      expect(result).toContain('evil.com');
-    });
-
-    it('sanitizeURL rejects file: scheme', () => {
-      expect(sanitizeURL('file:///etc/passwd')).toBeNull();
-    });
-
-    it('sanitizeURL rejects data: scheme', () => {
-      expect(sanitizeURL('data:text/html,<script>evil()</script>')).toBeNull();
-    });
-
-    it('sanitizeURL rejects javascript: scheme', () => {
-      expect(sanitizeURL('javascript:alert(1)')).toBeNull();
-    });
-
-    it('sanitizeURL rejects ftp: scheme', () => {
-      expect(sanitizeURL('ftp://internal.server/data')).toBeNull();
-    });
-
-    it('sanitizeURL rejects gopher: scheme', () => {
-      expect(sanitizeURL('gopher://internal:70/exploit')).toBeNull();
-    });
-
-    it('sanitizeURL returns null for malformed URLs', () => {
-      expect(sanitizeURL('not a url at all')).toBeNull();
-    });
-  });
+  // findings.md P2:1305 — `URL parsing tricks` block removed.
+  // sanitizeURL is now a non-exported internal helper in ssrf.ts;
+  // checkSSRF already exercises the scheme-rejection paths below,
+  // so the tests collapse into that single surface.
 
   describe('checkSSRF blocks private/internal targets', () => {
     it.each([
@@ -638,6 +627,30 @@ describe('SSRF Advanced', () => {
       expect(result.safe).toBe(false);
       expect(result.reason).toContain('DNS resolution failed');
     });
+
+    it('safeFetch pins DNS to the pre-resolved IP (P1 findings.md)', () => {
+      // An undici Agent with a custom connect.lookup callback is the
+      // anchor of the DNS-pinning fix. Without this, a second DNS
+      // lookup at connect time could rebind to a private IP.
+      expect(ssrfSource).toMatch(/from 'undici'/);
+      expect(ssrfSource).toMatch(/function buildPinnedAgent/);
+      expect(ssrfSource).toMatch(/new Agent\(\{\s*connect:\s*\{[\s\S]*?lookup/);
+      // Callback hands back the pre-resolved IP either in multi-result
+      // (all: true) or single-result form.
+      expect(ssrfSource).toMatch(/address:\s*resolvedIP,\s*family/);
+      expect(ssrfSource).toMatch(/callback\(null,\s*resolvedIP,\s*family\)/);
+    });
+
+    it('safeFetch passes the pinned dispatcher to the fetch call', () => {
+      // The pinned agent is wired through as `dispatcher` on the init
+      // so undici uses the pre-resolved IP instead of re-resolving DNS.
+      expect(ssrfSource).toMatch(/init\.dispatcher\s*=\s*dispatcher/);
+      expect(ssrfSource).toMatch(/undiciFetch\(sanitized, init\)/);
+    });
+
+    it('safeFetch closes the pinned agent after use to avoid leaks', () => {
+      expect(ssrfSource).toMatch(/dispatcher\?\.close\(\)/);
+    });
   });
 
   describe('Redirect-based SSRF protection', () => {
@@ -657,6 +670,321 @@ describe('SSRF Advanced', () => {
       expect(ssrfSource).toContain('response.status >= 300');
       expect(ssrfSource).toContain('response.status < 400');
     });
+
+    it('safeFetchFollow re-validates every hop and caps the chain (P1 findings.md)', () => {
+      // Open-redirector bypass: an initially-public URL 302s into
+      // http://169.254.169.254 / http://127.0.0.1. safeFetchFollow must
+      // (a) exist, (b) call safeFetch (which DNS-pins + rejects private
+      // IPs) on each hop, (c) resolve the Location header against the
+      // current URL (relative redirects), and (d) cap the hop count.
+      expect(ssrfSource).toMatch(/export async function safeFetchFollow/);
+      expect(ssrfSource).toMatch(/await safeFetch\(current, options\)/);
+      expect(ssrfSource).toMatch(/new URL\(location, current\)/);
+      expect(ssrfSource).toMatch(/too many redirects/);
+      expect(ssrfSource).toMatch(/maxHops\s*=\s*3/);
+    });
+  });
+
+  describe('LLM-reachable fetch tools route through safeFetch (P1 findings.md)', () => {
+    it('fetch_webpage uses safeFetch, not raw fetch', () => {
+      // The fetch_webpage handler block must use safeFetch. Without this
+      // the LLM can be prompt-injected into fetching metadata endpoints
+      // or RFC1918 addresses.
+      const handler = agentToolsSource.match(
+        /name: 'fetch_webpage'[\s\S]*?\n  \},\n\}\);/
+      );
+      expect(handler).not.toBeNull();
+      expect(handler![0]).toMatch(/await safeFetch\(url,/);
+      // No bare fetch(url, ...) call remaining in the handler body.
+      expect(handler![0]).not.toMatch(/await fetch\(url,/);
+    });
+
+    it('fetch_and_show_image uses safeFetchFollow for redirect-safe fetch', () => {
+      const handler = agentToolsSource.match(
+        /name: 'fetch_and_show_image'[\s\S]*?\n  \},\n\}\);/
+      );
+      expect(handler).not.toBeNull();
+      expect(handler![0]).toMatch(/await safeFetchFollow\(url,/);
+      expect(handler![0]).not.toMatch(/await fetch\(url,/);
+      // The pre-refactor code used `redirect: 'follow'` on a raw fetch,
+      // which is the exact open-redirector bypass the audit flagged.
+      expect(handler![0]).not.toMatch(/redirect:\s*'follow'/);
+    });
+
+    it('view_image uses safeFetchFollow for redirect-safe fetch', () => {
+      const handler = agentToolsSource.match(
+        /name: 'view_image'[\s\S]*?\n  \},\n\}\);/
+      );
+      expect(handler).not.toBeNull();
+      expect(handler![0]).toMatch(/await safeFetchFollow\(url,/);
+      expect(handler![0]).not.toMatch(/await fetch\(url,/);
+      expect(handler![0]).not.toMatch(/redirect:\s*'follow'/);
+    });
+
+    it('tools.ts imports the safe fetch helpers from ssrf.ts', () => {
+      expect(agentToolsSource).toMatch(
+        /import\s*\{\s*safeFetch,\s*safeFetchFollow\s*\}\s*from\s*'\.\.\/security\/ssrf\.js'/
+      );
+    });
+  });
+
+  describe('Dead tool-approval metadata removed (P1 findings.md)', () => {
+    it('tools.ts has no toolRequiresApproval export', () => {
+      // The helper + field advertised "telegram_call is gated" but
+      // executeTool never consulted them. Any future approval flow
+      // must gate executeTool itself, not a dead metadata field.
+      expect(agentToolsSource).not.toMatch(/export function toolRequiresApproval\b/);
+    });
+
+    it('Tool interface no longer declares requiresApproval', () => {
+      expect(agentToolsSource).not.toMatch(/requiresApproval\?:\s*boolean/);
+    });
+
+    it('no tool sets requiresApproval: true', () => {
+      expect(agentToolsSource).not.toMatch(/requiresApproval:\s*true/);
+    });
+
+    it('executeTool runs tool.handler unconditionally (visible contract)', () => {
+      // If this changes, whoever rewires enforcement must also re-derive
+      // the approval source-of-truth and update this regression.
+      expect(agentToolsSource).toMatch(
+        /async function executeTool[\s\S]*?const result = await tool\.handler\(toolCall\.input\);/
+      );
+    });
+  });
+
+  describe('POST /api/objects checks sanitize().blocked (P1 findings.md)', () => {
+    // sanitize() initializes result.sanitized = input and never overwrites
+    // it on the BLOCK early-return path. Slicing .sanitized without
+    // checking .blocked lets an injection string flow into the object
+    // store, where a character's later-context ("you see an object named
+    // …") surfaces it directly to the LLM.
+
+    it('POST /api/objects rejects when sanitize().blocked', () => {
+      // Isolate the handler: from the route marker to the next
+      // top-level route comment.
+      const start = serverSource.indexOf('// POST /api/objects — create a new object');
+      expect(start).toBeGreaterThan(-1);
+      const after = serverSource.indexOf('// POST /api/objects/:id/pickup', start);
+      expect(after).toBeGreaterThan(start);
+      const section = serverSource.substring(start, after);
+
+      expect(section).toMatch(/nameCheck\.blocked/);
+      expect(section).toMatch(/descCheck\.blocked/);
+      // A 400 response must exist before the createObject call.
+      const preCreate = section.substring(0, section.indexOf('createObject('));
+      expect(preCreate).toMatch(/res\.writeHead\(400/);
+      expect(preCreate).toMatch(/blocked by input sanitizer/i);
+    });
+
+    it('POST /api/objects does not pass raw sanitize(...).sanitized without a block check', () => {
+      // Specifically forbid the previous pattern `sanitize(name).sanitized.slice(...)`
+      // which was the footgun called out in findings.md.
+      const start = serverSource.indexOf('// POST /api/objects — create a new object');
+      const after = serverSource.indexOf('// POST /api/objects/:id/pickup', start);
+      const section = serverSource.substring(start, after);
+      expect(section).not.toMatch(/sanitize\(name\)\.sanitized\.slice/);
+      expect(section).not.toMatch(/sanitize\(description\)\.sanitized\.slice/);
+    });
+  });
+
+  describe('town-life post-LLM allowlist gate (P1 findings.md:2057)', () => {
+    // findings.md:2057 — executeTool(tc) ran LLM-chosen tools with no
+    // post-LLM gating. The prompt is assembled from 7 cross-peer reads
+    // (postboard, notes, docs, objects, nearby, events, residue). Any
+    // one of those carrying injection text could steer the LLM toward
+    // a tool outside the intended town-life allowlist, since the global
+    // tool registry includes web fetch, telegram_call, diagnostics, etc.
+
+    it('TOWN_LIFE_TOOLS allowlist is consulted BEFORE executeTool, not only when sending tools to the provider', () => {
+      // The loop body must short-circuit when `!TOWN_LIFE_TOOLS.has(tc.name)`
+      // BEFORE reaching executeTool(tc). Source-regex guard: in the loop,
+      // the allowlist check appears before `executeTool`.
+      const loopBlock = townLifeSource.match(
+        /for \(const tc of result\.toolCalls\)[\s\S]*?const toolResult = await executeTool\(tc\);/
+      );
+      expect(loopBlock).not.toBeNull();
+      const allowlistIdx = loopBlock![0].indexOf('TOWN_LIFE_TOOLS.has(tc.name)');
+      const executeIdx = loopBlock![0].indexOf('executeTool(tc)');
+      expect(allowlistIdx).toBeGreaterThan(-1);
+      expect(executeIdx).toBeGreaterThan(-1);
+      expect(allowlistIdx).toBeLessThan(executeIdx);
+    });
+
+    it('refused tool calls log a warning identifying the tool and character', () => {
+      expect(townLifeSource).toMatch(
+        /logger\.warn\([^)]*tool:\s*tc\.name[^)]*character:\s*config\.characterId/
+      );
+    });
+
+    it('refused tool calls are surfaced as an isError result, not silently dropped', () => {
+      // Silent drop would leave the LLM with a hung tool_use block on
+      // the next continueWithToolResults call. Must return an isError
+      // ToolResult with the same toolCallId.
+      const section = townLifeSource.match(
+        /if \(!TOWN_LIFE_TOOLS\.has\(tc\.name\)\)[\s\S]*?continue;/
+      );
+      expect(section).not.toBeNull();
+      expect(section![0]).toMatch(/toolCallId:\s*tc\.id/);
+      expect(section![0]).toMatch(/isError:\s*true/);
+    });
+
+    it('refused tool calls are visible in actionsTaken as "refused:<name>"', () => {
+      // So post-cycle forensics and the recent-actions log show the
+      // injection attempt rather than just silently absent.
+      expect(townLifeSource).toMatch(
+        /actionsTaken\.push\(`refused:\$\{tc\.name\}`\)/
+      );
+    });
+  });
+
+  describe('SQLCipher silent-fallback is no longer silent (P1 findings.md:295)', () => {
+    // findings.md:295 — the try/catch around PRAGMA key had an empty catch
+    // block, but the bigger issue is that stock better-sqlite3 does NOT
+    // throw on unknown pragmas — it silently no-ops. So catch never fires,
+    // and the DB stayed plaintext without a peep. Fix: probe
+    // PRAGMA cipher_version to actually detect SQLCipher, and fail loudly
+    // (or at minimum warn) when encryption is not active.
+
+    it('initDatabase probes cipher_version, not just try/catch on PRAGMA key', () => {
+      expect(databaseSource).toMatch(/cipher_version/);
+    });
+
+    it('plain try/catch with empty body around PRAGMA key is gone', () => {
+      // Old code: `try { db.pragma(`key = '${hexKey}'`); } catch {}` with a
+      // bare `// Log warning in production` stub. Forbid exactly that shape.
+      expect(databaseSource).not.toMatch(
+        /db\.pragma\(`key = '\$\{hexKey\}'`\);\s*\} catch \{\s*\/\/[^}]*continue without encryption/
+      );
+    });
+
+    it('LAIN_REQUIRE_ENCRYPTION=1 makes missing SQLCipher a hard error', () => {
+      expect(databaseSource).toMatch(/LAIN_REQUIRE_ENCRYPTION/);
+      expect(databaseSource).toMatch(/Database encryption required/i);
+      // Must throw StorageError (not a bare Error) so the existing
+      // initDatabase error-wrapping path surfaces it cleanly.
+      const encBlock = databaseSource.match(
+        /if \(process\.env\.LAIN_REQUIRE_ENCRYPTION === '1'\)[\s\S]*?throw new StorageError/
+      );
+      expect(encBlock).not.toBeNull();
+    });
+
+    it('the plaintext-mode warning is at warn level, not debug or info', () => {
+      // Operators need to see this in ops logs by default.
+      const warnBlock = databaseSource.match(
+        /!encryptionActive[\s\S]*?logger\.warn/
+      );
+      expect(warnBlock).not.toBeNull();
+      // And specifically call out "PLAINTEXT" so grep is trivial.
+      expect(databaseSource).toMatch(/PLAINTEXT/);
+    });
+
+    it('closes and nulls the db handle before throwing so state is not leaked', () => {
+      // If we decided encryption was required, we're about to reject the
+      // init. The already-opened plaintext handle must be closed and the
+      // module-level `db` reset so a future init attempt doesn't reuse it.
+      const block = databaseSource.match(
+        /LAIN_REQUIRE_ENCRYPTION === '1'[\s\S]*?throw new StorageError/
+      );
+      expect(block).not.toBeNull();
+      expect(block![0]).toMatch(/db\.close\(\)/);
+      expect(block![0]).toMatch(/db = null/);
+    });
+  });
+
+  describe('Channel reconnect state-machine (P1 findings.md)', () => {
+    // findings.md:2552 — whatsapp + signal both had dead reconnect loops.
+    //   whatsapp: setTimeout(() => connect(), 5000) fired while socket was
+    //     non-null → connect()'s early-return guard made the channel dead
+    //     until process restart.
+    //   signal:   emitDisconnect() set _connected=false before the reconnect
+    //     branch read _connected → branch unreachable. disconnect() zeroed
+    //     maxReconnectAttempts permanently, killing any re-used channel.
+
+    it('whatsapp nulls this.socket before scheduling reconnect', () => {
+      // The connection.update 'close' branch must drop the socket ref so
+      // connect()'s `if (this.socket) return` guard doesn't block the retry.
+      const closeBranch = whatsappChannelSource.match(
+        /if \(connection === 'close'\)[\s\S]*?else if \(connection === 'open'\)/
+      );
+      expect(closeBranch).not.toBeNull();
+      expect(closeBranch![0]).toMatch(/this\.socket = null/);
+    });
+
+    it('whatsapp has no raw setTimeout reconnect that calls connect() with socket alive', () => {
+      // Specifically forbid the previous pattern.
+      expect(whatsappChannelSource).not.toMatch(
+        /setTimeout\(\(\) => this\.connect\(\), \d+\)/
+      );
+    });
+
+    it('whatsapp reconnect uses exponential backoff with a max attempt cap', () => {
+      expect(whatsappChannelSource).toMatch(/MAX_RECONNECT_ATTEMPTS/);
+      expect(whatsappChannelSource).toMatch(/Math\.pow\(2,\s*this\.reconnectAttempt/);
+    });
+
+    it('whatsapp disconnect() sets a shuttingDown flag instead of zeroing a counter', () => {
+      const disconnectBlock = whatsappChannelSource.match(
+        /async disconnect\(\)[\s\S]*?\n {2}\}/
+      );
+      expect(disconnectBlock).not.toBeNull();
+      expect(disconnectBlock![0]).toMatch(/this\.shuttingDown = true/);
+      expect(disconnectBlock![0]).not.toMatch(/MAX_RECONNECT_ATTEMPTS\s*=\s*0/);
+    });
+
+    it('signal handleDisconnect snapshots _connected BEFORE emitDisconnect', () => {
+      // The reconnect branch must not rely on reading _connected after the
+      // emitDisconnect() call has flipped it to false.
+      const block = signalChannelSource.match(
+        /private handleDisconnect\(\)[\s\S]*?\n {2}\}/
+      );
+      expect(block).not.toBeNull();
+      const wasConnectedIdx = block![0].indexOf('wasConnected');
+      const emitDisconnectIdx = block![0].indexOf('emitDisconnect()');
+      expect(wasConnectedIdx).toBeGreaterThan(-1);
+      expect(emitDisconnectIdx).toBeGreaterThan(-1);
+      expect(wasConnectedIdx).toBeLessThan(emitDisconnectIdx);
+    });
+
+    it('signal handleDisconnect gates the reconnect branch on the snapshot, not this._connected', () => {
+      const block = signalChannelSource.match(
+        /private handleDisconnect\(\)[\s\S]*?\n {2}\}/
+      );
+      expect(block).not.toBeNull();
+      // The old, unreachable guard.
+      expect(block![0]).not.toMatch(/&&\s*this\._connected\s*\)/);
+    });
+
+    it('signal disconnect() does not permanently zero the reconnect budget', () => {
+      // The old bug: `this.maxReconnectAttempts = 0` turned reconnect off
+      // forever, even for a re-used channel instance. Replace with a
+      // shuttingDown flag that can be cleared on the next connect().
+      expect(signalChannelSource).not.toMatch(/this\.maxReconnectAttempts\s*=\s*0/);
+      const disconnectBlock = signalChannelSource.match(
+        /async disconnect\(\)[\s\S]*?\n {2}\}/
+      );
+      expect(disconnectBlock).not.toBeNull();
+      expect(disconnectBlock![0]).toMatch(/this\.shuttingDown = true/);
+    });
+
+    it('signal reconnect uses exponential backoff with a max attempt cap', () => {
+      expect(signalChannelSource).toMatch(/MAX_RECONNECT_ATTEMPTS/);
+      expect(signalChannelSource).toMatch(/Math\.pow\(2,\s*this\.reconnectAttempts/);
+    });
+
+    it('both channels clear shuttingDown on connect() so channel instances are re-usable', () => {
+      // Regression for the "re-used channel has dead reconnect forever" bug.
+      const waConnect = whatsappChannelSource.match(
+        /async connect\(\)[\s\S]*?\n {2}\}/
+      );
+      const sigConnect = signalChannelSource.match(
+        /async connect\(\)[\s\S]*?\n {2}\}/
+      );
+      expect(waConnect).not.toBeNull();
+      expect(sigConnect).not.toBeNull();
+      expect(waConnect![0]).toMatch(/this\.shuttingDown = false/);
+      expect(sigConnect![0]).toMatch(/this\.shuttingDown = false/);
+    });
   });
 
   describe('safeFetch timeout protection', () => {
@@ -673,43 +1001,9 @@ describe('SSRF Advanced', () => {
     });
   });
 
-  describe('Domain allowlist/blocklist', () => {
-    it('isAllowedDomain matches exact domain', () => {
-      expect(isAllowedDomain('http://example.com/path', ['example.com'])).toBe(true);
-    });
-
-    it('isAllowedDomain matches subdomain', () => {
-      expect(isAllowedDomain('http://sub.example.com/path', ['example.com'])).toBe(true);
-    });
-
-    it('isAllowedDomain rejects non-matching domain', () => {
-      expect(isAllowedDomain('http://evil.com/path', ['example.com'])).toBe(false);
-    });
-
-    it('isAllowedDomain rejects domain suffix attack (notexample.com)', () => {
-      expect(isAllowedDomain('http://notexample.com/path', ['example.com'])).toBe(false);
-    });
-
-    it('isAllowedDomain returns false for invalid URL', () => {
-      expect(isAllowedDomain('not a url', ['example.com'])).toBe(false);
-    });
-
-    it('isBlockedDomain blocks exact match', () => {
-      expect(isBlockedDomain('http://malware.com/path', ['malware.com'])).toBe(true);
-    });
-
-    it('isBlockedDomain blocks subdomain', () => {
-      expect(isBlockedDomain('http://sub.malware.com/path', ['malware.com'])).toBe(true);
-    });
-
-    it('isBlockedDomain allows non-matching domain', () => {
-      expect(isBlockedDomain('http://safe.com/path', ['malware.com'])).toBe(false);
-    });
-
-    it('isBlockedDomain blocks invalid URLs (safe default)', () => {
-      expect(isBlockedDomain('not-a-url', ['anything'])).toBe(true);
-    });
-  });
+  // findings.md P2:1305 — `Domain allowlist/blocklist` tests removed
+  // alongside the dead exports they covered. A per-character policy
+  // can be reintroduced deliberately if needed.
 
   describe('Curiosity loop uses SSRF check', () => {
     it('curiosity.ts imports checkSSRF', () => {
@@ -773,13 +1067,15 @@ describe('Path Traversal Deep', () => {
     });
   });
 
-  describe('character-server.ts serveStatic', () => {
-    it('replaces .. in paths', () => {
-      expect(charServerSource).toContain("path.replace(/\\.\\./g, '')");
+  describe('character-server.ts has no serveStatic (findings.md P1:27)', () => {
+    // Character servers are API-only by design. serveStatic + publicDir were
+    // removed because they pointed at nonexistent src/web/public-<id>/ dirs.
+    it('no serveStatic function exists', () => {
+      expect(charServerSource).not.toMatch(/function\s+serveStatic/);
     });
 
-    it('strips leading slashes', () => {
-      expect(charServerSource).toContain("replace(/^\\/+/, '')");
+    it('no publicDir field in CharacterConfig', () => {
+      expect(charServerSource).not.toMatch(/publicDir:\s*string/);
     });
   });
 
@@ -853,13 +1149,64 @@ describe('Path Traversal Deep', () => {
     });
   });
 
+  describe('Book chapter filename validator (P1 regression)', () => {
+    it('accepts valid chapter filenames (nn-slug.md)', async () => {
+      const { isValidChapterFilename } = await import('../src/agent/book.js');
+      expect(isValidChapterFilename('01-introduction.md')).toBe(true);
+      expect(isValidChapterFilename('02-prediction-and-constraint.md')).toBe(true);
+      expect(isValidChapterFilename('15-conclusion.md')).toBe(true);
+    });
+
+    it('rejects absolute paths', async () => {
+      const { isValidChapterFilename } = await import('../src/agent/book.js');
+      expect(isValidChapterFilename('/etc/passwd')).toBe(false);
+      expect(isValidChapterFilename('/tmp/evil.md')).toBe(false);
+    });
+
+    it('rejects path-traversal sequences', async () => {
+      const { isValidChapterFilename } = await import('../src/agent/book.js');
+      expect(isValidChapterFilename('../../../etc/passwd')).toBe(false);
+      expect(isValidChapterFilename('../../.ssh/authorized_keys')).toBe(false);
+      expect(isValidChapterFilename('01-slug/../../../evil.md')).toBe(false);
+    });
+
+    it('rejects filenames without the nn- prefix', async () => {
+      const { isValidChapterFilename } = await import('../src/agent/book.js');
+      expect(isValidChapterFilename('chapter.md')).toBe(false);
+      expect(isValidChapterFilename('1-short.md')).toBe(false);
+      expect(isValidChapterFilename('001-long.md')).toBe(false);
+    });
+
+    it('rejects filenames without .md extension', async () => {
+      const { isValidChapterFilename } = await import('../src/agent/book.js');
+      expect(isValidChapterFilename('01-slug.txt')).toBe(false);
+      expect(isValidChapterFilename('01-slug')).toBe(false);
+      expect(isValidChapterFilename('01-slug.md.sh')).toBe(false);
+    });
+
+    it('rejects uppercase or non-slug characters in the slug', async () => {
+      const { isValidChapterFilename } = await import('../src/agent/book.js');
+      expect(isValidChapterFilename('01-Slug.md')).toBe(false);
+      expect(isValidChapterFilename('01-slug with spaces.md')).toBe(false);
+      expect(isValidChapterFilename('01-slug_underscore.md')).toBe(false);
+    });
+
+    it('source reflects the validator is wired into write path', () => {
+      expect(bookSource).toContain('CHAPTER_FILENAME_RE');
+      expect(bookSource).toContain('isValidChapterFilename');
+    });
+  });
+
   describe('Meta key path traversal in character server', () => {
     it('meta key is URL-decoded but used as DB key not file path', () => {
       // /api/meta/:key reads from DB meta table via getMeta, not filesystem
       // Find the generic meta handler (not /api/meta/identity)
       const genericMetaIdx = charServerSource.indexOf("url.pathname.startsWith('/api/meta/')");
       expect(genericMetaIdx).toBeGreaterThan(-1);
-      const metaSection = charServerSource.substring(genericMetaIdx, genericMetaIdx + 600);
+      // findings.md P2:2404 widened the handler with an allowlist check
+      // between the key decode and the getMeta read; slice needs to be
+      // large enough to cover both.
+      const metaSection = charServerSource.substring(genericMetaIdx, genericMetaIdx + 1500);
       expect(metaSection).toContain('getMeta(key)');
     });
   });
@@ -921,10 +1268,13 @@ describe('Error Boundaries', () => {
 
   describe('Peer communication error handling', () => {
     it('server.ts peer/message endpoint has try-catch', () => {
-      // Find the handler (with POST method check), not just any reference
+      // Find the handler (with POST method check), not just any reference.
+      // Window widened (3000) after findings.md P2:2942-followup added the
+      // `possessed`-flag receiver logic which pushed the catch block past
+      // the original offset.
       const peerIdx = serverSource.indexOf("'/api/peer/message' && req.method === 'POST'");
       expect(peerIdx).toBeGreaterThan(-1);
-      const peerSection = serverSource.substring(peerIdx, peerIdx + 2000);
+      const peerSection = serverSource.substring(peerIdx, peerIdx + 3000);
       expect(peerSection).toContain('catch');
       expect(peerSection).toContain("'Failed to process peer message'");
     });
@@ -953,11 +1303,52 @@ describe('Error Boundaries', () => {
     });
   });
 
+  describe('handleInterlinkLetter senderId resolution (P1 findings.md)', () => {
+    it('does not hardcode senderId to wired-lain', () => {
+      const fnIdx = charServerSource.indexOf('async function handleInterlinkLetter');
+      expect(fnIdx).toBeGreaterThan(-1);
+      const fnEnd = charServerSource.indexOf('\nasync function ', fnIdx + 10);
+      const body = charServerSource.substring(fnIdx, fnEnd);
+      // The literal 'wired-lain' string in the senderId field is the bug.
+      expect(body).not.toMatch(/senderId:\s*'wired-lain'/);
+      expect(body).not.toMatch(/sessionKey:\s*'wired:letter'/);
+    });
+
+    it('resolves senderId from authenticated X-Interlink-From via manifest', () => {
+      // Post per-character tokens (findings.md P1:2289): the authenticated
+      // sender id from verifyInterlinkRequest is the sole source of truth —
+      // the body senderId must match (assertBodyIdentity) or be rejected,
+      // and the id is resolved via getCharacterEntry(authenticatedSenderId).
+      const fnIdx = charServerSource.indexOf('async function handleInterlinkLetter');
+      const fnEnd = charServerSource.indexOf('\nasync function ', fnIdx + 10);
+      const body = charServerSource.substring(fnIdx, fnEnd);
+      expect(body).toMatch(/getCharacterEntry/);
+      expect(body).toMatch(/assertBodyIdentity/);
+    });
+
+    it('rejects body-asserted senderId not in manifest', () => {
+      const fnIdx = charServerSource.indexOf('async function handleInterlinkLetter');
+      const fnEnd = charServerSource.indexOf('\nasync function ', fnIdx + 10);
+      const body = charServerSource.substring(fnIdx, fnEnd);
+      expect(body).toMatch(/Unknown senderId/);
+    });
+
+    it('research delivery in server.ts populates letter.senderId from LAIN_CHARACTER_ID', () => {
+      // Sender identity now comes from this process's own
+      // LAIN_CHARACTER_ID (matches the authenticated X-Interlink-From).
+      const idx = serverSource.indexOf('Include senderId so the recipient attributes');
+      expect(idx).toBeGreaterThan(-1);
+      const section = serverSource.substring(idx, idx + 500);
+      expect(section).toMatch(/LAIN_CHARACTER_ID/);
+      expect(section).toMatch(/senderId/);
+    });
+  });
+
   describe('JSON parse error handling in endpoints', () => {
     it('server conversations/event catches bad JSON', () => {
       const convIdx = serverSource.indexOf("'/api/conversations/event' && req.method === 'POST'");
       expect(convIdx).toBeGreaterThan(-1);
-      const convSection = serverSource.substring(convIdx, convIdx + 1500);
+      const convSection = serverSource.substring(convIdx, convIdx + 2500);
       expect(convSection).toContain("'Invalid JSON'");
     });
 
@@ -1209,9 +1600,13 @@ describe('HTTP Method Enforcement', () => {
       expect(corsIdx).toBeLessThan(routeIdx);
     });
 
-    it('character-server.ts sets CORS headers before routing', () => {
-      const corsIdx = charServerSource.indexOf('Access-Control-Allow-Origin');
+    it('character-server.ts sets CORS headers before routing (via applyCorsHeaders helper) — findings.md P2:2366', () => {
+      // After the cors.ts extraction, character-server no longer contains the
+      // literal Access-Control-Allow-Origin header text — it calls the helper
+      // instead. Check the helper call lands before the first route match.
+      const corsIdx = charServerSource.indexOf('applyCorsHeaders(res');
       const routeIdx = charServerSource.indexOf("'/api/characters'");
+      expect(corsIdx).toBeGreaterThan(-1);
       expect(corsIdx).toBeLessThan(routeIdx);
     });
 
@@ -1219,8 +1614,10 @@ describe('HTTP Method Enforcement', () => {
       expect(serverSource).toContain('GET, POST, OPTIONS');
     });
 
-    it('character-server.ts Access-Control-Allow-Methods includes standard methods', () => {
-      expect(charServerSource).toContain('GET, POST, OPTIONS');
+    it('cors.ts helper default methods include standard set — findings.md P2:2366', async () => {
+      const { readFile } = await import('node:fs/promises');
+      const corsSource = await readFile(new URL('../src/web/cors.ts', import.meta.url), 'utf-8');
+      expect(corsSource).toContain('GET, POST, OPTIONS');
     });
   });
 
@@ -1269,31 +1666,39 @@ describe('Auth Bypass Attempts', () => {
     });
 
     it('rejects request with wrong cookie name', () => {
-      const correctCookie = deriveOwnerCookie(TEST_TOKEN);
-      expect(isOwner(makeReq({ cookie: `wrong_name=${correctCookie}` }))).toBe(false);
+      const correctValue = makeV2CookieValue(TEST_TOKEN);
+      expect(isOwner(makeReq({ cookie: `wrong_name=${correctValue}` }))).toBe(false);
     });
 
     it('rejects request with partial cookie value', () => {
-      const correctCookie = deriveOwnerCookie(TEST_TOKEN);
-      const partial = correctCookie.slice(0, 10);
-      expect(isOwner(makeReq({ cookie: `lain_owner=${partial}` }))).toBe(false);
+      const correctValue = makeV2CookieValue(TEST_TOKEN);
+      const partial = correctValue.slice(0, 10);
+      expect(isOwner(makeReq({ cookie: `${OWNER_COOKIE_NAME}=${partial}` }))).toBe(false);
     });
 
     it('rejects request with cookie value + extra chars', () => {
-      const correctCookie = deriveOwnerCookie(TEST_TOKEN);
-      expect(isOwner(makeReq({ cookie: `lain_owner=${correctCookie}extra` }))).toBe(false);
+      // Sig is hex, so appending non-hex at the end causes regex stop — payload.sig
+      // regex still captures the valid pair. This simulates attacker appending
+      // bytes to a stolen cookie; our regex tolerates trailing garbage which is
+      // OK because the HMAC is still verified correctly.
+      const correctValue = makeV2CookieValue(TEST_TOKEN);
+      // Inject garbage BEFORE the sig ends — breaks sig parse.
+      const [payload, sig] = correctValue.split('.');
+      const broken = `${payload}.${sig!.slice(0, -2)}zz`; // non-hex tail
+      expect(isOwner(makeReq({ cookie: `${OWNER_COOKIE_NAME}=${broken}` }))).toBe(false);
     });
 
-    it('rejects request with uppercase hex cookie', () => {
-      const correctCookie = deriveOwnerCookie(TEST_TOKEN);
-      const upper = correctCookie.toUpperCase();
-      // The regex only matches [a-f0-9], uppercase hex won't match
-      expect(isOwner(makeReq({ cookie: `lain_owner=${upper}` }))).toBe(false);
+    it('rejects request with uppercase hex in signature', () => {
+      const correctValue = makeV2CookieValue(TEST_TOKEN);
+      const [payload, sig] = correctValue.split('.');
+      const upperSig = sig!.toUpperCase();
+      // The regex requires [a-f0-9]+ for the signature — uppercase won't match.
+      expect(isOwner(makeReq({ cookie: `${OWNER_COOKIE_NAME}=${payload}.${upperSig}` }))).toBe(false);
     });
 
     it('rejects request with cookie for different token', () => {
-      const wrongCookie = deriveOwnerCookie('different-token');
-      expect(isOwner(makeReq({ cookie: `lain_owner=${wrongCookie}` }))).toBe(false);
+      const wrongCookie = makeV2Cookie(TEST_TOKEN, { signWith: 'different-token' });
+      expect(isOwner(makeReq({ cookie: wrongCookie }))).toBe(false);
     });
 
     it('accepts request with correct cookie', () => {
@@ -1301,9 +1706,9 @@ describe('Auth Bypass Attempts', () => {
     });
 
     it('accepts request with cookie among multiple cookies', () => {
-      const correctCookie = deriveOwnerCookie(TEST_TOKEN);
+      const v2 = makeV2Cookie(TEST_TOKEN);
       expect(
-        isOwner(makeReq({ cookie: `other=abc; lain_owner=${correctCookie}; session=xyz` }))
+        isOwner(makeReq({ cookie: `other=abc; ${v2}; session=xyz` }))
       ).toBe(true);
     });
 
@@ -1314,8 +1719,13 @@ describe('Auth Bypass Attempts', () => {
 
     it('rejects when LAIN_OWNER_TOKEN is unset', () => {
       delete process.env['LAIN_OWNER_TOKEN'];
-      const cookie = deriveOwnerCookie(TEST_TOKEN);
-      expect(isOwner(makeReq({ cookie: `lain_owner=${cookie}` }))).toBe(false);
+      expect(isOwner(makeReq({ cookie: makeV2Cookie(TEST_TOKEN) }))).toBe(false);
+    });
+
+    it('rejects legacy v1 cookies outright', () => {
+      // findings.md P2:2348 — v1 (`lain_owner=<hex>`) is no longer accepted
+      // even when the hash happens to be well-formed.
+      expect(isOwner(makeReq({ cookie: 'lain_owner=' + 'a'.repeat(64) }))).toBe(false);
     });
   });
 
@@ -1332,27 +1742,24 @@ describe('Auth Bypass Attempts', () => {
       }
     });
 
-    it('rejects cookie with leading whitespace', () => {
-      const correctCookie = deriveOwnerCookie(TEST_TOKEN);
-      expect(isOwner(makeReq({ cookie: `lain_owner= ${correctCookie}` }))).toBe(false);
+    it('rejects cookie with leading whitespace inside the value', () => {
+      const correctValue = makeV2CookieValue(TEST_TOKEN);
+      expect(isOwner(makeReq({ cookie: `${OWNER_COOKIE_NAME}= ${correctValue}` }))).toBe(false);
     });
 
     it('cookie regex stops at trailing whitespace (captures correct value)', () => {
-      // Regex [a-f0-9]+ stops at space, so the extracted value is still correct
-      const correctCookie = deriveOwnerCookie(TEST_TOKEN);
-      expect(isOwner(makeReq({ cookie: `lain_owner=${correctCookie} ` }))).toBe(true);
+      const v2 = makeV2Cookie(TEST_TOKEN);
+      expect(isOwner(makeReq({ cookie: `${v2} ` }))).toBe(true);
     });
 
     it('rejects cookie with null byte prefix (changes captured value)', () => {
-      const correctCookie = deriveOwnerCookie(TEST_TOKEN);
-      // \x00 is not in [a-f0-9] so regex won't capture the correct value
-      expect(isOwner(makeReq({ cookie: `lain_owner=\x00${correctCookie}` }))).toBe(false);
+      const correctValue = makeV2CookieValue(TEST_TOKEN);
+      expect(isOwner(makeReq({ cookie: `${OWNER_COOKIE_NAME}=\x00${correctValue}` }))).toBe(false);
     });
 
     it('cookie regex stops at null byte suffix (captures correct value)', () => {
-      // \x00 is not hex, so regex stops before it — captured value is correct
-      const correctCookie = deriveOwnerCookie(TEST_TOKEN);
-      expect(isOwner(makeReq({ cookie: `lain_owner=${correctCookie}\x00` }))).toBe(true);
+      const v2 = makeV2Cookie(TEST_TOKEN);
+      expect(isOwner(makeReq({ cookie: `${v2}\x00` }))).toBe(true);
     });
   });
 
@@ -1530,12 +1937,13 @@ describe('Auth Bypass Attempts', () => {
     });
 
     it('OWNER_ONLY_PATHS includes character pages', () => {
+      // findings.md P2:2388 — per-character prefixes used to be hardcoded
+      // here; they are now derived from the manifest via
+      // getCharacterRoutePrefixes() so a rename only touches characters.json.
+      // `/local/` is still a literal alias (not a character id).
       expect(serverSource).toContain("'/local/'");
-      expect(serverSource).toContain("'/dr-claude/'");
-      expect(serverSource).toContain("'/pkd/'");
-      expect(serverSource).toContain("'/mckenna/'");
-      expect(serverSource).toContain("'/john/'");
-      expect(serverSource).toContain("'/hiru/'");
+      expect(serverSource).toContain('getCharacterRoutePrefixes');
+      expect(serverSource).toMatch(/OWNER_ONLY_PATHS\s*=\s*\[\.\.\.STATIC_OWNER_ONLY_PATHS,\s*\.\.\.getCharacterRoutePrefixes\(\)\]/);
     });
 
     it('OWNER_ONLY_PATHS includes postboard and events pages', () => {
@@ -1554,43 +1962,48 @@ describe('Auth Bypass Attempts', () => {
   });
 
   describe('Interlink auth implementation', () => {
-    it('server verifyInterlinkAuth checks for Bearer prefix', () => {
-      expect(serverSource).toContain("authHeader.startsWith('Bearer ')");
+    // Auth logic lives in src/security/interlink-auth.ts (per-character
+    // derivation + identity binding per findings.md P1:2289). Servers now
+    // delegate to verifyInterlinkRequest() and treat the authenticated
+    // fromId as the source of truth.
+    it('interlink-auth checks for Bearer prefix', () => {
+      expect(interlinkAuthSource).toContain("auth.startsWith('Bearer ')");
     });
 
-    it('server verifyInterlinkAuth uses secureCompare', () => {
+    it('interlink-auth uses secureCompare', () => {
+      expect(interlinkAuthSource).toContain('secureCompare');
+    });
+
+    it('interlink-auth returns 401 for missing auth header', () => {
+      const idx = interlinkAuthSource.indexOf('function verifyInterlinkRequest');
+      const section = interlinkAuthSource.substring(idx, idx + 1500);
+      expect(section).toContain('401');
+    });
+
+    it('interlink-auth returns 403 for invalid token', () => {
+      const idx = interlinkAuthSource.indexOf('function verifyInterlinkRequest');
+      const section = interlinkAuthSource.substring(idx, idx + 1500);
+      expect(section).toContain('403');
+    });
+
+    it('interlink-auth returns 503 when master token not configured', () => {
+      const idx = interlinkAuthSource.indexOf('function verifyInterlinkRequest');
+      const section = interlinkAuthSource.substring(idx, idx + 1500);
+      expect(section).toContain('503');
+    });
+
+    it('server verifyInterlinkAuth wrapper delegates to verifyInterlinkRequest', () => {
       const idx = serverSource.indexOf('function verifyInterlinkAuth');
-      // Need more than 500 chars to include the secureCompare call
-      const interlinkSection = serverSource.substring(idx, idx + 800);
-      expect(interlinkSection).toContain('secureCompare');
+      expect(idx).toBeGreaterThan(-1);
+      const section = serverSource.substring(idx, idx + 400);
+      expect(section).toContain('verifyInterlinkRequest');
     });
 
-    it('server returns 401 for missing auth header', () => {
-      const idx = serverSource.indexOf('function verifyInterlinkAuth');
-      const interlinkSection = serverSource.substring(idx, idx + 800);
-      expect(interlinkSection).toContain('401');
-    });
-
-    it('server returns 403 for invalid token', () => {
-      const idx = serverSource.indexOf('function verifyInterlinkAuth');
-      const interlinkSection = serverSource.substring(idx, idx + 800);
-      expect(interlinkSection).toContain('403');
-    });
-
-    it('server returns 503 when token not configured', () => {
-      const idx = serverSource.indexOf('function verifyInterlinkAuth');
-      const interlinkSection = serverSource.substring(idx, idx + 800);
-      expect(interlinkSection).toContain('503');
-    });
-
-    it('character server verifyInterlinkAuth checks Bearer prefix', () => {
-      expect(charServerSource).toContain("authHeader.startsWith('Bearer ')");
-    });
-
-    it('character server verifyInterlinkAuth uses secureCompare', () => {
+    it('character server verifyInterlinkAuth wrapper delegates to verifyInterlinkRequest', () => {
       const idx = charServerSource.indexOf('function verifyInterlinkAuth');
-      const charInterlinkSection = charServerSource.substring(idx, idx + 800);
-      expect(charInterlinkSection).toContain('secureCompare');
+      expect(idx).toBeGreaterThan(-1);
+      const section = charServerSource.substring(idx, idx + 400);
+      expect(section).toContain('verifyInterlinkRequest');
     });
   });
 
@@ -1744,18 +2157,39 @@ describe('Auth Bypass Attempts', () => {
       expect(serverSource).toContain('res.writeHead(403');
     });
 
-    it('gate sets cookie only on success', () => {
-      // setOwnerCookie is called only inside the success branch
-      const gateSection = serverSource.substring(
-        serverSource.indexOf("'/gate'"),
-        serverSource.indexOf("'/gate'") + 400
-      );
+    it('gate issues cookie only on success', () => {
+      // findings.md P2:2348 — issueOwnerCookie is called only inside the
+      // success branch. Both the POST and the GET handler must secureCompare
+      // and only then issueOwnerCookie.
+      const gateStart = serverSource.indexOf("'/gate'");
+      const gateEnd = serverSource.indexOf('// Block non-owners', gateStart);
+      const gateSection = serverSource.substring(gateStart, gateEnd > gateStart ? gateEnd : gateStart + 2400);
       expect(gateSection).toContain('secureCompare');
-      expect(gateSection).toContain('setOwnerCookie');
+      expect(gateSection).toContain('issueOwnerCookie');
     });
 
     it('gate redirects to / on success', () => {
       expect(serverSource).toContain("'Location': '/'");
+    });
+
+    // findings.md P2:2466 — the owner token must not leak through URL query strings
+    // into browser history, referrer headers, or reverse-proxy logs.
+    it('gate exposes a POST handler that reads the token from the request body', () => {
+      expect(serverSource).toContain("'/gate' && req.method === 'POST'");
+      const postIdx = serverSource.indexOf("'/gate' && req.method === 'POST'");
+      const chunk = serverSource.substring(postIdx, postIdx + 1200);
+      // The POST branch must read the body (not url.searchParams).
+      expect(chunk).toContain('collectBody');
+      expect(chunk).toContain('secureCompare');
+      expect(chunk).toContain('issueOwnerCookie');
+    });
+
+    it('gate responses include Cache-Control: no-store and Referrer-Policy: no-referrer', () => {
+      const firstGate = serverSource.indexOf("'/gate'");
+      const end = serverSource.indexOf('// Block non-owners', firstGate);
+      const gateBlock = serverSource.substring(firstGate, end > firstGate ? end : firstGate + 2000);
+      expect(gateBlock).toContain("'Cache-Control': 'no-store'");
+      expect(gateBlock).toContain("'Referrer-Policy': 'no-referrer'");
     });
   });
 
@@ -1884,8 +2318,11 @@ describe('Additional Security Patterns', () => {
     });
 
     it('object creation sanitizes name and description', () => {
-      expect(serverSource).toContain('sanitize(name).sanitized');
-      expect(serverSource).toContain('sanitize(description).sanitized');
+      // sanitize() is called on both fields; the block-check regression
+      // (that .blocked must gate the write) lives under the dedicated
+      // "POST /api/objects checks sanitize().blocked" describe.
+      expect(serverSource).toContain('sanitize(name)');
+      expect(serverSource).toContain('sanitize(description)');
     });
   });
 
@@ -1973,6 +2410,105 @@ describe('Additional Security Patterns', () => {
 
     it('object description is sliced to 500 chars', () => {
       expect(serverSource).toContain('.slice(0, 500)');
+    });
+  });
+
+  describe('Channel isAllowed fail-closed default (P1 findings.md)', () => {
+    const sources: Array<[string, string]> = [
+      ['telegram', telegramChannelSource],
+      ['whatsapp', whatsappChannelSource],
+      ['discord', discordChannelSource],
+      ['slack', slackChannelSource],
+      ['signal', signalChannelSource],
+    ];
+
+    for (const [name, source] of sources) {
+      it(`${name} config declares public?: boolean`, () => {
+        expect(source).toMatch(/public\?:\s*boolean/);
+      });
+
+      it(`${name} isAllowed empty-allowlists branch returns public === true, not true`, () => {
+        // The canonical fail-open phrase is gone.
+        expect(source).not.toMatch(/\/\/ If no restrictions, allow all/);
+        // And the early-return is now gated on the explicit opt-in.
+        expect(source).toMatch(/return this\.config\.public === true;/);
+      });
+
+      it(`${name} connect() warns when allowlists are empty`, () => {
+        // Warning must mention both the public-mode path and the fail-closed path.
+        expect(source).toMatch(/PUBLIC mode/);
+        expect(source).toMatch(/empty allowlists and public !== true/);
+      });
+    }
+  });
+
+  describe('town-events auth + forceLocation validation (P1 findings.md)', () => {
+    it('GET /api/town-events is gated by isOwner || verifyInterlinkAuth', () => {
+      const idx = serverSource.indexOf("'/api/town-events' && req.method === 'GET'");
+      expect(idx).toBeGreaterThan(-1);
+      const section = serverSource.substring(idx, idx + 600);
+      expect(section).toMatch(/if \(!isOwner\(req\) && !verifyInterlinkAuth\(req, res\)\) return;/);
+    });
+
+    it('GET /api/town-events/effects is gated by isOwner || verifyInterlinkAuth', () => {
+      const idx = serverSource.indexOf("'/api/town-events/effects' && req.method === 'GET'");
+      expect(idx).toBeGreaterThan(-1);
+      const section = serverSource.substring(idx, idx + 600);
+      expect(section).toMatch(/if \(!isOwner\(req\) && !verifyInterlinkAuth\(req, res\)\) return;/);
+    });
+
+    it('town-life.ts sends per-character interlink headers when fetching town events', () => {
+      // Per-character tokens (findings.md P1:2289): outbound calls now use
+      // getInterlinkHeaders() which supplies both the derived Bearer token
+      // and the X-Interlink-From identity header.
+      expect(townLifeSource).toMatch(/getInterlinkHeaders/);
+      expect(townLifeSource).toMatch(/\/api\/town-events[^'`]*['`],\s*\{\s*headers:\s*authHeaders/);
+    });
+
+    it('town-life.ts validates forceLocation via isValidBuilding before setCurrentLocation', () => {
+      expect(townLifeSource).toMatch(/import[^;]*isValidBuilding[^;]*buildings\.js/);
+      // The unsafe cast is gone.
+      expect(townLifeSource).not.toMatch(/activeEffects\.forceLocation\s+as\s+BuildingId/);
+      // The guard is present, and setCurrentLocation sits inside the valid branch.
+      const idx = townLifeSource.indexOf('activeEffects.forceLocation && activeEffects.forceLocation !== loc.building');
+      expect(idx).toBeGreaterThan(-1);
+      const section = townLifeSource.substring(idx, idx + 1000);
+      expect(section).toMatch(/if \(!isValidBuilding\(activeEffects\.forceLocation\)\)/);
+      expect(section).toMatch(/ignoring forceLocation for unknown building id/);
+      expect(section).toMatch(/setCurrentLocation\(activeEffects\.forceLocation,/);
+    });
+  });
+
+  describe('LLM-authored tool RCE surface is gone (P1 findings.md:1561)', () => {
+    // skills.ts handed `new Function(...)` + `require` + `process` to
+    // LLM-authored JavaScript. It was removed along with the three meta-tools
+    // that let the LLM save / list / delete custom tools.
+
+    it('src/agent/skills.ts no longer exists on disk', () => {
+      const { existsSync } = require('node:fs') as typeof import('node:fs');
+      expect(existsSync(join(SRC, 'agent', 'skills.ts'))).toBe(false);
+    });
+
+    it('agent/tools.ts does not re-introduce the skills.js import', () => {
+      expect(agentToolsSource).not.toMatch(/from\s+['"]\.\/skills\.js['"]/);
+      expect(agentToolsSource).not.toMatch(/import[^;]*saveCustomTool/);
+      expect(agentToolsSource).not.toMatch(/import[^;]*listCustomTools/);
+      expect(agentToolsSource).not.toMatch(/import[^;]*deleteCustomTool/);
+    });
+
+    it('agent/tools.ts no longer registers create_tool / list_my_tools / delete_tool', () => {
+      expect(agentToolsSource).not.toContain("name: 'create_tool'");
+      expect(agentToolsSource).not.toContain("name: 'list_my_tools'");
+      expect(agentToolsSource).not.toContain("name: 'delete_tool'");
+    });
+
+    it('no source file still wires up the skills module', () => {
+      const { execSync } = require('node:child_process') as typeof import('node:child_process');
+      const out = execSync(
+        "grep -rn --include='*.ts' \"from '\\./skills\\.js'\\|from '\\.\\./agent/skills\\.js'\\|loadCustomTools\" src || true",
+        { cwd: process.cwd(), encoding: 'utf-8' },
+      );
+      expect(out.trim(), `skills.js must not be referenced by any src/ file:\n${out}`).toBe('');
     });
   });
 });

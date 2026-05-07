@@ -2,6 +2,7 @@ import { getMeta, setMeta } from '../storage/database.js';
 import { getLogger } from '../utils/logger.js';
 import { eventBus } from '../events/bus.js';
 import type { InternalState } from '../agent/internal-state.js';
+import { getInterlinkHeaders } from '../security/interlink-auth.js';
 
 export interface Weather {
   condition: 'clear' | 'overcast' | 'rain' | 'fog' | 'storm' | 'aurora';
@@ -92,8 +93,17 @@ export async function computeWeather(states: InternalState[]): Promise<Weather> 
   return { condition, intensity, description, computed_at: Date.now() };
 }
 
-export function getWeatherEffect(condition: string): Partial<InternalState> {
-  const effects: Record<string, Partial<InternalState>> = {
+/**
+ * findings.md P2:1520 — weather effects are now scaled by intensity.
+ *
+ * `computeCondition` produces both `condition` and `intensity ∈ [0,1]`,
+ * but `getWeatherEffect` used to return a static per-condition delta
+ * map regardless of intensity — so a storm at 1.0 and a storm at 0.1
+ * applied identical pressure on internal state. `intensity` defaults
+ * to 1 for back-compatibility with callers/tests that don't care.
+ */
+export function getWeatherEffect(condition: string, intensity = 1): Partial<InternalState> {
+  const base: Record<string, Partial<InternalState>> = {
     storm: { energy: -0.04, intellectual_arousal: 0.03 },
     rain: { emotional_weight: 0.03, sociability: -0.02 },
     fog: { energy: -0.03, valence: -0.01 },
@@ -101,7 +111,132 @@ export function getWeatherEffect(condition: string): Partial<InternalState> {
     clear: { energy: 0.02 },
     overcast: {},
   };
-  return effects[condition] ?? {};
+  const effect = base[condition];
+  if (!effect) return {};
+  const scale = Math.max(0, Math.min(1, intensity));
+  const scaled: Partial<InternalState> = {};
+  for (const [k, v] of Object.entries(effect) as Array<[keyof InternalState, number]>) {
+    (scaled as Record<string, number>)[k] = v * scale;
+  }
+  return scaled;
+}
+
+/**
+ * findings.md P2:1505 — Wired Lain is the town's shared-state authority.
+ *
+ * The weather loop only runs on WL (see startWeatherLoop below, wired up
+ * in src/web/server.ts behind `isWired`). Other character processes
+ * previously had two partial access paths: `internal-state.ts` read
+ * `weather:current` from its own meta table (always null → no weather
+ * effects on mortals), and `agent/index.ts` had an inline fallback that
+ * fired a fresh GET to WL on every prompt build (uncached).
+ *
+ * The helpers below are the canonical client-side accessor:
+ *   - `getTownWeather()` — async; fetches from WL with 60s fresh TTL and
+ *     30min stale-grace during WL outages.
+ *   - `peekCachedTownWeather()` — sync; returns last cached value. On WL
+ *     itself, short-circuits to the local meta read.
+ *   - `startTownWeatherRefreshLoop()` — non-WL processes start this at
+ *     boot to warm the cache so synchronous consumers have data.
+ */
+const TOWN_WEATHER_CACHE_TTL_MS = 60_000;
+const TOWN_WEATHER_STALE_GRACE_MS = 30 * 60_000;
+const TOWN_WEATHER_REFRESH_INTERVAL_MS = 5 * 60_000;
+const TOWN_WEATHER_FETCH_TIMEOUT_MS = 3000;
+
+interface TownWeatherCache {
+  weather: Weather | null;
+  fetchedAt: number;
+}
+let townWeatherCache: TownWeatherCache | null = null;
+let townWeatherCacheHits = 0;
+let townWeatherCacheMisses = 0;
+let townWeatherCacheStaleServes = 0;
+
+function isWiredLain(): boolean {
+  return process.env['LAIN_CHARACTER_ID'] === 'wired-lain';
+}
+
+export async function getTownWeather(): Promise<Weather | null> {
+  if (isWiredLain()) {
+    return getCurrentWeather();
+  }
+  const now = Date.now();
+  if (townWeatherCache && now - townWeatherCache.fetchedAt < TOWN_WEATHER_CACHE_TTL_MS) {
+    townWeatherCacheHits++;
+    return townWeatherCache.weather;
+  }
+  townWeatherCacheMisses++;
+  const wiredUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
+  try {
+    const resp = await fetch(`${wiredUrl}/api/weather`, {
+      signal: AbortSignal.timeout(TOWN_WEATHER_FETCH_TIMEOUT_MS),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json() as Weather;
+    townWeatherCache = { weather: data, fetchedAt: now };
+    return data;
+  } catch {
+    if (
+      townWeatherCache &&
+      now - townWeatherCache.fetchedAt < TOWN_WEATHER_CACHE_TTL_MS + TOWN_WEATHER_STALE_GRACE_MS
+    ) {
+      townWeatherCacheStaleServes++;
+      return townWeatherCache.weather;
+    }
+    return null;
+  }
+}
+
+export function peekCachedTownWeather(): Weather | null {
+  if (isWiredLain()) {
+    return getCurrentWeather();
+  }
+  if (!townWeatherCache) return null;
+  const age = Date.now() - townWeatherCache.fetchedAt;
+  if (age > TOWN_WEATHER_CACHE_TTL_MS + TOWN_WEATHER_STALE_GRACE_MS) return null;
+  return townWeatherCache.weather;
+}
+
+export function getTownWeatherHealth(): {
+  cacheHits: number;
+  cacheMisses: number;
+  cacheStaleServes: number;
+  cachedAt: number | null;
+} {
+  return {
+    cacheHits: townWeatherCacheHits,
+    cacheMisses: townWeatherCacheMisses,
+    cacheStaleServes: townWeatherCacheStaleServes,
+    cachedAt: townWeatherCache?.fetchedAt ?? null,
+  };
+}
+
+/**
+ * Periodically warm the town-weather cache so synchronous consumers
+ * (internal-state.ts decay tick) have data on hand. WL short-circuits to
+ * local meta and the timer is a no-op, but we still arm it for uniformity.
+ */
+export function startTownWeatherRefreshLoop(intervalMs = TOWN_WEATHER_REFRESH_INTERVAL_MS): () => void {
+  const logger = getLogger();
+  let stopped = false;
+  const tick = async (): Promise<void> => {
+    if (stopped) return;
+    try {
+      await getTownWeather();
+    } catch (err) {
+      logger.debug({ err }, 'town-weather refresh tick failed (non-critical)');
+    }
+  };
+  void tick();
+  const timer = setInterval(() => { void tick(); }, intervalMs);
+  if (typeof (timer as { unref?: () => void }).unref === 'function') {
+    (timer as { unref: () => void }).unref();
+  }
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
 }
 
 interface PeerStateResponse {
@@ -110,9 +245,9 @@ interface PeerStateResponse {
 }
 
 async function fetchAllPeerStates(): Promise<InternalState[]> {
-  const token = process.env['LAIN_INTERLINK_TOKEN'] || '';
+  const headers = getInterlinkHeaders();
   const peerConfigRaw = process.env['PEER_CONFIG'];
-  if (!peerConfigRaw) return [];
+  if (!peerConfigRaw || !headers) return [];
 
   const peers = JSON.parse(peerConfigRaw) as Array<{ id: string; url: string }>;
   const states: InternalState[] = [];
@@ -125,7 +260,7 @@ async function fetchAllPeerStates(): Promise<InternalState[]> {
   await Promise.all(peers.map(async (peer) => {
     try {
       const resp = await fetch(`${peer.url}/api/internal-state`, {
-        headers: { 'Authorization': `Bearer ${token}` },
+        headers,
         signal: AbortSignal.timeout(5000),
       });
       if (resp.ok) {

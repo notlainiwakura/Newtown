@@ -29,9 +29,13 @@
   --font-heading: 'Orbitron', sans-serif;
   --font-mono: 'Share Tech Mono', monospace;
 
-  --color-neo: #60e0a0;
-  --color-plato: #e0c870;
-  --color-joe: #88b0d0;
+  --color-wired-lain: #4080ff;
+  --color-lain: #80c0ff;
+  --color-dr-claude: #ff6060;
+  --color-pkd: #c060ff;
+  --color-mckenna: #40e080;
+  --color-john: #ffb040;
+  --color-cage: #ff9f43;
 
   --type-diary: #e0a020;
   --type-dream: #a040e0;

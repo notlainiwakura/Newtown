@@ -1,5 +1,5 @@
 /**
- * NEWTOWN GAME — API Client
+ * LAINTOWN GAME — API Client
  * All backend API calls for possession, chat, location, etc.
  * Reuses patterns from commune-map.js and possess.js.
  */
@@ -7,11 +7,15 @@
 class APIClient {
   constructor() {
     this.token = '';
-    this.base = '/' + (typeof PLAYER_ID === 'string' ? PLAYER_ID : 'joe');
+    this.base = ''; // set dynamically from manifest
   }
 
   setToken(token) {
     this.token = token;
+  }
+
+  setBase(base) {
+    this.base = base || '';
   }
 
   getToken() {
@@ -150,10 +154,13 @@ class APIClient {
     return reader;
   }
 
-  // Get a specific character's location
+  // Get a specific character's location — path built from manifest
   async getCharacterLocation(charId) {
+    const ids = Object.keys(CHARACTERS);
+    const isHost = ids.length > 0 && ids[0] === charId;
+    const prefix = isHost ? '' : '/' + charId;
     try {
-      const resp = await fetch('/' + charId + '/api/location');
+      const resp = await fetch(prefix + '/api/location');
       if (!resp.ok) return null;
       const data = await resp.json();
       return data.location || null;

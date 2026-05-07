@@ -43,6 +43,7 @@ vi.mock('../src/memory/embeddings.js', () => ({
   isEmbeddingModelLoaded: vi.fn().mockReturnValue(false),
   isEmbeddingModelLoading: vi.fn().mockReturnValue(false),
   unloadEmbeddingModel: vi.fn(),
+  CURRENT_EMBEDDING_MODEL: 'Xenova/all-MiniLM-L6-v2',
 }));
 
 // ── characters mock ──────────────────────────────────────────────────────────
@@ -188,6 +189,7 @@ function createMockProvider(overrides: Partial<Provider> = {}): Provider {
   return {
     name: 'mock',
     model: 'mock-model',
+    supportsStreaming: false,
     complete: vi.fn().mockResolvedValue({
       content: 'mock response',
       finishReason: 'stop',

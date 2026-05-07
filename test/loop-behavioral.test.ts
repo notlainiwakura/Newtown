@@ -54,6 +54,7 @@ vi.mock('../src/memory/index.js', () => ({
 
 vi.mock('../src/memory/embeddings.js', () => ({
   cosineSimilarity: vi.fn((_a: Float32Array, _b: Float32Array) => 0.3),
+  CURRENT_EMBEDDING_MODEL: 'Xenova/all-MiniLM-L6-v2',
 }));
 
 // Mock provider — the core of behavioral testing
@@ -104,6 +105,7 @@ vi.mock('../src/config/paths.js', () => ({
 
 vi.mock('../src/config/characters.js', () => ({
   getDefaultLocations: vi.fn(() => ({ 'test-char': 'library' })),
+  requireCharacterName: vi.fn(() => 'TestChar'),
 }));
 
 vi.mock('../src/commune/location.js', () => ({
@@ -828,6 +830,23 @@ describe('Diary Loop — Behavioral', () => {
 // ═════════════════════════════════════════════════
 
 describe('Letter Loop — Behavioral', () => {
+  let prevCharId: string | undefined;
+  let prevInterlink: string | undefined;
+
+  beforeEach(() => {
+    prevCharId = process.env['LAIN_CHARACTER_ID'];
+    prevInterlink = process.env['LAIN_INTERLINK_TOKEN'];
+    process.env['LAIN_CHARACTER_ID'] = 'test-char';
+    process.env['LAIN_INTERLINK_TOKEN'] = 'test-master-token';
+  });
+
+  afterEach(() => {
+    if (prevCharId === undefined) delete process.env['LAIN_CHARACTER_ID'];
+    else process.env['LAIN_CHARACTER_ID'] = prevCharId;
+    if (prevInterlink === undefined) delete process.env['LAIN_INTERLINK_TOKEN'];
+    else process.env['LAIN_INTERLINK_TOKEN'] = prevInterlink;
+  });
+
   describe('startLetterLoop', () => {
     it('should return noop when no target URL configured', async () => {
       const { startLetterLoop } = await import('../src/agent/letter.js');
@@ -847,7 +866,6 @@ describe('Letter Loop — Behavioral', () => {
       const { startLetterLoop } = await import('../src/agent/letter.js');
       const stop = startLetterLoop({
         targetUrl: 'http://localhost:3001/api/interlink/letter',
-        authToken: 'test-token',
         enabled: true,
         intervalMs: 999999999,
         maxJitterMs: 0,
@@ -862,7 +880,7 @@ describe('Letter Loop — Behavioral', () => {
     it('should throw if no target URL', async () => {
       const { runLetterCycle } = await import('../src/agent/letter.js');
       await expect(
-        runLetterCycle({ targetUrl: null, authToken: null, enabled: true, intervalMs: 1, targetHour: 21, maxJitterMs: 0 })
+        runLetterCycle({ targetUrl: null, enabled: true, intervalMs: 1, targetHour: 21, maxJitterMs: 0 })
       ).rejects.toThrow('no interlink target configured');
     });
 
@@ -872,7 +890,7 @@ describe('Letter Loop — Behavioral', () => {
 
       const { runLetterCycle } = await import('../src/agent/letter.js');
       await expect(
-        runLetterCycle({ targetUrl: 'http://test', authToken: 'tok', enabled: true, intervalMs: 1, targetHour: 21, maxJitterMs: 0 })
+        runLetterCycle({ targetUrl: 'http://test', enabled: true, intervalMs: 1, targetHour: 21, maxJitterMs: 0 })
       ).rejects.toThrow('letter blocked by Dr. Claude');
     });
 
@@ -891,7 +909,6 @@ describe('Letter Loop — Behavioral', () => {
       const { runLetterCycle } = await import('../src/agent/letter.js');
       await runLetterCycle({
         targetUrl: 'http://localhost:3001/api/interlink/letter',
-        authToken: 'test-token',
         enabled: true,
         intervalMs: 1,
         targetHour: 21,
@@ -951,7 +968,6 @@ describe('Letter Loop — Behavioral', () => {
       const { runLetterCycle } = await import('../src/agent/letter.js');
       await runLetterCycle({
         targetUrl: 'http://localhost:3001/api/interlink/letter',
-        authToken: 'test-token',
         enabled: true,
         intervalMs: 1,
         targetHour: 21,
@@ -964,7 +980,8 @@ describe('Letter Loop — Behavioral', () => {
           method: 'POST',
           headers: expect.objectContaining({
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer test-token',
+            'Authorization': expect.stringMatching(/^Bearer [0-9a-f]{64}$/),
+            'X-Interlink-From': 'test-char',
           }),
         })
       );
@@ -985,7 +1002,6 @@ describe('Letter Loop — Behavioral', () => {
       await expect(
         runLetterCycle({
           targetUrl: 'http://localhost:3001/api/interlink/letter',
-          authToken: 'test-token',
           enabled: true,
           intervalMs: 1,
           targetHour: 21,
@@ -1009,7 +1025,6 @@ describe('Letter Loop — Behavioral', () => {
       await expect(
         runLetterCycle({
           targetUrl: 'http://localhost:3001/api/interlink/letter',
-          authToken: 'test-token',
           enabled: true,
           intervalMs: 1,
           targetHour: 21,
@@ -1032,7 +1047,6 @@ describe('Letter Loop — Behavioral', () => {
       const { runLetterCycle } = await import('../src/agent/letter.js');
       await runLetterCycle({
         targetUrl: 'http://localhost:3001/api/interlink/letter',
-        authToken: 'test-token',
         enabled: true,
         intervalMs: 1,
         targetHour: 21,
@@ -1063,7 +1077,6 @@ describe('Letter Loop — Behavioral', () => {
       const { runLetterCycle } = await import('../src/agent/letter.js');
       await runLetterCycle({
         targetUrl: 'http://test/letter',
-        authToken: 'tok',
         enabled: true,
         intervalMs: 1,
         targetHour: 21,

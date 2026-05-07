@@ -23,6 +23,12 @@ vi.mock('keytar', () => ({
 const TOOLS_PATH = join(process.cwd(), 'src', 'agent', 'tools.ts');
 const toolsSource = readFileSync(TOOLS_PATH, 'utf-8');
 
+// Web search primitives (DDG URL/POST, HTML entity decoder) live in the
+// shared module now. Both tools.ts's `web_search` and server.ts's
+// `webSearch` delegate to it.
+const WEB_SEARCH_PATH = join(process.cwd(), 'src', 'utils', 'web-search.ts');
+const webSearchSource = readFileSync(WEB_SEARCH_PATH, 'utf-8');
+
 // ─────────────────────────────────────────────────────────
 // 1. TOOL REGISTRY — Core registry functions exist and work
 // ─────────────────────────────────────────────────────────
@@ -36,7 +42,9 @@ describe('Tool Registry', () => {
   });
 
   it('exports getToolDefinitions function', () => {
-    expect(toolsSource).toContain('export function getToolDefinitions(): ToolDefinition[]');
+    // findings.md P2:1887 — signature accepts optional characterId for
+    // per-character allowlist filtering.
+    expect(toolsSource).toContain('export function getToolDefinitions(characterId?: string): ToolDefinition[]');
   });
 
   it('exports executeTool function', () => {
@@ -55,8 +63,14 @@ describe('Tool Registry', () => {
     expect(toolsSource).toContain('Array.from(registeredTools.values()).map((t) => t.definition)');
   });
 
-  it('toolRequiresApproval function exists', () => {
-    expect(toolsSource).toContain('export function toolRequiresApproval(name: string): boolean');
+  it('does not ship a dead tool-approval helper', () => {
+    // toolRequiresApproval() existed but nothing in the execution path
+    // ever called it — see P1 in findings.md. Enforce that if someone
+    // re-adds an approval helper they must wire it into executeTool
+    // (which currently calls tool.handler unconditionally).
+    expect(toolsSource).not.toMatch(/export function toolRequiresApproval\b/);
+    expect(toolsSource).not.toMatch(/requiresApproval\?:\s*boolean/);
+    expect(toolsSource).not.toMatch(/requiresApproval:\s*true/);
   });
 });
 
@@ -72,7 +86,10 @@ describe('Tool Execution', () => {
 
   it('catches tool execution errors and returns isError result', () => {
     expect(toolsSource).toContain('} catch (error)');
-    expect(toolsSource).toContain('Error executing tool:');
+    // P2:1851 — error content returned to the LLM is generic + incident ID,
+    // not the raw handler error message.
+    expect(toolsSource).toContain('failed (incident ');
+    expect(toolsSource).toContain('isError: true');
   });
 
   it('truncates result to 1000 chars for logging', () => {
@@ -207,16 +224,29 @@ describe('Web Search Tool', () => {
     expect(toolsSource).toContain("name: 'web_search'");
   });
 
-  it('uses DuckDuckGo HTML search endpoint', () => {
-    expect(toolsSource).toContain('https://html.duckduckgo.com/html/');
+  it('delegates to shared fallback chain in src/utils/web-search.ts', () => {
+    // Prior implementation inlined only DDG HTML with no cascade — 202
+    // anti-bot challenges were silently swallowed. The shared module
+    // cascades DDG HTML → DDG Lite → Wikipedia.
+    expect(toolsSource).toContain("import('../utils/web-search.js')");
+    expect(toolsSource).toMatch(/const\s*\{\s*searchWeb\s*\}\s*=\s*await\s*import/);
   });
 
-  it('uses POST method for search', () => {
-    expect(toolsSource).toContain("method: 'POST'");
+  it('uses DuckDuckGo HTML search endpoint (in shared module)', () => {
+    expect(webSearchSource).toContain('https://html.duckduckgo.com/html/');
   });
 
-  it('sends query as form-encoded body', () => {
-    expect(toolsSource).toContain('`q=${encodeURIComponent(query)}`');
+  it('uses POST method for DDG HTML search (in shared module)', () => {
+    expect(webSearchSource).toContain("method: 'POST'");
+  });
+
+  it('sends query as form-encoded body (in shared module)', () => {
+    expect(webSearchSource).toContain('`q=${encodeURIComponent(query)}`');
+  });
+
+  it('cascades through DDG Lite and Wikipedia fallbacks', () => {
+    expect(webSearchSource).toContain('lite.duckduckgo.com/lite/');
+    expect(webSearchSource).toContain('en.wikipedia.org/w/api.php');
   });
 });
 
@@ -228,16 +258,23 @@ describe('Fetch Webpage Tool', () => {
     expect(toolsSource).toContain("name: 'fetch_webpage'");
   });
 
-  it('validates URL protocol (http/https only)', () => {
-    expect(toolsSource).toContain("!['http:', 'https:'].includes(parsedUrl.protocol)");
+  it('validates URL protocol (http/https only) via safeFetch', () => {
+    // Protocol validation moved into safeFetch (src/security/ssrf.ts),
+    // which rejects non-http/https schemes and private IPs for all
+    // LLM-reachable fetches. The handler simply awaits safeFetch.
+    const section = toolsSource.substring(
+      toolsSource.indexOf("name: 'fetch_webpage'")
+    );
+    expect(section).toMatch(/await safeFetch\(url,/);
   });
 
-  it('returns error for non-http(s) protocols', () => {
-    expect(toolsSource).toContain("'error: only http and https URLs are supported'");
-  });
-
-  it('uses 10 second timeout', () => {
-    expect(toolsSource).toContain('AbortSignal.timeout(10000)');
+  it('returns SSRF-protected fetch, not a raw fetch', () => {
+    // Scope to the fetch_webpage registerTool block only.
+    const match = toolsSource.match(
+      /name: 'fetch_webpage'[\s\S]*?\n  \},\n\}\);/
+    );
+    expect(match).not.toBeNull();
+    expect(match![0]).not.toMatch(/await fetch\(url,/);
   });
 
   it('truncates content at 8000 characters', () => {
@@ -288,10 +325,11 @@ describe('View Image Tool', () => {
     expect(toolsSource).toContain('error: URL does not point to an image');
   });
 
-  it('validates URL protocol (http/https only)', () => {
-    // view_image also checks protocol
+  it('validates URL protocol + private IPs via safeFetchFollow', () => {
+    // view_image delegates full SSRF (scheme check, private-IP block,
+    // DNS pinning, redirect re-validation) to safeFetchFollow.
     const viewImageSection = toolsSource.substring(toolsSource.indexOf("name: 'view_image'"));
-    expect(viewImageSection).toContain("!['http:', 'https:'].includes(parsed.protocol)");
+    expect(viewImageSection).toMatch(/await safeFetchFollow\(url,/);
   });
 });
 
@@ -378,7 +416,8 @@ describe('isPathAllowed Security', () => {
   });
 
   it('computes relative path from repo root', () => {
-    expect(toolsSource).toContain('const relativePath = relative(LAIN_REPO_PATH, normalizedPath)');
+    // P2:1831 — computed against the realpath-resolved form so symlinks can't escape.
+    expect(toolsSource).toMatch(/const relativePath = relative\(LAIN_REPO_PATH, \w+\)/);
   });
 
   it('blocks paths outside the repo (.. traversal)', () => {
@@ -391,6 +430,14 @@ describe('isPathAllowed Security', () => {
 
   it('checks against excluded paths list', () => {
     expect(toolsSource).toContain('relativePath.includes(excluded)');
+  });
+
+  it('derives LAIN_REPO_PATH at runtime — no hardcoded developer path', () => {
+    // P1 regression (audit): previously hardcoded to /Users/apopo0308/IdeaProjects/lain,
+    // which broke every introspection tool on the production droplet
+    // (repo lives at /opt/local-lain/) and leaked the author's username.
+    expect(toolsSource).not.toContain('/Users/apopo0308');
+    expect(toolsSource).toMatch(/fileURLToPath\(new URL\('\.',\s*import\.meta\.url\)\)/);
   });
 });
 
@@ -408,17 +455,19 @@ describe('Send Letter Tool', () => {
 });
 
 // ─────────────────────────────────────────────────────────
-// 14. TELEGRAM_CALL TOOL — requiresApproval flag
+// 14. TELEGRAM_CALL TOOL — dead approval metadata removed (P1 findings.md)
 // ─────────────────────────────────────────────────────────
 describe('Telegram Call Tool', () => {
   it('is registered as a tool', () => {
     expect(toolsSource).toContain("name: 'telegram_call'");
   });
 
-  it('has requiresApproval flag set to true', () => {
-    // Check the exact pattern: requiresApproval: true appears after telegram_call definition
+  it('does not declare a dead requiresApproval flag', () => {
+    // The flag existed but executeTool never consulted it — the tool
+    // ran unattended anyway. Metadata removed; if a real approval queue
+    // is added later it must gate executeTool itself.
     const telegramSection = toolsSource.substring(toolsSource.indexOf("name: 'telegram_call'"));
-    expect(telegramSection).toContain('requiresApproval: true');
+    expect(telegramSection).not.toContain('requiresApproval');
   });
 });
 
@@ -426,36 +475,38 @@ describe('Telegram Call Tool', () => {
 // 15. HTML ENTITY DECODING — Correct entity handling
 // ─────────────────────────────────────────────────────────
 describe('HTML Entity Decoding', () => {
+  // Moved from tools.ts to the shared web-search module during the
+  // web_search fallback-chain consolidation. The decoder is the same.
   it('decodes &amp; to &', () => {
-    expect(toolsSource).toContain(".replace(/&amp;/g, '&')");
+    expect(webSearchSource).toContain(".replace(/&amp;/g, '&')");
   });
 
   it('decodes &lt; to <', () => {
-    expect(toolsSource).toContain(".replace(/&lt;/g, '<')");
+    expect(webSearchSource).toContain(".replace(/&lt;/g, '<')");
   });
 
   it('decodes &gt; to >', () => {
-    expect(toolsSource).toContain(".replace(/&gt;/g, '>')");
+    expect(webSearchSource).toContain(".replace(/&gt;/g, '>')");
   });
 
   it('decodes &quot; to "', () => {
-    expect(toolsSource).toContain('.replace(/&quot;/g, \'"\')');
+    expect(webSearchSource).toContain('.replace(/&quot;/g, \'"\')');
   });
 
   it('decodes &#x27; to single quote', () => {
-    expect(toolsSource).toContain("replace(/&#x27;/g, \"'\")");
+    expect(webSearchSource).toContain("replace(/&#x27;/g, \"'\")");
   });
 
   it('decodes &#39; to single quote', () => {
-    expect(toolsSource).toContain("replace(/&#39;/g, \"'\")");
+    expect(webSearchSource).toContain("replace(/&#39;/g, \"'\")");
   });
 
   it('decodes &nbsp; to space', () => {
-    expect(toolsSource).toContain(".replace(/&nbsp;/g, ' ')");
+    expect(webSearchSource).toContain(".replace(/&nbsp;/g, ' ')");
   });
 
   it('decodes numeric character references', () => {
-    expect(toolsSource).toContain('String.fromCharCode(parseInt(num, 10))');
+    expect(webSearchSource).toContain('String.fromCharCode(parseInt(num, 10))');
   });
 });
 
@@ -576,16 +627,19 @@ describe('Additional Tool Registration', () => {
     expect(toolsSource).toContain("name: 'expand_memory'");
   });
 
-  it('registers create_tool meta-tool', () => {
-    expect(toolsSource).toContain("name: 'create_tool'");
+  // create_tool / list_my_tools / delete_tool were removed in findings.md P1:1561.
+  // The skills.ts module handed new Function() + require + process to LLM-
+  // authored JS, making every injection vector a path to host RCE.
+  it('does NOT register the removed create_tool meta-tool (P1 findings.md:1561)', () => {
+    expect(toolsSource).not.toContain("name: 'create_tool'");
   });
 
-  it('registers list_my_tools meta-tool', () => {
-    expect(toolsSource).toContain("name: 'list_my_tools'");
+  it('does NOT register the removed list_my_tools meta-tool (P1 findings.md:1561)', () => {
+    expect(toolsSource).not.toContain("name: 'list_my_tools'");
   });
 
-  it('registers delete_tool meta-tool', () => {
-    expect(toolsSource).toContain("name: 'delete_tool'");
+  it('does NOT register the removed delete_tool meta-tool (P1 findings.md:1561)', () => {
+    expect(toolsSource).not.toContain("name: 'delete_tool'");
   });
 
   it('registers introspect_search tool', () => {

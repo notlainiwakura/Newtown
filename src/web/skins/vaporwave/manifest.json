@@ -4,9 +4,9 @@
   "description": "Magenta/cyan retrofuturism, 80s digital nostalgia",
   "fonts": { "heading": "Audiowide", "body": "VT323", "mono": "VT323" },
   "buildingIcons": {
-    "pub": "🍸", "station": "💿", "abandoned-house": "🌀", "field": "🌴",
-    "windmill": "📼", "locksmith": "🔮", "mystery-tower": "📡", "theater": "🎬", "square": "🌇"
+    "library": "📼", "bar": "🍸", "field": "🌴", "windmill": "💿",
+    "lighthouse": "📡", "school": "💾", "market": "🏬", "locksmith": "🔮", "threshold": "🌀"
   },
   "googleFontsUrl": "https://fonts.googleapis.com/css2?family=Audiowide&family=VT323&display=swap",
-  "previewColors": ["#40ffb0", "#ffd166", "#66ccff"]
+  "previewColors": ["#ff40ff", "#40ffff", "#ff8040"]
 }

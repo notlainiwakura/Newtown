@@ -86,21 +86,21 @@ describe('Conversation Path Token Limits', () => {
     }
   });
 
-  it('generateResponseWithToolsStream uses >= 8192 maxTokens', () => {
-    const fnBody = extractFunction(indexSrc, 'generateResponseWithToolsStream');
-    const tokenValues = extractMaxTokensFromCompleteWithTools(fnBody);
-    for (const val of tokenValues) {
-      expect(val, 'streaming completeWithTools maxTokens must be >= 8192').toBeGreaterThanOrEqual(MIN_CHAT_TOKENS);
-    }
+  it('generateResponseWithTools shared completionOpts uses >= 8192 maxTokens', () => {
+    // Post-dedup (findings.md P1:1707): streaming + non-streaming share one
+    // completionOpts object that is passed to completeWithTools,
+    // completeWithToolsStream, continueWithToolResults, and
+    // continueWithToolResultsStream. Verify the shared object has >= 8192.
+    const fnBody = extractFunction(indexSrc, 'generateResponseWithTools');
+    const match = fnBody.match(/completionOpts\s*=\s*\{[^}]*maxTokens:\s*(\d+)/);
+    expect(match, 'completionOpts with maxTokens must exist').not.toBeNull();
+    expect(Number(match![1])).toBeGreaterThanOrEqual(MIN_CHAT_TOKENS);
   });
 
-  it('continueWithToolResults uses >= 8192 maxTokens', () => {
-    const matches = indexSrc.matchAll(/continueWithToolResults\w*\(\s*\{[^}]*maxTokens:\s*(\d+)/g);
-    const values = [...matches].map(m => Number(m[1]));
-    expect(values.length).toBeGreaterThan(0);
-    for (const val of values) {
-      expect(val, 'continueWithToolResults maxTokens must be >= 8192').toBeGreaterThanOrEqual(MIN_CHAT_TOKENS);
-    }
+  it('continueWithToolResults is invoked with the shared completionOpts', () => {
+    const fnBody = extractFunction(indexSrc, 'generateResponseWithTools');
+    expect(fnBody).toMatch(/continueWithToolResults\s*\(\s*completionOpts/);
+    expect(fnBody).toMatch(/continueWithToolResultsStream\s*\(\s*completionOpts/);
   });
 
   it('summary fallback uses >= 2048 maxTokens', () => {
@@ -135,10 +135,12 @@ describe('Conversation Path Token Limits', () => {
 // ─────────────────────────────────────────────────────────
 describe('Truncation Detection', () => {
   it('main agent pipeline checks finishReason after tool loop', () => {
+    // Post-dedup (findings.md P1:1707): streaming and non-streaming share one
+    // generateResponseWithTools, so the single check covers both paths.
     const src = readFileSync(join(process.cwd(), 'src/agent/index.ts'), 'utf-8');
     const checks = src.match(/finishReason\s*===?\s*['"]length['"]/g);
-    expect(checks, 'must check finishReason === "length" somewhere').not.toBeNull();
-    expect(checks!.length).toBeGreaterThanOrEqual(2);
+    expect(checks, 'must check finishReason === "length" in agent pipeline').not.toBeNull();
+    expect(checks!.length).toBeGreaterThanOrEqual(1);
   });
 
   it('truncation logs a warning', () => {
@@ -268,45 +270,59 @@ describe('No Dangerously Low Token Limits on Long-Form Content', () => {
 // 6. CONFIG VALIDATION — Schema must catch dangerous configs
 // ─────────────────────────────────────────────────────────
 describe('Config Validation', () => {
-  it('schema requires at least one provider per agent', async () => {
-    const { getSchema } = await import('../src/config/schema.js');
-    const schema = getSchema();
-    const agentItems = schema.properties.agents.items;
-    const providersSchema = agentItems.properties.providers;
-    expect(providersSchema.minItems).toBeGreaterThanOrEqual(1);
+  // findings.md P2:171 — provider validation moved to the character
+  // manifest; the three tests below assert the manifest schema catches
+  // the same classes of dangerous configuration the old lain.json5
+  // `agents` schema caught.
+  it('manifest schema requires at least one provider per character when declared', async () => {
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    const manifest = {
+      town: { name: 'T', description: 't' },
+      characters: [{
+        id: 'x', name: 'X', port: 3000, server: 'character',
+        defaultLocation: 'bar', workspace: 'workspace/characters/x',
+        providers: [],
+      }],
+    };
+    expect(() => validateManifest(manifest, 'test')).toThrow();
   });
 
-  it('schema requires provider type to be a known enum', async () => {
-    const { getSchema } = await import('../src/config/schema.js');
-    const schema = getSchema();
-    const providerSchema = schema.properties.agents.items.properties.providers.items;
-    expect(providerSchema.properties.type.enum).toContain('anthropic');
-    expect(providerSchema.properties.type.enum).toContain('openai');
-    expect(providerSchema.properties.type.enum).toContain('google');
+  it('manifest schema requires provider type to be a known enum', async () => {
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    const manifest = {
+      town: { name: 'T', description: 't' },
+      characters: [{
+        id: 'x', name: 'X', port: 3000, server: 'character',
+        defaultLocation: 'bar', workspace: 'workspace/characters/x',
+        providers: [{ type: 'mistral', model: 'test' }],
+      }],
+    };
+    expect(() => validateManifest(manifest, 'test')).toThrow();
   });
 
-  it('schema requires model field on providers', async () => {
-    const { getSchema } = await import('../src/config/schema.js');
-    const schema = getSchema();
-    const providerSchema = schema.properties.agents.items.properties.providers.items;
-    expect(providerSchema.required).toContain('model');
+  it('manifest schema requires model field on providers', async () => {
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    const manifest = {
+      town: { name: 'T', description: 't' },
+      characters: [{
+        id: 'x', name: 'X', port: 3000, server: 'character',
+        defaultLocation: 'bar', workspace: 'workspace/characters/x',
+        providers: [{ type: 'anthropic' }],
+      }],
+    };
+    expect(() => validateManifest(manifest, 'test')).toThrow();
   });
 
-  it('default config has 3 provider tiers', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    const config = getDefaultConfig();
-    const agent = config.agents[0]!;
-    expect(agent.providers.length).toBe(3);
+  it('DEFAULT_PROVIDERS has 3 tiers', async () => {
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    expect(DEFAULT_PROVIDERS.length).toBe(3);
   });
 
-  it('default config uses valid provider types', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    const config = getDefaultConfig();
+  it('DEFAULT_PROVIDERS uses valid provider types', async () => {
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
     const validTypes = ['anthropic', 'openai', 'google'];
-    for (const agent of config.agents) {
-      for (const provider of agent.providers) {
-        expect(validTypes).toContain(provider.type);
-      }
+    for (const provider of DEFAULT_PROVIDERS) {
+      expect(validTypes).toContain(provider.type);
     }
   });
 
@@ -342,7 +358,9 @@ describe('Budget System', () => {
   it('all providers are wrapped with budget enforcement', () => {
     const src = readFileSync(join(process.cwd(), 'src/providers/index.ts'), 'utf-8');
     expect(src).toContain('withBudget');
-    expect(src).toContain('checkBudget');
+    // findings.md P2:1126 — withBudget now calls enforceBudget (async)
+    // which wraps both the monthly hard cap and the daily throttle.
+    expect(src).toContain('enforceBudget');
     expect(src).toContain('recordUsage');
   });
 });
@@ -357,9 +375,13 @@ describe('Environment Variable Safety', () => {
     expect(src).toContain('homedir()');
   });
 
-  it('LAIN_CHARACTER_NAME has a fallback', () => {
-    const src = readFileSync(join(process.cwd(), 'src/config/defaults.ts'), 'utf-8');
-    expect(src).toMatch(/process\.env\['LAIN_CHARACTER_NAME'\]\s*\|\|/);
+  it('LAIN_CHARACTER_NAME fails closed (no silent "Lain" fallback)', () => {
+    // findings.md P2:2271 — the silent `|| 'Lain'` fallback was deliberately
+    // removed because it mis-identified every non-Lain character when the
+    // env wasn't set. requireCharacterName() now throws instead.
+    const src = readFileSync(join(process.cwd(), 'src/config/characters.ts'), 'utf-8');
+    expect(src).toContain('LAIN_CHARACTER_NAME is not set');
+    expect(src).toMatch(/throw\s+new\s+Error/);
   });
 
   it('owner auth checks for LAIN_OWNER_TOKEN', () => {
@@ -368,8 +390,15 @@ describe('Environment Variable Safety', () => {
   });
 
   it('interlink token is checked before use', () => {
-    const serverSrc = readFileSync(join(process.cwd(), 'src/web/server.ts'), 'utf-8');
-    expect(serverSrc).toContain('LAIN_INTERLINK_TOKEN');
+    // findings.md P1:2289 — auth now lives in src/security/interlink-auth.ts.
+    // The master LAIN_INTERLINK_TOKEN is checked there (returns 503 when
+    // unset rather than silently allowing unauth'd interlink traffic).
+    const interlinkSrc = readFileSync(
+      join(process.cwd(), 'src/security/interlink-auth.ts'),
+      'utf-8',
+    );
+    expect(interlinkSrc).toContain('LAIN_INTERLINK_TOKEN');
+    expect(interlinkSrc).toContain('Interlink not configured');
   });
 });
 

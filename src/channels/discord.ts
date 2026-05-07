@@ -22,6 +22,11 @@ export interface DiscordConfig extends ChannelConfig {
   allowedGuilds?: string[];
   allowedChannels?: string[];
   respondToBots?: boolean;
+  /**
+   * Opt-in to public mode: when no allowlists are set, incoming messages
+   * are denied unless this is `true`.
+   */
+  public?: boolean;
 }
 
 export class DiscordChannel extends BaseChannel {
@@ -45,6 +50,24 @@ export class DiscordChannel extends BaseChannel {
     }
 
     logger.info({ channelId: this.id }, 'Connecting Discord bot');
+
+    const emptyAllowlists =
+      !this.config.allowedUsers?.length &&
+      !this.config.allowedGuilds?.length &&
+      !this.config.allowedChannels?.length;
+    if (emptyAllowlists) {
+      if (this.config.public === true) {
+        logger.warn(
+          { channelId: this.id },
+          'Discord channel running in PUBLIC mode — every user in reachable guilds/DMs can message this bot',
+        );
+      } else {
+        logger.warn(
+          { channelId: this.id },
+          'Discord channel has empty allowlists and public !== true — all incoming messages will be rejected. Set public: true or populate allowedUsers/allowedGuilds/allowedChannels.',
+        );
+      }
+    }
 
     this.client = new Client({
       intents: [
@@ -154,13 +177,14 @@ export class DiscordChannel extends BaseChannel {
   }
 
   private isAllowed(msg: DiscordMessage): boolean {
-    // If no restrictions, allow all
+    // Empty allowlists are fail-closed by default. Only allow all when
+    // the operator has explicitly set `public: true`.
     if (
       !this.config.allowedUsers?.length &&
       !this.config.allowedGuilds?.length &&
       !this.config.allowedChannels?.length
     ) {
-      return true;
+      return this.config.public === true;
     }
 
     // Check user whitelist

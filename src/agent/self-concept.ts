@@ -13,6 +13,7 @@ import { searchMemories, saveMemory } from '../memory/store.js';
 import { getLogger } from '../utils/logger.js';
 import { getMeta, setMeta } from '../storage/database.js';
 import { getBasePath } from '../config/paths.js';
+import { requireCharacterName } from '../config/characters.js';
 
 export interface SelfConceptConfig {
   intervalMs: number;
@@ -223,7 +224,7 @@ export async function runSelfConceptSynthesis(): Promise<void> {
         10,
         0.1,
         undefined,
-        { sortBy: 'importance' }
+        { sortBy: 'importance', skipAccessBoost: true }
       );
       memoriesContext = memories
         .map((r) => `- ${r.memory.content}`)
@@ -241,7 +242,7 @@ export async function runSelfConceptSynthesis(): Promise<void> {
       5,
       0.1,
       undefined,
-      { memoryTypes: ['episode'], sortBy: 'recency' }
+      { memoryTypes: ['episode'], sortBy: 'recency', skipAccessBoost: true }
     );
     const browseResults = discoveries.filter(
       (r) => r.memory.sessionKey === 'curiosity:browse'
@@ -265,7 +266,8 @@ export async function runSelfConceptSynthesis(): Promise<void> {
   const previousConcept = getMeta('self-concept:current') ?? null;
 
   // Character identity
-  const characterName = process.env['LAIN_CHARACTER_NAME'] || 'Newtown';
+  // findings.md P2:2271 — fail-closed; see requireCharacterName.
+  const characterName = requireCharacterName();
   const soulContext = getAgent('default')?.persona?.soul || '';
 
   const previousConceptSection = previousConcept

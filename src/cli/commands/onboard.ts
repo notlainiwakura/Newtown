@@ -127,11 +127,30 @@ export async function onboard(): Promise<void> {
 
   // Copy workspace files
   displaySection('Workspace');
-  const sourceWorkspace = join(process.cwd(), 'workspace');
-  try {
-    await copyWorkspaceFiles(sourceWorkspace, paths.workspace);
-  } catch (error) {
-    displayInfo(`Workspace files not copied: ${error}`);
+
+  // findings.md P2:78 — when a characters.json exists, the source workspace
+  // directory no longer contains top-level SOUL.md/AGENTS.md/IDENTITY.md —
+  // those files live under `workspace/characters/<id>/`. The old
+  // copyWorkspaceFiles() silently skipped every file and then reported
+  // "Lain is ready", leaving the target workspace empty. Detect the
+  // multi-char layout and point the operator at the real setup path
+  // instead of claiming success on an empty copy.
+  const { getManifestPath, getAllCharacters } = await import('../../config/characters.js');
+  const manifestPath = getManifestPath();
+  if (manifestPath) {
+    const characters = getAllCharacters();
+    displayInfo(`Multi-char town detected (${manifestPath}, ${characters.length} characters).`);
+    displayInfo(
+      'Workspace files live under workspace/characters/<id>/ per character. ' +
+        'Edit characters.json and create SOUL.md/AGENTS.md/IDENTITY.md under the matching workspace/ subdir. See SETUP.md.',
+    );
+  } else {
+    const sourceWorkspace = join(process.cwd(), 'workspace');
+    try {
+      await copyWorkspaceFiles(sourceWorkspace, paths.workspace);
+    } catch (error) {
+      displayInfo(`Workspace files not copied: ${error}`);
+    }
   }
 
   // Initialize database
@@ -153,8 +172,14 @@ export async function onboard(): Promise<void> {
       displayInfo(`Token: ${token}`);
       displayInfo('Store this token securely - you will need it to connect');
     } catch (error) {
+      // findings.md P2:105 — the previous guidance pointed at a
+      // `lain token generate` subcommand that does not exist. Onboard is
+      // the only code path that generates the auth token, so direct the
+      // user back here once the keychain is accessible again.
       displayError(`Failed to generate token: ${error}`);
-      displayInfo('You can generate a token later with: lain token generate');
+      displayInfo(
+        'Check keychain access (macOS: unlock login keychain; Linux: start libsecret/gnome-keyring) and re-run `lain onboard`.',
+      );
     }
   }
 

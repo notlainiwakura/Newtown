@@ -228,14 +228,40 @@ describe('Memory Extraction (src/memory/extraction.ts)', () => {
       expect(ids).toEqual([]);
     });
 
-    it('returns empty array when provider returns no JSON array', async () => {
+    // findings.md P2:511 — parse failures used to be silently
+    // swallowed to []. Now they throw `ExtractionParseError` so the
+    // caller can distinguish "LLM returned garbage" from
+    // "extraction worked and found nothing interesting".
+    it('findings.md P2:511 — throws ExtractionParseError when provider returns no JSON array', async () => {
       const { extractMemories } = await import('../src/memory/extraction.js');
+      const { ExtractionParseError } = await import('../src/utils/errors.js');
       const provider = makeMockProvider({ completeResponse: 'No memories to extract.' });
       const messages = [
         { id: '1', sessionKey: 's:1', userId: null, role: 'user' as const, content: 'hello', timestamp: Date.now(), metadata: {} },
       ];
-      const ids = await extractMemories(provider as any, messages, 's:1');
-      expect(ids).toEqual([]);
+      await expect(extractMemories(provider as any, messages, 's:1'))
+        .rejects.toBeInstanceOf(ExtractionParseError);
+      await expect(extractMemories(provider as any, messages, 's:1'))
+        .rejects.toThrow(/no JSON array/i);
+    });
+
+    it('findings.md P2:511 — ExtractionParseError carries raw response preview for debugging', async () => {
+      const { extractMemories } = await import('../src/memory/extraction.js');
+      const { ExtractionParseError } = await import('../src/utils/errors.js');
+      const raw = 'LLM-produced prose that mentions nothing parseable at all.';
+      const provider = makeMockProvider({ completeResponse: raw });
+      const messages = [
+        { id: '1', sessionKey: 's:1', userId: null, role: 'user' as const, content: 'hello', timestamp: Date.now(), metadata: {} },
+      ];
+      try {
+        await extractMemories(provider as any, messages, 's:1');
+        expect.fail('should have thrown ExtractionParseError');
+      } catch (err) {
+        expect(err).toBeInstanceOf(ExtractionParseError);
+        const e = err as InstanceType<typeof ExtractionParseError>;
+        expect(e.rawResponse).toBe(raw);
+        expect(e.code).toBe('EXTRACTION_PARSE_ERROR');
+      }
     });
 
     it('clamps importance to [0, 1]', async () => {
@@ -416,14 +442,24 @@ describe('Memory Extraction (src/memory/extraction.ts)', () => {
       expect(ids).toEqual([]);
     });
 
-    it('returns empty array on malformed JSON', async () => {
+    // findings.md P2:511 — malformed JSON inside a seemingly-valid
+    // bracket span used to be silently swallowed. Now it throws
+    // ExtractionParseError with the raw response attached so the
+    // caller can retry or log for later inspection. The regex pulls
+    // `[` ... `]` out of the response first, so to exercise the
+    // JSON.parse branch (rather than the no-brackets branch) we need
+    // a response that includes both brackets but invalid contents.
+    it('findings.md P2:511 — throws ExtractionParseError on malformed JSON inside brackets', async () => {
       const { extractMemories } = await import('../src/memory/extraction.js');
-      const provider = makeMockProvider({ completeResponse: '[{invalid json' });
+      const { ExtractionParseError } = await import('../src/utils/errors.js');
+      const provider = makeMockProvider({ completeResponse: '[{invalid: json}]' });
       const messages = [
         { id: '1', sessionKey: 's:1', userId: null, role: 'user' as const, content: 'hello', timestamp: Date.now(), metadata: {} },
       ];
-      const ids = await extractMemories(provider as any, messages, 's:1');
-      expect(ids).toEqual([]);
+      await expect(extractMemories(provider as any, messages, 's:1'))
+        .rejects.toBeInstanceOf(ExtractionParseError);
+      await expect(extractMemories(provider as any, messages, 's:1'))
+        .rejects.toThrow(/JSON\.parse failed/i);
     });
 
     it('stores metadata with extractedFrom and messageCount', async () => {
@@ -442,6 +478,115 @@ describe('Memory Extraction (src/memory/extraction.ts)', () => {
       const mem = getMemory(ids[0]!);
       expect(mem!.metadata.extractedFrom).toBe('s:meta');
       expect(mem!.metadata.messageCount).toBe(2);
+    });
+
+    it('findings.md P2:549 — populates sourceMessageId with the last message id in the batch', async () => {
+      const { extractMemories } = await import('../src/memory/extraction.js');
+      const { getMemory } = await import('../src/memory/store.js');
+      const provider = makeMockProvider({
+        completeResponse: JSON.stringify([
+          { content: 'First memory', type: 'fact', importance: 0.5, emotionalWeight: 0 },
+          { content: 'Second memory', type: 'preference', importance: 0.5, emotionalWeight: 0 },
+        ]),
+      });
+      const messages = [
+        { id: 'msg-alpha', sessionKey: 's:src', userId: null, role: 'user' as const, content: 'hi', timestamp: Date.now(), metadata: {} },
+        { id: 'msg-beta', sessionKey: 's:src', userId: null, role: 'assistant' as const, content: 'hey', timestamp: Date.now(), metadata: {} },
+        { id: 'msg-gamma', sessionKey: 's:src', userId: null, role: 'user' as const, content: 'bye', timestamp: Date.now(), metadata: {} },
+      ];
+      const ids = await extractMemories(provider as any, messages, 's:src');
+      expect(ids).toHaveLength(2);
+      // Every memory in the batch carries the LAST message's id as its
+      // source watermark — the fix replaces unconditional null.
+      for (const id of ids) {
+        const mem = getMemory(id);
+        expect(mem?.sourceMessageId).toBe('msg-gamma');
+      }
+    });
+
+    it('findings.md P2:539 — second call with identical messages skips LLM and returns empty ids', async () => {
+      const { extractMemories } = await import('../src/memory/extraction.js');
+      const provider = makeMockProvider({
+        completeResponse: JSON.stringify([
+          { content: 'Watermarked fact', type: 'fact', importance: 0.5, emotionalWeight: 0 },
+        ]),
+      });
+      const messages = [
+        { id: 'wm-1', sessionKey: 's:wm', userId: null, role: 'user' as const, content: 'hello', timestamp: Date.now(), metadata: {} },
+        { id: 'wm-2', sessionKey: 's:wm', userId: null, role: 'assistant' as const, content: 'hi', timestamp: Date.now(), metadata: {} },
+      ];
+      const firstIds = await extractMemories(provider as any, messages, 's:wm');
+      expect(firstIds).toHaveLength(1);
+      expect(provider.complete).toHaveBeenCalledTimes(1);
+
+      // Second call with the SAME messages must skip LLM and return no ids.
+      const secondIds = await extractMemories(provider as any, messages, 's:wm');
+      expect(secondIds).toEqual([]);
+      expect(provider.complete).toHaveBeenCalledTimes(1); // unchanged
+    });
+
+    it('findings.md P2:539 — appended message invalidates watermark and re-runs extraction', async () => {
+      const { extractMemories } = await import('../src/memory/extraction.js');
+      const provider = makeMockProvider({
+        completeResponse: JSON.stringify([
+          { content: 'Next fact', type: 'fact', importance: 0.5, emotionalWeight: 0 },
+        ]),
+      });
+      const base = [
+        { id: 'wm2-1', sessionKey: 's:wm2', userId: null, role: 'user' as const, content: 'a', timestamp: Date.now(), metadata: {} },
+        { id: 'wm2-2', sessionKey: 's:wm2', userId: null, role: 'assistant' as const, content: 'b', timestamp: Date.now(), metadata: {} },
+      ];
+      await extractMemories(provider as any, base, 's:wm2');
+      expect(provider.complete).toHaveBeenCalledTimes(1);
+
+      const extended = [
+        ...base,
+        { id: 'wm2-3', sessionKey: 's:wm2', userId: null, role: 'user' as const, content: 'c', timestamp: Date.now(), metadata: {} },
+      ];
+      const extendedIds = await extractMemories(provider as any, extended, 's:wm2');
+      expect(extendedIds).toHaveLength(1);
+      // Watermark changed (count + last id) → LLM was called again.
+      expect(provider.complete).toHaveBeenCalledTimes(2);
+    });
+
+    it('findings.md P2:539 — watermarks are per-session (different sessionKey triggers LLM call)', async () => {
+      const { extractMemories } = await import('../src/memory/extraction.js');
+      const provider = makeMockProvider({
+        completeResponse: JSON.stringify([
+          { content: 'Per-session fact', type: 'fact', importance: 0.5, emotionalWeight: 0 },
+        ]),
+      });
+      const messages = [
+        { id: 'wm3-1', sessionKey: 'ignored', userId: null, role: 'user' as const, content: 'x', timestamp: Date.now(), metadata: {} },
+      ];
+      await extractMemories(provider as any, messages, 's:alpha');
+      await extractMemories(provider as any, messages, 's:beta');
+      // Different sessionKey → different watermark key → LLM runs twice.
+      expect(provider.complete).toHaveBeenCalledTimes(2);
+    });
+
+    it('findings.md P2:539 — computeExtractionWatermark hash is stable for identical input, differs when any input changes', async () => {
+      const { computeExtractionWatermark } = await import('../src/memory/extraction.js');
+      const m1 = { id: 'a', sessionKey: 's', userId: null, role: 'user' as const, content: 'x', timestamp: 0, metadata: {} };
+      const m2 = { id: 'b', sessionKey: 's', userId: null, role: 'user' as const, content: 'y', timestamp: 0, metadata: {} };
+      const h = computeExtractionWatermark('s', [m1, m2]);
+      expect(h).toBe(computeExtractionWatermark('s', [m1, m2]));
+      expect(h).not.toBe(computeExtractionWatermark('s', [m1])); // count differs
+      expect(h).not.toBe(computeExtractionWatermark('other', [m1, m2])); // session differs
+      const m2b = { ...m2, id: 'bb' };
+      expect(h).not.toBe(computeExtractionWatermark('s', [m1, m2b])); // last id differs
+    });
+
+    it('findings.md P2:549 — sourceMessageId is null when the messages array is empty (no-op path)', async () => {
+      // extractMemories already returns early on empty messages before
+      // ever touching the LLM, so this is really a defensive assertion
+      // that the empty-array short-circuit still fires and we don't
+      // accidentally crash reading messages[-1].id.
+      const { extractMemories } = await import('../src/memory/extraction.js');
+      const provider = makeMockProvider();
+      const result = await extractMemories(provider as any, [], 's:empty');
+      expect(result).toEqual([]);
+      expect(provider.complete).not.toHaveBeenCalled();
     });
 
     it('stores lifecycle state as seed', async () => {
@@ -673,7 +818,7 @@ describe('Memory Extraction (src/memory/extraction.ts)', () => {
       ];
       await summarizeConversation(provider as any, messages, 's:1');
       const callArgs = provider.complete.mock.calls[0]![0];
-      expect(callArgs.maxTokens).toBe(512);
+      expect(callArgs.maxTokens).toBe(1024);
       expect(callArgs.temperature).toBe(0.3);
       expect(callArgs.enableCaching).toBe(true);
     });
@@ -933,9 +1078,10 @@ describe('Doctor Server (src/web/doctor-server.ts)', () => {
   describe('Owner auth integration', () => {
     it('isOwner returns false when LAIN_OWNER_TOKEN is not set', async () => {
       const { isOwner } = await import('../src/web/owner-auth.js');
+      const { makeV2Cookie } = await import('./fixtures/owner-cookie-v2.js');
       const originalToken = process.env['LAIN_OWNER_TOKEN'];
       delete process.env['LAIN_OWNER_TOKEN'];
-      const mockReq = { headers: { cookie: 'lain_owner=abc123' } } as any;
+      const mockReq = { headers: { cookie: makeV2Cookie('test-token') } } as any;
       expect(isOwner(mockReq)).toBe(false);
       if (originalToken) process.env['LAIN_OWNER_TOKEN'] = originalToken;
     });
@@ -950,32 +1096,32 @@ describe('Doctor Server (src/web/doctor-server.ts)', () => {
       else delete process.env['LAIN_OWNER_TOKEN'];
     });
 
-    it('isOwner returns true with valid cookie', async () => {
-      const { isOwner, deriveOwnerCookie } = await import('../src/web/owner-auth.js');
+    it('isOwner returns true with valid v2 cookie', async () => {
+      const { isOwner } = await import('../src/web/owner-auth.js');
+      const { makeV2Cookie } = await import('./fixtures/owner-cookie-v2.js');
       const originalToken = process.env['LAIN_OWNER_TOKEN'];
       process.env['LAIN_OWNER_TOKEN'] = 'test-token';
-      const validCookie = deriveOwnerCookie('test-token');
-      const mockReq = { headers: { cookie: `lain_owner=${validCookie}` } } as any;
+      const mockReq = { headers: { cookie: makeV2Cookie('test-token') } } as any;
       expect(isOwner(mockReq)).toBe(true);
       if (originalToken) process.env['LAIN_OWNER_TOKEN'] = originalToken;
       else delete process.env['LAIN_OWNER_TOKEN'];
     });
 
-    it('isOwner returns false with invalid cookie', async () => {
+    it('isOwner returns false with malformed cookie', async () => {
       const { isOwner } = await import('../src/web/owner-auth.js');
       const originalToken = process.env['LAIN_OWNER_TOKEN'];
       process.env['LAIN_OWNER_TOKEN'] = 'test-token';
-      const mockReq = { headers: { cookie: 'lain_owner=invalid' } } as any;
+      const mockReq = { headers: { cookie: 'lain_owner_v2=invalid' } } as any;
       expect(isOwner(mockReq)).toBe(false);
       if (originalToken) process.env['LAIN_OWNER_TOKEN'] = originalToken;
       else delete process.env['LAIN_OWNER_TOKEN'];
     });
 
-    it('isOwner returns false with cookie length mismatch', async () => {
+    it('isOwner rejects legacy v1 cookies outright', async () => {
       const { isOwner } = await import('../src/web/owner-auth.js');
       const originalToken = process.env['LAIN_OWNER_TOKEN'];
       process.env['LAIN_OWNER_TOKEN'] = 'test-token';
-      const mockReq = { headers: { cookie: 'lain_owner=ab' } } as any;
+      const mockReq = { headers: { cookie: 'lain_owner=' + 'a'.repeat(64) } } as any;
       expect(isOwner(mockReq)).toBe(false);
       if (originalToken) process.env['LAIN_OWNER_TOKEN'] = originalToken;
       else delete process.env['LAIN_OWNER_TOKEN'];
@@ -1219,14 +1365,15 @@ TARGET: Alice`;
       // With 6+ active, spawnDesireFromVisitor would return null before calling provider
     });
 
-    it('getDesireContext formats desires correctly', async () => {
+    it('getDesireContext formats desires correctly — findings.md P2:2281', async () => {
       const { ensureDesireTable, createDesire, getDesireContext } = await import('../src/agent/desires.js');
       ensureDesireTable();
       createDesire({ type: 'social', description: 'talk to someone', source: 'test', intensity: 0.8 });
       const ctx = getDesireContext();
       expect(ctx).toContain('## Current Desires');
-      expect(ctx).toContain('strongly want');
-      expect(ctx).toContain('talk to someone');
+      // P2:2281 replaced the "You strongly want:" imperative with quoted labelled data.
+      expect(ctx).toContain('[pull: strong]');
+      expect(ctx).toContain('"talk to someone"');
     });
 
     it('getDesireContext returns empty string when no desires', async () => {
@@ -1236,12 +1383,12 @@ TARGET: Alice`;
       expect(ctx).toBe('');
     });
 
-    it('getDesireContext uses intensity labels (faintly, somewhat, strongly)', async () => {
+    it('getDesireContext uses intensity labels (faint, moderate, strong) — findings.md P2:2281', async () => {
       const { ensureDesireTable, createDesire, getDesireContext } = await import('../src/agent/desires.js');
       ensureDesireTable();
       createDesire({ type: 'emotional', description: 'faint desire', source: 'test', intensity: 0.2 });
       const ctx = getDesireContext();
-      expect(ctx).toContain('faintly');
+      expect(ctx).toContain('[pull: faint]');
     });
 
     it('resolveDesire marks desire as resolved', async () => {
@@ -2125,6 +2272,117 @@ describe('Migration Scripts', () => {
     await cleanup();
   });
 
+  describe('Migration script guards (findings.md P1-latent:2898)', () => {
+    // These scripts previously fell back to ~/.lain when LAIN_HOME was unset,
+    // silently migrating Lain's production DB when the operator forgot to
+    // set the per-character env var. Both scripts now refuse and log the
+    // resolved DB path.
+    it('run-kg-migration refuses to run without LAIN_HOME', async () => {
+      const { readFileSync } = await import('node:fs');
+      const src = readFileSync('src/scripts/run-kg-migration.ts', 'utf-8');
+      expect(src).toContain("process.env['LAIN_HOME']");
+      expect(src).toContain('Refusing to run');
+      expect(src).toContain('Resolved database');
+      expect(src).not.toMatch(/LAIN_HOME['"\]]\s*\?\?\s*['"]~\/\.lain['"]/);
+    });
+
+    it('run-palace-migration refuses to run without LAIN_HOME', async () => {
+      const { readFileSync } = await import('node:fs');
+      const src = readFileSync('src/scripts/run-palace-migration.ts', 'utf-8');
+      expect(src).toContain("process.env['LAIN_HOME']");
+      expect(src).toContain('Refusing to run');
+      expect(src).toContain('Resolved database');
+      expect(src).not.toMatch(/LAIN_HOME['"\]]\s*\?\?\s*['"]~\/\.lain['"]/);
+    });
+  });
+
+  describe('Migration script DB backup (findings.md P2:2916)', () => {
+    // migration.ts mutates per-row non-transactionally; a SIGKILL mid-run can
+    // leave a half-migrated DB with no rollback. Both scripts must now copy the
+    // DB to <path>.pre-migration-<ts>.db before any write and print the restore
+    // command.
+    it('run-kg-migration copies DB to pre-migration-<timestamp>.db before mutating', async () => {
+      const { readFileSync } = await import('node:fs');
+      const src = readFileSync('src/scripts/run-kg-migration.ts', 'utf-8');
+      expect(src).toContain('copyFileSync');
+      expect(src).toContain('pre-migration-');
+      expect(src).toContain('Backup created');
+      expect(src).toContain('Restore with');
+    });
+
+    it('run-palace-migration copies DB to pre-migration-<timestamp>.db before mutating', async () => {
+      const { readFileSync } = await import('node:fs');
+      const src = readFileSync('src/scripts/run-palace-migration.ts', 'utf-8');
+      expect(src).toContain('copyFileSync');
+      expect(src).toContain('pre-migration-');
+      expect(src).toContain('Backup created');
+      expect(src).toContain('Restore with');
+    });
+
+    it('both scripts back up BEFORE calling initDatabase', async () => {
+      // Order matters: SQLite may hold open handles after initDatabase(), and a
+      // copy while the process is writing is a torn file. Back up first, open
+      // second.
+      const { readFileSync } = await import('node:fs');
+      for (const file of ['src/scripts/run-kg-migration.ts', 'src/scripts/run-palace-migration.ts']) {
+        const src = readFileSync(file, 'utf-8');
+        const copyIdx = src.indexOf('copyFileSync');
+        const initIdx = src.indexOf('initDatabase()');
+        expect(copyIdx).toBeGreaterThan(0);
+        expect(initIdx).toBeGreaterThan(0);
+        expect(copyIdx).toBeLessThan(initIdx);
+      }
+    });
+  });
+
+  describe('Migration per-row error detail (findings.md P2:2928)', () => {
+    // Prior to this fix, per-row failures were only logged; operators had to
+    // scrape logs to identify which memory IDs failed. Both runner scripts must
+    // now write <LAIN_HOME>/migration-errors-<timestamp>.json and print the path.
+    it('migrateMemoriesToPalace stats include errorDetails array', async () => {
+      const { migrateMemoriesToPalace } = await import('../src/memory/migration.js');
+      const stats = await migrateMemoriesToPalace();
+      expect(stats.errorDetails).toBeDefined();
+      expect(Array.isArray(stats.errorDetails)).toBe(true);
+    });
+
+    it('migrateAssociationsToKG stats include errorDetails array', async () => {
+      const { migrateAssociationsToKG } = await import('../src/memory/migration.js');
+      const stats = migrateAssociationsToKG();
+      expect(stats.errorDetails).toBeDefined();
+      expect(Array.isArray(stats.errorDetails)).toBe(true);
+    });
+
+    it('run-palace-migration writes migration-errors-<ts>.json on partial failure', async () => {
+      const { readFileSync } = await import('node:fs');
+      const src = readFileSync('src/scripts/run-palace-migration.ts', 'utf-8');
+      expect(src).toContain('writeFileSync');
+      expect(src).toContain('migration-errors-');
+      expect(src).toMatch(/stats\.errors\s*>\s*0/);
+      expect(src).toContain('stats.errorDetails');
+    });
+
+    it('run-kg-migration writes migration-errors-<ts>.json on partial failure', async () => {
+      const { readFileSync } = await import('node:fs');
+      const src = readFileSync('src/scripts/run-kg-migration.ts', 'utf-8');
+      expect(src).toContain('writeFileSync');
+      expect(src).toContain('migration-errors-');
+      expect(src).toMatch(/stats\.errors\s*>\s*0/);
+      expect(src).toContain('stats.errorDetails');
+    });
+
+    it('both scripts write the error file under LAIN_HOME, not CWD', async () => {
+      // Error file must be written inside the same LAIN_HOME the script was
+      // refusing-to-run-without — otherwise running from `/opt/local-lain` with
+      // LAIN_HOME=/root/.lain-wired would sprinkle JSON into the repo.
+      const { readFileSync } = await import('node:fs');
+      for (const file of ['src/scripts/run-kg-migration.ts', 'src/scripts/run-palace-migration.ts']) {
+        const src = readFileSync(file, 'utf-8');
+        expect(src).toMatch(/join\(home,\s*[`'"]migration-errors-/);
+      }
+    });
+  });
+
   describe('KG Migration (run-kg-migration.ts pattern)', () => {
     it('migrateAssociationsToKG returns stats with zero total on empty DB', async () => {
       const { migrateAssociationsToKG } = await import('../src/memory/migration.js');
@@ -2593,48 +2851,45 @@ describe('Session Types (src/types/session.ts)', () => {
 // 7. OWNER AUTH (supplement for doctor-server coverage)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe('Owner Auth (src/web/owner-auth.ts)', () => {
-  it('deriveOwnerCookie is deterministic', async () => {
-    const { deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    const a = deriveOwnerCookie('my-token');
-    const b = deriveOwnerCookie('my-token');
-    expect(a).toBe(b);
+describe('Owner Auth (src/web/owner-auth.ts — v2 / findings.md P2:2348)', () => {
+  it('v2 signature is deterministic for fixed payload', async () => {
+    const { makeV2CookieValue } = await import('./fixtures/owner-cookie-v2.js');
+    const opts = { nonce: 'n', iat: 1 };
+    expect(makeV2CookieValue('my-token', opts)).toBe(makeV2CookieValue('my-token', opts));
   });
 
-  it('deriveOwnerCookie differs for different tokens', async () => {
-    const { deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    const a = deriveOwnerCookie('token-a');
-    const b = deriveOwnerCookie('token-b');
-    expect(a).not.toBe(b);
+  it('v2 signature differs for different tokens', async () => {
+    const { makeV2CookieValue } = await import('./fixtures/owner-cookie-v2.js');
+    const opts = { nonce: 'n', iat: 1 };
+    expect(makeV2CookieValue('token-a', opts)).not.toBe(makeV2CookieValue('token-b', opts));
   });
 
-  it('deriveOwnerCookie returns hex string', async () => {
-    const { deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    const cookie = deriveOwnerCookie('test');
-    expect(cookie).toMatch(/^[a-f0-9]+$/);
+  it('v2 cookie value matches <payload>.<sig> shape', async () => {
+    const { makeV2CookieValue } = await import('./fixtures/owner-cookie-v2.js');
+    const value = makeV2CookieValue('test');
+    expect(value).toMatch(/^[A-Za-z0-9_\-]+\.[a-f0-9]+$/);
   });
 
-  it('setOwnerCookie sets correct header', async () => {
-    const { setOwnerCookie } = await import('../src/web/owner-auth.js');
-    const headers: Record<string, string> = {};
-    const mockRes = {
-      setHeader: (key: string, value: string) => { headers[key] = value; },
-    } as any;
-    setOwnerCookie(mockRes, 'owner-tok');
-    expect(headers['Set-Cookie']).toContain('lain_owner=');
-    expect(headers['Set-Cookie']).toContain('HttpOnly');
-    expect(headers['Set-Cookie']).toContain('SameSite=Strict');
-    expect(headers['Set-Cookie']).toContain('Path=/');
-    expect(headers['Set-Cookie']).toContain('Max-Age=31536000');
+  it('owner-auth.ts declares required cookie attributes at source level', async () => {
+    // issueOwnerCookie writes a nonce row and thus requires WL+DB setup;
+    // assert the source guarantees directly to stay hermetic.
+    const { readFileSync } = await import('node:fs');
+    const src = readFileSync('src/web/owner-auth.ts', 'utf-8');
+    expect(src).toContain("const COOKIE_NAME = 'lain_owner_v2'");
+    expect(src).toContain('HttpOnly');
+    expect(src).toContain('SameSite=Strict');
+    expect(src).toContain('Path=/');
+    expect(src).toContain('Max-Age=31536000');
   });
 
   it('isOwner handles cookie among multiple cookies', async () => {
-    const { isOwner, deriveOwnerCookie } = await import('../src/web/owner-auth.js');
+    const { isOwner } = await import('../src/web/owner-auth.js');
+    const { makeV2Cookie } = await import('./fixtures/owner-cookie-v2.js');
     const originalToken = process.env['LAIN_OWNER_TOKEN'];
     process.env['LAIN_OWNER_TOKEN'] = 'multi-cookie-test';
-    const validCookie = deriveOwnerCookie('multi-cookie-test');
+    const v2 = makeV2Cookie('multi-cookie-test');
     const mockReq = {
-      headers: { cookie: `other=value; lain_owner=${validCookie}; another=thing` },
+      headers: { cookie: `other=value; ${v2}; another=thing` },
     } as any;
     expect(isOwner(mockReq)).toBe(true);
     if (originalToken) process.env['LAIN_OWNER_TOKEN'] = originalToken;
@@ -2993,7 +3248,7 @@ describe('Deeper desire engine tests', () => {
     expect(found!.intensity).toBeLessThan(0.9);
   });
 
-  it('getDesireContext includes target peer in output', async () => {
+  it('getDesireContext includes target peer in output — findings.md P2:2281', async () => {
     const { ensureDesireTable, createDesire, getDesireContext } = await import('../src/agent/desires.js');
     ensureDesireTable();
     createDesire({
@@ -3004,7 +3259,7 @@ describe('Deeper desire engine tests', () => {
       targetPeer: 'PKD',
     });
     const ctx = getDesireContext();
-    expect(ctx).toContain('about PKD');
+    expect(ctx).toContain('about: "PKD"');
   });
 
   it('getActiveDesires respects limit', async () => {

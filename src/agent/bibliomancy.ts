@@ -13,13 +13,13 @@ import { join, extname } from 'node:path';
 import { getProvider } from './index.js';
 import { getMeta, setMeta } from '../storage/database.js';
 import { getLogger } from '../utils/logger.js';
+import { getInterlinkHeaders } from '../security/interlink-auth.js';
 
 interface BibliomancyConfig {
   intervalMs: number;
   maxJitterMs: number;
   offeringsDir: string;
   targetUrl: string | null;
-  authToken: string | null;
   enabled: boolean;
 }
 
@@ -30,7 +30,6 @@ const DEFAULT_CONFIG: BibliomancyConfig = {
   maxJitterMs: 60 * 60 * 1000,          // ±1h
   offeringsDir: join(process.cwd(), 'workspace', 'offerings'),
   targetUrl: process.env['LAIN_INTERLINK_TARGET'] ?? null,
-  authToken: process.env['LAIN_INTERLINK_TOKEN'] ?? null,
   enabled: true,
 };
 
@@ -180,13 +179,15 @@ async function runBibliomancyCycle(cfg: BibliomancyConfig): Promise<void> {
   const dreamSeedUrl = new URL('/api/interlink/dream-seed', baseUrl).toString();
   const emotionalWeight = 0.4 + Math.random() * 0.3; // 0.4-0.7
 
+  const headers = getInterlinkHeaders();
+  if (!headers) {
+    logger.warn('Bibliomancy: interlink not configured, skipping delivery');
+    return;
+  }
   try {
     const response = await fetch(dreamSeedUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(cfg.authToken ? { Authorization: `Bearer ${cfg.authToken}` } : {}),
-      },
+      headers,
       body: JSON.stringify({
         content: distorted,
         emotionalWeight,

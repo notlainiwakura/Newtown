@@ -198,12 +198,16 @@ function makeDiscordMsg(overrides: Record<string, unknown> = {}) {
 describe('Telegram behavioral', () => {
   let TelegramChannel: typeof import('../src/channels/telegram.js').TelegramChannel;
 
+  // public: true so shared behavioral tests (no allowlists set) are not
+  // fail-closed by the new isAllowed default. Tests that cover the
+  // fail-closed path construct their own config without public.
   const cfg = {
     id: 'tg-beh',
     type: 'telegram' as const,
     enabled: true,
     agentId: 'agent-1',
     token: 'test-token',
+    public: true,
   };
 
   function getHandler(event: string): (ctx: any) => Promise<void> {
@@ -412,7 +416,12 @@ describe('Telegram behavioral', () => {
 
   // --- Photo/image message handling ---
 
-  it('photo message produces IncomingMessage with type=image', async () => {
+  // findings.md P2:199 — Telegram media (photo/voice/document) requires
+  // a separate getFile round-trip that we don't perform here, so the
+  // channel emits a TextContent placeholder rather than an ImageContent/
+  // AudioContent/FileContent with no url/base64.
+
+  it('photo message produces text placeholder (no getFile round-trip)', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const ch = new TelegramChannel(cfg);
     ch.setEventHandlers({ onMessage });
@@ -425,27 +434,11 @@ describe('Telegram behavioral', () => {
     await flush();
 
     const msg: IncomingMessage = onMessage.mock.calls[0][0];
-    expect(msg.content.type).toBe('image');
-    expect(msg.content).toEqual(expect.objectContaining({ mimeType: 'image/jpeg' }));
+    expect(msg.content.type).toBe('text');
+    expect((msg.content as any).text).toBe('[image attachment] cool pic');
   });
 
-  it('photo message caption is preserved', async () => {
-    const onMessage = vi.fn().mockResolvedValue(undefined);
-    const ch = new TelegramChannel(cfg);
-    ch.setEventHandlers({ onMessage });
-    mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
-    await ch.connect();
-
-    await getHandler('message:photo')(makeTelegramCtx({
-      message: { message_id: 2, caption: 'photo caption', date: 1700000000 },
-    }));
-    await flush();
-
-    const msg: IncomingMessage = onMessage.mock.calls[0][0];
-    expect((msg.content as any).caption).toBe('photo caption');
-  });
-
-  it('photo message without caption has no caption field', async () => {
+  it('photo message without caption still produces text placeholder', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const ch = new TelegramChannel(cfg);
     ch.setEventHandlers({ onMessage });
@@ -458,12 +451,13 @@ describe('Telegram behavioral', () => {
     await flush();
 
     const msg: IncomingMessage = onMessage.mock.calls[0][0];
-    expect((msg.content as any).caption).toBeUndefined();
+    expect(msg.content.type).toBe('text');
+    expect((msg.content as any).text).toBe('[image attachment]');
   });
 
   // --- Voice message handling ---
 
-  it('voice message produces IncomingMessage with type=audio', async () => {
+  it('voice message produces text placeholder (no getFile round-trip)', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const ch = new TelegramChannel(cfg);
     ch.setEventHandlers({ onMessage });
@@ -476,24 +470,25 @@ describe('Telegram behavioral', () => {
     await flush();
 
     const msg: IncomingMessage = onMessage.mock.calls[0][0];
-    expect(msg.content.type).toBe('audio');
-    expect(msg.content).toEqual(expect.objectContaining({ mimeType: 'audio/ogg' }));
+    expect(msg.content.type).toBe('text');
+    expect((msg.content as any).text).toBe('[audio attachment]');
   });
 
-  it('voice message duration is captured', async () => {
+  it('document message produces text placeholder with filename', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const ch = new TelegramChannel(cfg);
     ch.setEventHandlers({ onMessage });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await ch.connect();
 
-    await getHandler('message:voice')(makeTelegramCtx({
-      message: { message_id: 3, voice: { duration: 42 }, date: 1700000000 },
+    await getHandler('message:document')(makeTelegramCtx({
+      message: { message_id: 4, document: { mime_type: 'application/pdf', file_name: 'report.pdf' }, date: 1700000000 },
     }));
     await flush();
 
     const msg: IncomingMessage = onMessage.mock.calls[0][0];
-    expect((msg.content as any).duration).toBe(42);
+    expect(msg.content.type).toBe('text');
+    expect((msg.content as any).text).toBe('[file attachment: report.pdf]');
   });
 
   // --- Group chat vs DM ---
@@ -599,9 +594,26 @@ describe('Telegram behavioral', () => {
     expect(onMessage).not.toHaveBeenCalled();
   });
 
-  it('no restrictions -> all messages allowed', async () => {
+  it('no restrictions + no public flag -> fail-closed, message dropped', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
-    const ch = new TelegramChannel(cfg); // no allowedUsers or allowedGroups
+    // Explicitly strip the shared cfg's public flag for this test.
+    const strictCfg = { ...cfg, public: false };
+    const ch = new TelegramChannel(strictCfg);
+    ch.setEventHandlers({ onMessage });
+    mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
+    await ch.connect();
+
+    await getHandler('message:text')(makeTelegramCtx({
+      from: { id: 42, first_name: 'Anyone' },
+    }));
+    await flush();
+
+    expect(onMessage).not.toHaveBeenCalled();
+  });
+
+  it('public: true -> messages allowed even with no allowlists', async () => {
+    const onMessage = vi.fn().mockResolvedValue(undefined);
+    const ch = new TelegramChannel({ ...cfg, public: true });
     ch.setEventHandlers({ onMessage });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await ch.connect();
@@ -876,7 +888,9 @@ describe('Telegram behavioral', () => {
 
   // --- Document incoming message ---
 
-  it('document message maps to file content with correct fields', async () => {
+  // findings.md P2:199 — Telegram documents are represented as text
+  // placeholders carrying the filename (see photo/voice tests above).
+  it('document message maps to text placeholder with filename', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const ch = new TelegramChannel(cfg);
     ch.setEventHandlers({ onMessage });
@@ -894,13 +908,12 @@ describe('Telegram behavioral', () => {
 
     const msg: IncomingMessage = onMessage.mock.calls[0][0];
     expect(msg.content).toEqual({
-      type: 'file',
-      mimeType: 'text/plain',
-      filename: 'readme.txt',
+      type: 'text',
+      text: '[file attachment: readme.txt]',
     });
   });
 
-  it('document without mime_type defaults to application/octet-stream', async () => {
+  it('document without file_name falls back to generic "document" in placeholder', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const ch = new TelegramChannel(cfg);
     ch.setEventHandlers({ onMessage });
@@ -917,7 +930,7 @@ describe('Telegram behavioral', () => {
     await flush();
 
     const msg: IncomingMessage = onMessage.mock.calls[0][0];
-    expect((msg.content as any).mimeType).toBe('application/octet-stream');
+    expect((msg.content as any).text).toBe('[file attachment: document]');
   });
 
   // --- Reconnect behavior ---
@@ -1332,12 +1345,15 @@ describe('Telegram behavioral', () => {
 describe('Discord behavioral', () => {
   let DiscordChannel: typeof import('../src/channels/discord.js').DiscordChannel;
 
+  // public: true for the shared cfg so behavioral tests without explicit
+  // allowlists are not fail-closed by the new isAllowed default.
   const cfg = {
     id: 'dc-beh',
     type: 'discord' as const,
     enabled: true,
     agentId: 'agent-1',
     token: 'discord-token',
+    public: true,
   };
 
   function getMsgHandler(): (msg: any) => Promise<void> {
@@ -1774,9 +1790,22 @@ describe('Discord behavioral', () => {
     expect(onMessage).not.toHaveBeenCalled();
   });
 
-  it('no restrictions allows all messages', async () => {
+  it('no restrictions + no public flag -> fail-closed, message dropped', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
-    const ch = new DiscordChannel(cfg);
+    const strictCfg = { ...cfg, public: false };
+    const ch = new DiscordChannel(strictCfg);
+    ch.setEventHandlers({ onMessage });
+    await ch.connect();
+
+    await getMsgHandler()(makeDiscordMsg());
+    await flush();
+
+    expect(onMessage).not.toHaveBeenCalled();
+  });
+
+  it('public: true -> messages allowed even with no allowlists', async () => {
+    const onMessage = vi.fn().mockResolvedValue(undefined);
+    const ch = new DiscordChannel({ ...cfg, public: true });
     ch.setEventHandlers({ onMessage });
     await ch.connect();
 
@@ -1977,6 +2006,8 @@ describe('Discord behavioral', () => {
 describe('Slack behavioral', () => {
   let SlackChannel: typeof import('../src/channels/slack.js').SlackChannel;
 
+  // public: true for the shared cfg so behavioral tests without explicit
+  // allowlists are not fail-closed by the new isAllowed default.
   const cfg = {
     id: 'slack-beh',
     type: 'slack' as const,
@@ -1985,6 +2016,7 @@ describe('Slack behavioral', () => {
     botToken: 'xoxb-test',
     appToken: 'xapp-test',
     signingSecret: 'secret',
+    public: true,
   };
 
   function getMsgHandler(): (args: { message: any }) => Promise<void> {
@@ -2230,7 +2262,30 @@ describe('Slack behavioral', () => {
     expect(onMessage.mock.calls[0][0].content.type).toBe('audio');
   });
 
-  it('generic file attachment produces file content', async () => {
+  it('generic file with url_private produces file content', async () => {
+    const onMessage = vi.fn().mockResolvedValue(undefined);
+    const ch = new SlackChannel(cfg);
+    ch.setEventHandlers({ onMessage });
+    await ch.connect();
+
+    await getMsgHandler()({
+      message: {
+        user: 'U1', ts: '1.0', channel: 'C1', type: 'message',
+        files: [{ id: 'F3', mimetype: 'application/pdf', name: 'doc.pdf', url_private: 'https://slack/doc.pdf' }],
+      },
+    });
+    await flush();
+
+    const msg = onMessage.mock.calls[0][0];
+    expect(msg.content.type).toBe('file');
+    expect((msg.content as any).filename).toBe('doc.pdf');
+    expect((msg.content as any).url).toBe('https://slack/doc.pdf');
+  });
+
+  // findings.md P2:199 — when Slack doesn't surface url_private (and we
+  // don't fetch bytes ourselves), emit a text placeholder rather than a
+  // media content with no data pointer.
+  it('file attachment without url_private produces text placeholder', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const ch = new SlackChannel(cfg);
     ch.setEventHandlers({ onMessage });
@@ -2245,8 +2300,27 @@ describe('Slack behavioral', () => {
     await flush();
 
     const msg = onMessage.mock.calls[0][0];
-    expect(msg.content.type).toBe('file');
-    expect((msg.content as any).filename).toBe('doc.pdf');
+    expect(msg.content.type).toBe('text');
+    expect((msg.content as any).text).toBe('[file attachment: doc.pdf]');
+  });
+
+  it('image attachment without url_private produces text placeholder', async () => {
+    const onMessage = vi.fn().mockResolvedValue(undefined);
+    const ch = new SlackChannel(cfg);
+    ch.setEventHandlers({ onMessage });
+    await ch.connect();
+
+    await getMsgHandler()({
+      message: {
+        user: 'U1', ts: '1.0', channel: 'C1', type: 'message',
+        files: [{ id: 'F4', mimetype: 'image/png', name: 'img.png' }],
+      },
+    });
+    await flush();
+
+    const msg = onMessage.mock.calls[0][0];
+    expect(msg.content.type).toBe('text');
+    expect((msg.content as any).text).toBe('[image attachment]');
   });
 
   // --- send image attachment ---
@@ -2453,9 +2527,24 @@ describe('Slack behavioral', () => {
     );
   });
 
-  it('no restrictions allows all users and channels', async () => {
+  it('no restrictions + no public flag -> fail-closed, message dropped', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
-    const ch = new SlackChannel(cfg); // no allowedUsers or allowedChannels
+    const strictCfg = { ...cfg, public: false };
+    const ch = new SlackChannel(strictCfg);
+    ch.setEventHandlers({ onMessage });
+    await ch.connect();
+
+    await getMsgHandler()({
+      message: { user: 'U_ANYONE', text: 'hello', ts: '1.0', channel: 'C_ANY', type: 'message' },
+    });
+    await flush();
+
+    expect(onMessage).not.toHaveBeenCalled();
+  });
+
+  it('public: true allows all users and channels', async () => {
+    const onMessage = vi.fn().mockResolvedValue(undefined);
+    const ch = new SlackChannel({ ...cfg, public: true });
     ch.setEventHandlers({ onMessage });
     await ch.connect();
 
@@ -2488,6 +2577,8 @@ describe('Slack behavioral', () => {
 describe('Signal behavioral', () => {
   let SignalChannel: typeof import('../src/channels/signal.js').SignalChannel;
 
+  // public: true for the shared cfg so behavioral tests without explicit
+  // allowlists are not fail-closed by the new isAllowed default.
   const cfg = {
     id: 'sig-beh',
     type: 'signal' as const,
@@ -2495,6 +2586,7 @@ describe('Signal behavioral', () => {
     agentId: 'agent-1',
     socketPath: '/tmp/signal.sock',
     account: '+1234567890',
+    public: true,
   };
 
   let connectHandler: () => void;
@@ -2636,7 +2728,7 @@ describe('Signal behavioral', () => {
 
   // --- Attachment handling ---
 
-  it('image attachment produces image content', async () => {
+  it('image attachment produces text placeholder with caption', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const ch = new SignalChannel(cfg);
     ch.setEventHandlers({ onMessage });
@@ -2644,6 +2736,10 @@ describe('Signal behavioral', () => {
     connectHandler();
     await p;
 
+    // findings.md P2:199 — signal-cli writes attachments to local disk
+    // and we don't resolve them to url/base64 here, so the channel emits
+    // a TextContent placeholder instead of an ImageContent with no data
+    // pointer.
     dataHandler(Buffer.from(JSON.stringify({
       jsonrpc: '2.0',
       method: 'receive',
@@ -2660,11 +2756,11 @@ describe('Signal behavioral', () => {
     await flush();
 
     const msg = onMessage.mock.calls[0][0];
-    expect(msg.content.type).toBe('image');
-    expect((msg.content as any).caption).toBe('pic');
+    expect(msg.content.type).toBe('text');
+    expect((msg.content as any).text).toBe('[image attachment] pic');
   });
 
-  it('voice note attachment produces audio content', async () => {
+  it('voice note attachment produces text placeholder', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const ch = new SignalChannel(cfg);
     ch.setEventHandlers({ onMessage });
@@ -2687,10 +2783,12 @@ describe('Signal behavioral', () => {
     }) + '\n'));
     await flush();
 
-    expect(onMessage.mock.calls[0][0].content.type).toBe('audio');
+    const msg = onMessage.mock.calls[0][0];
+    expect(msg.content.type).toBe('text');
+    expect((msg.content as any).text).toBe('[audio attachment]');
   });
 
-  it('file attachment produces file content', async () => {
+  it('file attachment produces text placeholder with filename', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const ch = new SignalChannel(cfg);
     ch.setEventHandlers({ onMessage });
@@ -2714,8 +2812,8 @@ describe('Signal behavioral', () => {
     await flush();
 
     const msg = onMessage.mock.calls[0][0];
-    expect(msg.content.type).toBe('file');
-    expect((msg.content as any).filename).toBe('doc.pdf');
+    expect(msg.content.type).toBe('text');
+    expect((msg.content as any).text).toBe('[file attachment: doc.pdf]');
   });
 
   // --- Quote / reply ---
@@ -3039,12 +3137,15 @@ describe('Signal behavioral', () => {
 describe('WhatsApp behavioral', () => {
   let WhatsAppChannel: typeof import('../src/channels/whatsapp.js').WhatsAppChannel;
 
+  // public: true for the shared cfg so behavioral tests without explicit
+  // allowlists are not fail-closed by the new isAllowed default.
   const cfg = {
     id: 'wa-beh',
     type: 'whatsapp' as const,
     enabled: true,
     agentId: 'agent-1',
     authDir: '/tmp/wa-auth',
+    public: true,
   };
 
   let connectionUpdateHandler: (update: any) => void;
@@ -3231,7 +3332,11 @@ describe('WhatsApp behavioral', () => {
 
   // --- Media message types ---
 
-  it('imageMessage produces image content', async () => {
+  // findings.md P2:199 — Baileys delivers encrypted media that must be
+  // downloaded via downloadMediaMessage(); the channel emits a
+  // TextContent placeholder until that plumbing exists.
+
+  it('imageMessage produces text placeholder with caption', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const ch = new WhatsAppChannel(cfg);
     ch.setEventHandlers({ onMessage });
@@ -3247,11 +3352,11 @@ describe('WhatsApp behavioral', () => {
     await flush();
 
     const msg = onMessage.mock.calls[0][0];
-    expect(msg.content.type).toBe('image');
-    expect((msg.content as any).caption).toBe('photo');
+    expect(msg.content.type).toBe('text');
+    expect((msg.content as any).text).toBe('[image attachment] photo');
   });
 
-  it('documentMessage produces file content', async () => {
+  it('documentMessage produces text placeholder with filename', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const ch = new WhatsAppChannel(cfg);
     ch.setEventHandlers({ onMessage });
@@ -3267,11 +3372,11 @@ describe('WhatsApp behavioral', () => {
     await flush();
 
     const msg = onMessage.mock.calls[0][0];
-    expect(msg.content.type).toBe('file');
-    expect((msg.content as any).filename).toBe('report.pdf');
+    expect(msg.content.type).toBe('text');
+    expect((msg.content as any).text).toBe('[file attachment: report.pdf]');
   });
 
-  it('audioMessage produces audio content with duration', async () => {
+  it('audioMessage produces text placeholder', async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const ch = new WhatsAppChannel(cfg);
     ch.setEventHandlers({ onMessage });
@@ -3287,8 +3392,8 @@ describe('WhatsApp behavioral', () => {
     await flush();
 
     const msg = onMessage.mock.calls[0][0];
-    expect(msg.content.type).toBe('audio');
-    expect((msg.content as any).duration).toBe(30);
+    expect(msg.content.type).toBe('text');
+    expect((msg.content as any).text).toBe('[audio attachment]');
   });
 
   it('unsupported message type is ignored', async () => {
@@ -3766,7 +3871,7 @@ describe('Cross-channel consistency', () => {
       results.push(m);
       return Promise.resolve();
     });
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: tgMsg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -3779,7 +3884,7 @@ describe('Cross-channel consistency', () => {
       results.push(m);
       return Promise.resolve();
     });
-    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't' });
+    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't', public: true });
     dc.setEventHandlers({ onMessage: dcMsg });
     await dc.connect();
     const dcHandler = mockClientOn.mock.calls.find((c: any[]) => c[0] === 'messageCreate')[1];
@@ -3800,7 +3905,7 @@ describe('Cross-channel consistency', () => {
       channels.push(m.channel);
       return Promise.resolve();
     });
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: tgMsg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -3812,7 +3917,7 @@ describe('Cross-channel consistency', () => {
       channels.push(m.channel);
       return Promise.resolve();
     });
-    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't' });
+    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't', public: true });
     dc.setEventHandlers({ onMessage: dcMsg });
     await dc.connect();
     await mockClientOn.mock.calls.find((c: any[]) => c[0] === 'messageCreate')[1](makeDiscordMsg());
@@ -3833,7 +3938,7 @@ describe('Cross-channel consistency', () => {
       tgPeerIds.push(m.peerId);
       return Promise.resolve();
     });
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: tgMsg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -3846,7 +3951,7 @@ describe('Cross-channel consistency', () => {
       dcPeerIds.push(m.peerId);
       return Promise.resolve();
     });
-    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't' });
+    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't', public: true });
     dc.setEventHandlers({ onMessage: dcMsg });
     await dc.connect();
     await mockClientOn.mock.calls.find((c: any[]) => c[0] === 'messageCreate')[1](
@@ -3865,7 +3970,7 @@ describe('Cross-channel consistency', () => {
     const msgs: IncomingMessage[] = [];
 
     // Telegram
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: vi.fn().mockImplementation((m: IncomingMessage) => { msgs.push(m); return Promise.resolve(); }) });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -3873,7 +3978,7 @@ describe('Cross-channel consistency', () => {
 
     vi.clearAllMocks();
     // Discord
-    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't' });
+    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't', public: true });
     dc.setEventHandlers({ onMessage: vi.fn().mockImplementation((m: IncomingMessage) => { msgs.push(m); return Promise.resolve(); }) });
     await dc.connect();
     await mockClientOn.mock.calls.find((c: any[]) => c[0] === 'messageCreate')[1](makeDiscordMsg());
@@ -3890,14 +3995,14 @@ describe('Cross-channel consistency', () => {
     const tgError = vi.fn();
     const dcError = vi.fn();
 
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onError: tgError });
     vi.useFakeTimers();
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
 
     vi.clearAllMocks();
-    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't' });
+    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't', public: true });
     dc.setEventHandlers({ onError: dcError });
     await dc.connect();
 
@@ -3914,12 +4019,12 @@ describe('Cross-channel consistency', () => {
   });
 
   it('disconnecting one channel does not disconnect another', async () => {
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
 
     vi.clearAllMocks();
-    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't' });
+    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't', public: true });
     await dc.connect();
 
     // Trigger ready on discord
@@ -3940,7 +4045,7 @@ describe('Cross-channel consistency', () => {
 
     // Test telegram
     const tgMsg = vi.fn().mockResolvedValue(undefined);
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: tgMsg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -3956,7 +4061,7 @@ describe('Cross-channel consistency', () => {
 
   it('text content always has text field', async () => {
     const tgMsg = vi.fn().mockResolvedValue(undefined);
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: tgMsg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -3973,19 +4078,19 @@ describe('Cross-channel consistency', () => {
   it('all channels throw when sending before connect', async () => {
     const textMsg: OutgoingMessage = { id: 'o', channel: 'telegram', peerId: '1', content: { type: 'text', text: 'x' } };
 
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     await expect(tg.send(textMsg)).rejects.toThrow();
 
-    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't' });
+    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't', public: true });
     await expect(dc.send({ ...textMsg, channel: 'discord' })).rejects.toThrow();
 
-    const sl = new SlackChannel({ id: 'sl', type: 'slack', enabled: true, agentId: 'a', botToken: 'b', appToken: 'a', signingSecret: 's' });
+    const sl = new SlackChannel({ id: 'sl', type: 'slack', enabled: true, agentId: 'a', botToken: 'b', appToken: 'a', signingSecret: 's', public: true });
     await expect(sl.send({ ...textMsg, channel: 'slack' })).rejects.toThrow();
 
-    const sig = new SignalChannel({ id: 'sig', type: 'signal', enabled: true, agentId: 'a', socketPath: '/tmp/s', account: '+1' });
+    const sig = new SignalChannel({ id: 'sig', type: 'signal', enabled: true, agentId: 'a', socketPath: '/tmp/s', account: '+1', public: true });
     await expect(sig.send({ ...textMsg, channel: 'signal' })).rejects.toThrow();
 
-    const wa = new WhatsAppChannel({ id: 'wa', type: 'whatsapp', enabled: true, agentId: 'a', authDir: '/tmp/wa' });
+    const wa = new WhatsAppChannel({ id: 'wa', type: 'whatsapp', enabled: true, agentId: 'a', authDir: '/tmp/wa', public: true });
     await expect(wa.send({ ...textMsg, channel: 'whatsapp' })).rejects.toThrow();
   });
 
@@ -4072,7 +4177,7 @@ describe('Cross-channel consistency', () => {
   it('all channels produce numeric timestamps', async () => {
     // Telegram
     const tgMsg = vi.fn().mockResolvedValue(undefined);
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: tgMsg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -4087,7 +4192,7 @@ describe('Cross-channel consistency', () => {
 
   it('all channels produce non-empty string message ids', async () => {
     const tgMsg = vi.fn().mockResolvedValue(undefined);
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: tgMsg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -4105,13 +4210,13 @@ describe('Cross-channel consistency', () => {
     const tgMsgs: IncomingMessage[] = [];
     const dcMsgs: IncomingMessage[] = [];
 
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: vi.fn().mockImplementation((m: IncomingMessage) => { tgMsgs.push(m); return Promise.resolve(); }) });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
 
     vi.clearAllMocks();
-    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't' });
+    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't', public: true });
     dc.setEventHandlers({ onMessage: vi.fn().mockImplementation((m: IncomingMessage) => { dcMsgs.push(m); return Promise.resolve(); }) });
     await dc.connect();
 
@@ -4138,7 +4243,7 @@ describe('Cross-channel consistency', () => {
   it('text content from all channels has type=text and text field', async () => {
     // Already tested implicitly but verifying the contract explicitly
     const tgMsg = vi.fn().mockResolvedValue(undefined);
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: tgMsg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -4157,7 +4262,7 @@ describe('Cross-channel consistency', () => {
   it('private/DM messages use peerKind=user across channels', async () => {
     // Telegram
     const tgMsg = vi.fn().mockResolvedValue(undefined);
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: tgMsg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -4170,7 +4275,7 @@ describe('Cross-channel consistency', () => {
     // Discord DM
     vi.clearAllMocks();
     const dcMsg = vi.fn().mockResolvedValue(undefined);
-    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't' });
+    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't', public: true });
     dc.setEventHandlers({ onMessage: dcMsg });
     await dc.connect();
     await mockClientOn.mock.calls.find((c: any[]) => c[0] === 'messageCreate')[1](
@@ -4183,7 +4288,7 @@ describe('Cross-channel consistency', () => {
   it('group/guild messages use peerKind=group across channels', async () => {
     // Telegram group
     const tgMsg = vi.fn().mockResolvedValue(undefined);
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: tgMsg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -4196,7 +4301,7 @@ describe('Cross-channel consistency', () => {
     // Discord guild
     vi.clearAllMocks();
     const dcMsg = vi.fn().mockResolvedValue(undefined);
-    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't' });
+    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't', public: true });
     dc.setEventHandlers({ onMessage: dcMsg });
     await dc.connect();
     await mockClientOn.mock.calls.find((c: any[]) => c[0] === 'messageCreate')[1](
@@ -4211,7 +4316,7 @@ describe('Cross-channel consistency', () => {
   it('senderId is always a string across all channels', async () => {
     // Telegram (numeric id becomes string)
     const tgMsg = vi.fn().mockResolvedValue(undefined);
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: tgMsg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -4222,7 +4327,7 @@ describe('Cross-channel consistency', () => {
     // Discord
     vi.clearAllMocks();
     const dcMsg = vi.fn().mockResolvedValue(undefined);
-    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't' });
+    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't', public: true });
     dc.setEventHandlers({ onMessage: dcMsg });
     await dc.connect();
     await mockClientOn.mock.calls.find((c: any[]) => c[0] === 'messageCreate')[1](makeDiscordMsg());
@@ -4232,7 +4337,7 @@ describe('Cross-channel consistency', () => {
 
   it('peerId is always a string across all channels', async () => {
     const tgMsg = vi.fn().mockResolvedValue(undefined);
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: tgMsg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -4242,7 +4347,7 @@ describe('Cross-channel consistency', () => {
 
     vi.clearAllMocks();
     const dcMsg = vi.fn().mockResolvedValue(undefined);
-    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't' });
+    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't', public: true });
     dc.setEventHandlers({ onMessage: dcMsg });
     await dc.connect();
     await mockClientOn.mock.calls.find((c: any[]) => c[0] === 'messageCreate')[1](makeDiscordMsg());
@@ -4252,7 +4357,7 @@ describe('Cross-channel consistency', () => {
 
   it('metadata is always an object when present', async () => {
     const tgMsg = vi.fn().mockResolvedValue(undefined);
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: tgMsg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -4266,7 +4371,7 @@ describe('Cross-channel consistency', () => {
 
   it('content.type is always one of the known types', async () => {
     const tgMsg = vi.fn().mockResolvedValue(undefined);
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onMessage: tgMsg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -4297,13 +4402,13 @@ describe('Cross-channel consistency', () => {
     const tg1Msg = vi.fn().mockResolvedValue(undefined);
     const tg2Msg = vi.fn().mockResolvedValue(undefined);
 
-    const tg1 = new TelegramChannel({ id: 'tg-1', type: 'telegram', enabled: true, agentId: 'a', token: 't1' });
+    const tg1 = new TelegramChannel({ id: 'tg-1', type: 'telegram', enabled: true, agentId: 'a', token: 't1', public: true });
     tg1.setEventHandlers({ onMessage: tg1Msg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot1' }));
     await tg1.connect();
 
     vi.clearAllMocks();
-    const tg2 = new TelegramChannel({ id: 'tg-2', type: 'telegram', enabled: true, agentId: 'a', token: 't2' });
+    const tg2 = new TelegramChannel({ id: 'tg-2', type: 'telegram', enabled: true, agentId: 'a', token: 't2', public: true });
     tg2.setEventHandlers({ onMessage: tg2Msg });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot2' }));
     await tg2.connect();
@@ -4332,7 +4437,7 @@ describe('Cross-channel consistency', () => {
     // Create and connect telegram
     let tgConnectCount = 0;
     const tgOnConnect = vi.fn(() => { tgConnectCount++; });
-    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't' });
+    const tg = new TelegramChannel({ id: 'tg', type: 'telegram', enabled: true, agentId: 'a', token: 't', public: true });
     tg.setEventHandlers({ onConnect: tgOnConnect });
     mockBotStart.mockImplementation(({ onStart }: any) => onStart({ username: 'bot' }));
     await tg.connect();
@@ -4341,7 +4446,7 @@ describe('Cross-channel consistency', () => {
     // Create discord - should not trigger telegram handlers
     vi.clearAllMocks();
     const dcOnConnect = vi.fn();
-    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't' });
+    const dc = new DiscordChannel({ id: 'dc', type: 'discord', enabled: true, agentId: 'a', token: 't', public: true });
     dc.setEventHandlers({ onConnect: dcOnConnect });
     await dc.connect();
 

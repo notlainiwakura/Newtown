@@ -1,4 +1,4 @@
-// Newtown Skin Loader
+// Laintown Skin Loader
 const SKIN_STORAGE_KEY = 'laintown-skin';
 const SKIN_CHANGED_EVENT = 'skin-changed';
 const DEFAULT_SKIN = 'default';
@@ -9,10 +9,29 @@ let skinLinkEl = null;
 let fontLinkEl = null;
 let registry = null;
 
+function getInjectedCharPaths() {
+  const meta = document.querySelector('meta[name="laintown-char-paths"]');
+  if (meta && meta.content) {
+    try {
+      const parsed = JSON.parse(meta.content);
+      if (Array.isArray(parsed) && parsed.length) return parsed;
+    } catch { /* ignore malformed injected metadata */ }
+  }
+  if (window.LAINTOWN_CHAR_PATHS && window.LAINTOWN_CHAR_PATHS.length) {
+    return window.LAINTOWN_CHAR_PATHS;
+  }
+  return [];
+}
+
 function skinsBasePath() {
-  // Character pages (e.g., /neo/, /plato/) have their own server with a /skins/ route.
-  // All other pages (including /game/, /newspaper.html, etc.) use the root /skins/.
-  const charPaths = ['/neo', '/plato', '/joe'];
+  // findings.md P2:2388 — Character pages (e.g., /pkd/, /mckenna/) have their
+  // own server with a /skins/ route. Read the authoritative list from
+  // window.LAINTOWN_CHAR_PATHS (injected by main server from characters.json).
+  // Falls back to `/skins` when accessed directly on a character server —
+  // correct, because the URL path won't carry a character prefix in that
+  // case. The old hardcoded list drifted from the manifest (doctor vs.
+  // dr-claude) and produced FOUC on renamed characters.
+  const charPaths = getInjectedCharPaths();
   const path = location.pathname;
   for (const cp of charPaths) {
     if (path.startsWith(cp + '/') || path === cp) {

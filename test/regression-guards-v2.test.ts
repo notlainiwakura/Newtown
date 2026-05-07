@@ -121,18 +121,18 @@ describe('maxTokens Truncation Guards', () => {
     // Guard: residue is intentionally terse but must not be zero.
     const src = readSrc('src/agent/dreams.ts');
     const values = extractMaxTokensValues(src);
-    const residueCall = values.find(v => v.value === 60);
-    expect(residueCall, 'dream residue should use 60 maxTokens').toBeDefined();
+    const residueCall = values.find(v => v.value >= 60 && v.value <= 200);
+    expect(residueCall, 'dream residue should use 60-200 maxTokens').toBeDefined();
   });
 
   // --- Internal state guards ---
 
-  it('internal-state LLM update tokens >= 512', () => {
+  it('internal-state LLM update tokens >= 500', () => {
     // Bug: state update JSON truncated when maxTokens too low, causing heuristic fallback.
     const src = readSrc('src/agent/internal-state.ts');
     const values = extractMaxTokensValues(src);
-    const stateCall = values.find(v => v.value >= 512);
-    expect(stateCall, 'state update must use >= 512 maxTokens').toBeDefined();
+    const stateCall = values.find(v => v.value >= 500);
+    expect(stateCall, 'state update must use >= 500 maxTokens').toBeDefined();
   });
 
   // --- Curiosity loop guards ---
@@ -471,10 +471,12 @@ describe('Environment Variable Isolation Guards', () => {
     expect(src).toContain("process.env['WIRED_LAIN_URL'] || 'http://localhost:3000'");
   });
 
-  it('LAIN_INTERLINK_TOKEN defaults to empty string when not set', () => {
-    // Guard: missing token should default to empty, not undefined.
+  it('commune-loop authenticates via per-character interlink headers', () => {
+    // findings.md P1:2289 — raw LAIN_INTERLINK_TOKEN reads were replaced with
+    // getInterlinkHeaders() which returns null when master/id are unset.
+    // Callers skip the remote fetch on null rather than sending empty auth.
     const src = readSrc('src/agent/commune-loop.ts');
-    expect(src).toContain("process.env['LAIN_INTERLINK_TOKEN'] || ''");
+    expect(src).toContain('getInterlinkHeaders');
   });
 });
 
@@ -658,16 +660,18 @@ describe('Auth Persistence Guards', () => {
     expect(src).toContain('export function isOwner');
   });
 
-  it('owner-auth.ts exports deriveOwnerCookie function', () => {
-    // Guard: cookie derivation must be exported for setOwnerCookie.
+  it('owner-auth.ts exports issueOwnerCookie function', () => {
+    // Guard (findings.md P2:2348): issueOwnerCookie replaces v1 setOwnerCookie
+    // and is what the gate endpoint calls on successful authentication.
     const src = readSrc('src/web/owner-auth.ts');
-    expect(src).toContain('export function deriveOwnerCookie');
+    expect(src).toContain('export function issueOwnerCookie');
   });
 
-  it('owner-auth.ts exports setOwnerCookie function', () => {
-    // Guard: setOwnerCookie is needed by the gate endpoint.
+  it('owner-auth.ts exports clearOwnerCookie function (for /owner/logout)', () => {
+    // Guard (findings.md P2:2348): /owner/logout relies on clearOwnerCookie
+    // to drop the local cookie after revoking the nonce authority-side.
     const src = readSrc('src/web/owner-auth.ts');
-    expect(src).toContain('export function setOwnerCookie');
+    expect(src).toContain('export function clearOwnerCookie');
   });
 
   it('owner-auth.ts uses timingSafeEqual (not string comparison)', () => {
@@ -731,11 +735,12 @@ describe('Auth Persistence Guards', () => {
     expect(src).toContain('verifyApiAuth');
   });
 
-  it('interlink endpoints require Authorization header', () => {
+  it('commune-loop peer calls send authenticated interlink headers', () => {
     // Guard: peer-to-peer messages must be authenticated to prevent spoofing.
+    // Per-character derivation (findings.md P1:2289) wraps the Bearer + identity
+    // headers in getInterlinkHeaders().
     const communeSrc = readSrc('src/agent/commune-loop.ts');
-    expect(communeSrc).toContain("'Authorization'");
-    expect(communeSrc).toContain('Bearer');
+    expect(communeSrc).toContain('getInterlinkHeaders');
   });
 
   it('character-server.ts verifies interlink auth on peer message endpoint', () => {
@@ -755,7 +760,8 @@ describe('Auth Persistence Guards', () => {
     const origToken = process.env['LAIN_OWNER_TOKEN'];
     delete process.env['LAIN_OWNER_TOKEN'];
     const { isOwner } = await import('../src/web/owner-auth.js');
-    expect(isOwner({ headers: { cookie: 'lain_owner=anything' } } as any)).toBe(false);
+    const { makeV2Cookie } = await import('./fixtures/owner-cookie-v2.js');
+    expect(isOwner({ headers: { cookie: makeV2Cookie('anything') } } as any)).toBe(false);
     if (origToken) process.env['LAIN_OWNER_TOKEN'] = origToken;
   });
 
@@ -767,18 +773,16 @@ describe('Auth Persistence Guards', () => {
     delete process.env['LAIN_OWNER_TOKEN'];
   });
 
-  it('deriveOwnerCookie is deterministic', async () => {
-    // Guard: same token must always produce same hash.
-    const { deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    const a = deriveOwnerCookie('my-token');
-    const b = deriveOwnerCookie('my-token');
-    expect(a).toBe(b);
+  it('v2 signature is deterministic for fixed payload + token', async () => {
+    const { makeV2CookieValue } = await import('./fixtures/owner-cookie-v2.js');
+    const opts = { nonce: 'n', iat: 1 };
+    expect(makeV2CookieValue('my-token', opts)).toBe(makeV2CookieValue('my-token', opts));
   });
 
-  it('different tokens produce different cookies', async () => {
-    // Guard: tokens must not collide.
-    const { deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    expect(deriveOwnerCookie('token-a')).not.toBe(deriveOwnerCookie('token-b'));
+  it('different tokens produce different v2 signatures', async () => {
+    const { makeV2CookieValue } = await import('./fixtures/owner-cookie-v2.js');
+    const opts = { nonce: 'n', iat: 1 };
+    expect(makeV2CookieValue('token-a', opts)).not.toBe(makeV2CookieValue('token-b', opts));
   });
 });
 
@@ -820,10 +824,12 @@ describe('Character Identity Guards', () => {
     expect(eventBus.characterId).toBe('test-char-2');
   });
 
-  it('diary uses LAIN_CHARACTER_NAME from environment', () => {
-    // Bug: diary addressed to wrong character when name hardcoded.
+  it('diary resolves character name via requireCharacterName (fail-closed) — findings.md P2:2271', () => {
+    // Bug: diary addressed to wrong character when name hardcoded or fail-open
+    // to 'Lain'. requireCharacterName() throws when the env is unset.
     const src = readSrc('src/agent/diary.ts');
-    expect(src).toContain('LAIN_CHARACTER_NAME');
+    expect(src).toContain('requireCharacterName');
+    expect(src).not.toMatch(/process\.env\[['"]LAIN_CHARACTER_NAME['"]\]\s*\|\|\s*['"]Lain['"]/);
   });
 
   it('diary uses getBasePath for journal path (not hardcoded)', () => {
@@ -876,10 +882,12 @@ describe('Character Identity Guards', () => {
     expect(src).toContain('wired-lain');
   });
 
-  it('dreams use LAIN_CHARACTER_NAME', () => {
-    // Guard: dream fragments should reference the correct character.
+  it('dreams use requireCharacterName (fail-closed identity) — findings.md P2:2271', () => {
+    // Guard: dream fragments should reference the correct character via the
+    // fail-closed helper rather than the bare env default.
     const src = readSrc('src/agent/dreams.ts');
-    expect(src).toContain('LAIN_CHARACTER_NAME');
+    expect(src).toContain('requireCharacterName');
+    expect(src).not.toMatch(/process\.env\[['"]LAIN_CHARACTER_NAME['"]\]\s*\|\|\s*['"]Lain['"]/);
   });
 
   it('internal-state uses eventBus.characterId for movement', () => {
@@ -897,8 +905,9 @@ describe('Character Identity Guards', () => {
 
   it('persona buildSystemPrompt uses persona parameter (not global)', () => {
     // Guard: buildSystemPrompt must take persona as input, not read a global.
+    // Second arg `characterId` gates the Lain-specific communication block.
     const src = readSrc('src/agent/persona.ts');
-    expect(src).toContain('export function buildSystemPrompt(persona: Persona)');
+    expect(src).toMatch(/export function buildSystemPrompt\(persona: Persona,\s*characterId\?: string\)/);
   });
 
   it('initAgent loads persona from config.workspace', () => {

@@ -299,6 +299,9 @@ function categorizeCallsite(
   // Newspaper reaction — "2-3 sentences"
   if (file.includes('newspaper.ts') && context.includes('2-3 sentences')) return 'short-creative';
 
+  // findings.md P2:1873 — view_image vision description — "1-2 sentences"
+  if (file.includes('tools.ts') && context.includes('Briefly describe') && context.includes('1-2 sentences')) return 'short-creative';
+
   // Config defaults — check what they feed into (self-concept config)
   if (callType === 'config') return 'free-form';
 
@@ -1041,7 +1044,6 @@ describe('maxTokens Audit — Living Guardrail', () => {
       'agent/novelty.ts',
       'agent/persona.ts',
       'agent/possession.ts',
-      'agent/skills.ts',
       'agent/tools.ts',
     ]);
 

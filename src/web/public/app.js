@@ -22,6 +22,7 @@ const CHARACTER_LABELS = {
   neo: 'NEO',
   plato: 'PLATO',
   joe: 'JOE',
+  cage: 'NICOLAS CAGE',
 };
 const LEGACY_VISITOR_NAMES = new Set(['', 'SHRAII', 'LAIN', 'NEWTOWN']);
 

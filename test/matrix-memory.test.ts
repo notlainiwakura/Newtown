@@ -242,10 +242,11 @@ describe('Palace wing × session key pattern', () => {
     },
   );
 
-  it('unknown session key with userId → visitor wing', async () => {
+  it('unknown session key with userId → shared visitors wing + per-user room (findings.md P2:652)', async () => {
     const { resolveWingForMemory } = await import('../src/memory/palace.js');
-    const { wingName } = resolveWingForMemory('chat:random', 'user-abc');
-    expect(wingName).toBe('visitor-user-abc');
+    const { wingName, roomName } = resolveWingForMemory('chat:random', 'user-abc');
+    expect(wingName).toBe('visitors');
+    expect(roomName).toBe('visitor-user-abc');
   });
 
   it('unknown session key without userId → encounters wing', async () => {

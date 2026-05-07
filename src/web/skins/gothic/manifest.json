@@ -4,9 +4,9 @@
   "description": "Victorian darkness meets digital occult",
   "fonts": { "heading": "Cinzel", "body": "Crimson Text", "mono": "Fira Code" },
   "buildingIcons": {
-    "pub": "🍷", "station": "🚂", "abandoned-house": "🏚", "field": "⚰",
-    "windmill": "🦇", "locksmith": "⛓", "mystery-tower": "🕯", "theater": "📜", "square": "🗝"
+    "library": "🏚", "bar": "🍷", "field": "⚰", "windmill": "🦇",
+    "lighthouse": "🕯", "school": "📜", "market": "🗝", "locksmith": "⛓", "threshold": "🚪"
   },
   "googleFontsUrl": "https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700&family=Crimson+Text:ital,wght@0,400;0,600;1,400&family=Fira+Code&display=swap",
-  "previewColors": ["#406040", "#a08060", "#8090a0"]
+  "previewColors": ["#8b0020", "#600080", "#c0c0c0"]
 }

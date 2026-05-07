@@ -14,7 +14,9 @@ import { countMemories, countMessages } from '../memory/store.js';
 import { query, getMeta, setMeta } from '../storage/database.js';
 import { getLogger } from '../utils/logger.js';
 import { getBasePath } from '../config/paths.js';
+import { getInhabitants, getHomeDir } from '../config/characters.js';
 import { eventBus } from '../events/bus.js';
+import { getInterlinkHeaders } from '../security/interlink-auth.js';
 
 export interface DoctorConfig {
   telemetryIntervalMs: number;
@@ -354,11 +356,17 @@ export async function runTelemetryCycle(_cfg: DoctorConfig): Promise<void> {
     // ignore
   }
 
-  // Log files (tail last ~200 lines)
+  // Log files (tail last ~200 lines).
+  // findings.md P2:1983 — the debug-log utility writes under
+  // `${getBasePath()}/logs/` so each character's log is isolated; read
+  // from the same location here instead of the legacy
+  // `process.cwd()/logs/` which the droplet shared across all character
+  // processes. Without this fix, the doctor report either surfaced
+  // another character's log or found nothing at all.
   let agentLogTail = '';
   let curiosityLogTail = '';
   try {
-    const agentLogPath = join(process.cwd(), 'logs', 'agent-debug.log');
+    const agentLogPath = join(getBasePath(), 'logs', 'agent-debug.log');
     if (existsSync(agentLogPath)) {
       const content = readFileSync(agentLogPath, 'utf-8');
       const lines = content.split('\n');
@@ -369,7 +377,7 @@ export async function runTelemetryCycle(_cfg: DoctorConfig): Promise<void> {
     // ignore
   }
   try {
-    const curiosityLogPath = join(process.cwd(), 'logs', 'curiosity-debug.log');
+    const curiosityLogPath = join(getBasePath(), 'logs', 'curiosity-debug.log');
     if (existsSync(curiosityLogPath)) {
       const content = readFileSync(curiosityLogPath, 'utf-8');
       const lines = content.split('\n');
@@ -617,12 +625,17 @@ async function fetchAllCharacterTelemetry(): Promise<CharacterTelemetry[]> {
   const logger = getLogger();
   const results: CharacterTelemetry[] = [];
 
+  const headers = getInterlinkHeaders();
+  if (!headers) {
+    logger.warn('Telemetry fetch: interlink not configured');
+    return results;
+  }
+
   for (const svc of TELEMETRY_SERVICES) {
     try {
-      const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
       const resp = await fetch(`http://localhost:${svc.port}/api/telemetry`, {
         signal: AbortSignal.timeout(10000),
-        headers: { 'Authorization': `Bearer ${interlinkToken}` },
+        headers,
       });
       if (resp.ok) {
         const data = await resp.json() as CharacterTelemetry;
@@ -809,15 +822,6 @@ export async function runHealthCheckCycle(_cfg: DoctorConfig): Promise<HealthChe
 // Character isolation integrity check
 // ============================================================
 
-const INTEGRITY_SERVICES = [
-  { name: 'Wired Lain', port: 3000, expectedHome: '/root/.lain-wired' },
-  { name: 'Lain', port: 3001, expectedHome: '/root/.lain' },
-  { name: 'PKD', port: 3003, expectedHome: '/root/.lain-pkd' },
-  { name: 'McKenna', port: 3004, expectedHome: '/root/.lain-mckenna' },
-  { name: 'John', port: 3005, expectedHome: '/root/.lain-john' },
-  { name: 'Hiru', port: 3006, expectedHome: '/root/.lain-hiru' },
-];
-
 interface IntegrityViolation {
   character: string;
   check: string;
@@ -831,12 +835,23 @@ async function runIntegrityCheck(
   const violations: IntegrityViolation[] = [];
   const basePaths = new Map<string, string>();
 
-  for (const svc of INTEGRITY_SERVICES) {
+  const integrityServices = getInhabitants().map(c => ({
+    name: c.name,
+    port: c.port,
+    expectedHome: getHomeDir(c.id),
+  }));
+
+  const headers = getInterlinkHeaders();
+  if (!headers) {
+    logger.warn('Integrity check: interlink not configured, skipping');
+    return;
+  }
+
+  for (const svc of integrityServices) {
     try {
-      const interlinkToken2 = process.env['LAIN_INTERLINK_TOKEN'] || '';
       const resp = await fetch(`http://localhost:${svc.port}/api/meta/integrity`, {
         signal: AbortSignal.timeout(5000),
-        headers: { 'Authorization': `Bearer ${interlinkToken2}` },
+        headers,
       });
       if (!resp.ok) continue;
 

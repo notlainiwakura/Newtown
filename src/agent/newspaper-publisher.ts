@@ -375,6 +375,7 @@ function buildFallbackEdition(
     neo: 'Something in the pattern of the day always matters. Even the small movements tell you where people are trying to go.',
     plato: 'A town reveals itself less through monuments than through habit. One day of movement and conversation is enough to show its governing forms.',
     joe: 'You can learn a lot from a normal day if you pay attention and do not try to turn every little thing into a prophecy.',
+    cage: 'Every town has a scene beneath the scene. The trick is to notice when the ordinary object begins to glow.',
   };
 
   const sections: string[] = [];
@@ -436,7 +437,7 @@ function buildFallbackEdition(
     '',
     ...sections,
     '',
-    `### Sign-off`,
+    '### Sign-off',
     `${editor.name} closes the desk for the day.`,
   ].join('\n');
 }
@@ -622,6 +623,7 @@ export function getDefaultNewtownNewspaperConfig(
       { id: 'neo', name: 'Neo', port: 3003 },
       { id: 'plato', name: 'Plato', port: 3004 },
       { id: 'joe', name: 'Joe', port: 3005 },
+      { id: 'cage', name: 'Nicolas Cage', port: 3006 },
     ],
     editors: [
       {
@@ -638,6 +640,11 @@ export function getDefaultNewtownNewspaperConfig(
         id: 'joe',
         name: 'Joe',
         voice: 'Write as Joe — plainspoken, dry, grounded, practical, and mildly suspicious of grand theories. Sound like the one person in town making sure words still connect to ordinary life.',
+      },
+      {
+        id: 'cage',
+        name: 'Nicolas Cage',
+        voice: 'Write as Nicolas Cage — vivid, sincere, theatrical but not hollow. Find the charged object in ordinary events, then bring the sentence back to something human.',
       },
     ],
   };

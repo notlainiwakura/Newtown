@@ -10,13 +10,13 @@ import { doctor } from './commands/doctor.js';
 import { chat, sendMessage } from './commands/chat.js';
 import { startWeb } from './commands/web.js';
 import { startTelegram } from './commands/telegram.js';
-import { startCharacter } from './commands/character.js';
+import { startCharacterById } from './commands/character.js';
 
 const program = new Command();
 
 program
-  .name('newtown')
-  .description('A local-first multi-resident town')
+  .name('lain')
+  .description('A privacy-first personal AI assistant')
   .version('0.1.0');
 
 // Onboard command
@@ -70,7 +70,7 @@ program
 // Configure command (alias for onboard)
 program
   .command('configure')
-  .description('Reconfigure Newtown')
+  .description('Reconfigure Lain')
   .action(onboard);
 
 // Web command
@@ -90,29 +90,13 @@ program
     await startTelegram();
   });
 
-// Character commands
+// Generic character command — loads from characters.json manifest
 program
-  .command('neo')
-  .description('Start the Neo character server')
-  .option('-p, --port <port>', 'Port to listen on', '3003')
-  .action(async (options) => {
-    await startCharacter('neo', parseInt(options.port, 10));
-  });
-
-program
-  .command('plato')
-  .description('Start the Plato character server')
-  .option('-p, --port <port>', 'Port to listen on', '3004')
-  .action(async (options) => {
-    await startCharacter('plato', parseInt(options.port, 10));
-  });
-
-program
-  .command('joe')
-  .description('Start the Joe character server (possessable)')
-  .option('-p, --port <port>', 'Port to listen on', '3005')
-  .action(async (options) => {
-    await startCharacter('joe', parseInt(options.port, 10));
+  .command('character <id>')
+  .description('Start a character server')
+  .option('-p, --port <port>', 'Port to listen on')
+  .action(async (id: string, options: { port?: string }) => {
+    await startCharacterById(id, options.port ? parseInt(options.port, 10) : undefined);
   });
 
 export { program };

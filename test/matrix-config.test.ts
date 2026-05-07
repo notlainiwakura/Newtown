@@ -40,15 +40,7 @@ describe('Config field × invalid value type', () => {
         maxMessageLength: 100000,
         keyDerivation: { algorithm: 'argon2id', memoryCost: 65536, timeCost: 3, parallelism: 4 },
       },
-      agents: [
-        {
-          id: 'default',
-          name: 'Test',
-          enabled: true,
-          workspace: '/tmp/ws',
-          providers: [{ type: 'anthropic', model: 'claude-3-haiku-20240307' }],
-        },
-      ],
+      // findings.md P2:171 — `agents` removed from LainConfig.
       logging: { level: 'info', prettyPrint: true },
     };
   }
@@ -68,8 +60,8 @@ describe('Config field × invalid value type', () => {
     ['security.keyDerivation.memoryCost (string)', (c, v) => { c.security.keyDerivation.memoryCost = v as number; }, ['64k', true, null, []]],
     ['security.keyDerivation.timeCost (bool)', (c, v) => { c.security.keyDerivation.timeCost = v as number; }, [false, 'three', null, []]],
     ['logging.prettyPrint (string)', (c, v) => { c.logging.prettyPrint = v as boolean; }, ['true', 1, null, []]],
-    ['agent.enabled (number)', (c, v) => { c.agents[0]!.enabled = v as boolean; }, [1, 'yes', null, []]],
-    ['agent.providers (empty array)', (c, v) => { (c.agents[0] as Record<string, unknown>).providers = v; }, [[], null, 'str', 42]],
+    // findings.md P2:171 — agent.enabled / agent.providers cases removed;
+    // those fields belong to the character manifest now, not LainConfig.
   ];
 
   describe.each(fieldCases)('%s', (_label, mutate, badValues) => {
@@ -88,71 +80,63 @@ describe('Config field × invalid value type', () => {
 // 2. CHARACTER FIELD × VALIDATION  (8 required fields × 3 states = 24)
 // ─────────────────────────────────────────────────────────────────────────────
 
+// findings.md P2:171 — `agents[]` moved from lain.json5 into the character
+// manifest. Per-character field × validation now runs through
+// `validateManifest` instead of the top-level config validator.
 describe('Character field × validation', () => {
-  function validAgent() {
+  function validCharacter() {
     return {
       id: 'my-char',
       name: 'My Character',
-      enabled: true,
+      port: 3000,
+      server: 'character' as const,
+      defaultLocation: 'home',
       workspace: '/tmp/ws',
       providers: [{ type: 'anthropic' as const, model: 'claude-3-haiku-20240307' }],
     };
   }
 
-  function validConfig(agentOverride: Record<string, unknown>) {
+  function validManifest(charOverride: Record<string, unknown>) {
     return {
-      version: '1',
-      gateway: {
-        socketPath: '/tmp/test.sock',
-        socketPermissions: 0o600,
-        pidFile: '/tmp/test.pid',
-        rateLimit: { connectionsPerMinute: 60, requestsPerSecond: 10, burstSize: 20 },
-      },
-      security: {
-        requireAuth: true,
-        tokenLength: 32,
-        inputSanitization: true,
-        maxMessageLength: 100000,
-        keyDerivation: { algorithm: 'argon2id', memoryCost: 65536, timeCost: 3, parallelism: 4 },
-      },
-      agents: [agentOverride],
-      logging: { level: 'info', prettyPrint: true },
+      town: { name: 'T', description: 'd' },
+      characters: [charOverride],
     };
   }
 
-  let validate: (c: unknown) => boolean;
+  let validateManifest: (m: unknown, path: string) => void;
   beforeEach(async () => {
-    ({ validate } = await import('../src/config/schema.js'));
+    ({ validateManifest } = await import('../src/config/manifest-schema.js'));
   });
 
-  // [field, valid value, missing sentinel, wrong-type value]
-  const agentFields: Array<[string, unknown, unknown]> = [
+  // [field, valid value, wrong-type value]. Required manifest fields only.
+  const characterFields: Array<[string, unknown, unknown]> = [
     ['id', 'valid-id', 42],
     ['name', 'Valid Name', 99],
-    ['enabled', true, 'yes'],
+    ['port', 3000, 'str'],
+    ['server', 'web', 'bad-server'],
+    ['defaultLocation', 'home', 123],
     ['workspace', '/tmp/ws', 123],
-    ['providers', [{ type: 'anthropic', model: 'c-h' }], 'str'],
   ];
 
-  describe.each(agentFields)('agent.%s', (field, validVal, badType) => {
+  describe.each(characterFields)('character.%s', (field, validVal, badType) => {
     it('valid value passes', () => {
-      const agent = { ...validAgent(), [field]: validVal };
-      expect(() => validate(validConfig(agent as Record<string, unknown>))).not.toThrow();
+      const char = { ...validCharacter(), [field]: validVal };
+      expect(() => validateManifest(validManifest(char as Record<string, unknown>), 'test')).not.toThrow();
     });
 
     it('missing field fails', () => {
-      const agent: Record<string, unknown> = { ...validAgent() };
-      delete agent[field];
-      expect(() => validate(validConfig(agent))).toThrow();
+      const char: Record<string, unknown> = { ...validCharacter() };
+      delete char[field];
+      expect(() => validateManifest(validManifest(char), 'test')).toThrow();
     });
 
     it('wrong type fails', () => {
-      const agent = { ...validAgent(), [field]: badType };
-      expect(() => validate(validConfig(agent as Record<string, unknown>))).toThrow();
+      const char = { ...validCharacter(), [field]: badType };
+      expect(() => validateManifest(validManifest(char as Record<string, unknown>), 'test')).toThrow();
     });
   });
 
-  // provider sub-fields
+  // provider sub-fields (manifest-schema.ts)
   const providerFields: Array<[string, unknown, unknown]> = [
     ['type', 'openai', 'bad-type'],
     ['model', 'gpt-4o', 9999],
@@ -161,16 +145,15 @@ describe('Character field × validation', () => {
 
   describe.each(providerFields)('provider.%s', (field, validVal, badType) => {
     it('valid value passes (or absent)', () => {
-      // apiKeyEnv is optional — also check without it
       const provider: Record<string, unknown> = { type: 'openai', model: 'gpt-4o', [field]: validVal };
-      const agent = { ...validAgent(), providers: [provider] };
-      expect(() => validate(validConfig(agent as Record<string, unknown>))).not.toThrow();
+      const char = { ...validCharacter(), providers: [provider] };
+      expect(() => validateManifest(validManifest(char as Record<string, unknown>), 'test')).not.toThrow();
     });
 
     it('wrong type fails', () => {
       const provider: Record<string, unknown> = { type: 'openai', model: 'gpt-4o', [field]: badType };
-      const agent = { ...validAgent(), providers: [provider] };
-      expect(() => validate(validConfig(agent as Record<string, unknown>))).toThrow();
+      const char = { ...validCharacter(), providers: [provider] };
+      expect(() => validateManifest(validManifest(char as Record<string, unknown>), 'test')).toThrow();
     });
   });
 });
@@ -429,31 +412,30 @@ describe('Config merge scenarios', () => {
 // 6. AGENT ID PATTERN MATRIX  (20 IDs × valid/invalid = 20)
 // ─────────────────────────────────────────────────────────────────────────────
 
+// findings.md P2:171 — `agents` moved out of LainConfig into characters.json.
+// The agent id pattern now lives on the manifest schema; the test below
+// still covers the same pattern but hits `validateManifest` instead of the
+// top-level `validate`.
 describe('Agent ID pattern matrix', () => {
-  let validate: (c: unknown) => boolean;
+  let validateManifest: (m: unknown, path: string) => void;
 
   beforeEach(async () => {
-    ({ validate } = await import('../src/config/schema.js'));
+    ({ validateManifest } = await import('../src/config/manifest-schema.js'));
   });
 
-  function configWithId(id: unknown) {
+  function manifestWithId(id: unknown) {
     return {
-      version: '1',
-      gateway: {
-        socketPath: '/tmp/t.sock',
-        socketPermissions: 0o600,
-        pidFile: '/tmp/t.pid',
-        rateLimit: { connectionsPerMinute: 60, requestsPerSecond: 10, burstSize: 20 },
-      },
-      security: {
-        requireAuth: true,
-        tokenLength: 32,
-        inputSanitization: true,
-        maxMessageLength: 100000,
-        keyDerivation: { algorithm: 'argon2id', memoryCost: 65536, timeCost: 3, parallelism: 4 },
-      },
-      agents: [{ id, name: 'T', enabled: true, workspace: '/tmp', providers: [{ type: 'anthropic', model: 'c-h' }] }],
-      logging: { level: 'info', prettyPrint: true },
+      town: { name: 'T', description: 'd' },
+      characters: [
+        {
+          id,
+          name: 'T',
+          port: 3000,
+          server: 'character',
+          defaultLocation: 'home',
+          workspace: '/tmp',
+        },
+      ],
     };
   }
 
@@ -461,11 +443,11 @@ describe('Agent ID pattern matrix', () => {
   const invalidIds = ['Lain', 'WIRED', 'wired lain', 'agent_01', 'agent!', '@home', '', '  ', 'lain.two', 'café'];
 
   it.each(validIds.map((id) => [id]))('valid id "%s" passes', (id) => {
-    expect(() => validate(configWithId(id))).not.toThrow();
+    expect(() => validateManifest(manifestWithId(id), 'test')).not.toThrow();
   });
 
   it.each(invalidIds.map((id) => [id]))('invalid id "%s" fails', (id) => {
-    expect(() => validate(configWithId(id))).toThrow();
+    expect(() => validateManifest(manifestWithId(id), 'test')).toThrow();
   });
 });
 
@@ -535,7 +517,6 @@ describe('Log level matrix', () => {
         maxMessageLength: 100000,
         keyDerivation: { algorithm: 'argon2id', memoryCost: 65536, timeCost: 3, parallelism: 4 },
       },
-      agents: [{ id: 'default', name: 'T', enabled: true, workspace: '/tmp', providers: [{ type: 'anthropic', model: 'c-h' }] }],
       logging: { level, prettyPrint: true },
     };
   }
@@ -684,24 +665,22 @@ describe('Default config value matrix', () => {
     expect(getDefaultConfig().logging.prettyPrint).toBe(true);
   });
 
-  it('agents has at least one entry', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    expect(getDefaultConfig().agents.length).toBeGreaterThan(0);
+  // findings.md P2:171 — `agents` moved out of LainConfig. Below three
+  // tests now exercise DEFAULT_PROVIDERS (the fallback chain used when a
+  // character manifest entry omits providers).
+  it('DEFAULT_PROVIDERS has at least one entry', async () => {
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    expect(DEFAULT_PROVIDERS.length).toBeGreaterThan(0);
   });
 
-  it('default agent id is "default"', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    expect(getDefaultConfig().agents[0]?.id).toBe('default');
+  it('DEFAULT_PROVIDERS first tier model is claude-sonnet-4-6', async () => {
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    expect(DEFAULT_PROVIDERS[0]?.model).toBe('claude-sonnet-4-6');
   });
 
-  it('default agent is enabled', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    expect(getDefaultConfig().agents[0]?.enabled).toBe(true);
-  });
-
-  it('default agent has at least one provider', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    expect(getDefaultConfig().agents[0]!.providers.length).toBeGreaterThan(0);
+  it('DEFAULT_PROVIDERS has exactly 3 tiers (personality, memory, light)', async () => {
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    expect(DEFAULT_PROVIDERS.length).toBe(3);
   });
 
   it('generateSampleConfig returns a non-empty string', async () => {
@@ -739,7 +718,6 @@ describe('Schema numeric boundary values', () => {
         maxMessageLength: 100000,
         keyDerivation: { algorithm: 'argon2id', memoryCost: 65536, timeCost: 3, parallelism: 4 },
       },
-      agents: [{ id: 'default', name: 'T', enabled: true, workspace: '/tmp', providers: [{ type: 'anthropic', model: 'c-h' }] }],
       logging: { level: 'info', prettyPrint: true },
       ...overrides,
     };

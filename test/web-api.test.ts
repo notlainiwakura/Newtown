@@ -10,9 +10,10 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { EventEmitter } from 'node:events';
+import { isOwner as realIsOwner } from '../src/web/owner-auth.js';
+import { makeV2Cookie, makeV2CookieValue, OWNER_COOKIE_NAME } from './fixtures/owner-cookie-v2.js';
 
 // ============================================================
 // Helpers — lightweight HTTP mock objects
@@ -105,162 +106,165 @@ function parseBody(res: MockResponse): unknown {
 }
 
 // ============================================================
-// Owner Auth module — deriveOwnerCookie / isOwner
+// Owner Auth module — v2 cookie (findings.md P2:2348)
+//
+// Exercises the real isOwner() from src/web/owner-auth via the v2 cookie
+// helper at test/fixtures/owner-cookie-v2 — no inline HMAC reimplementation.
 // ============================================================
 
 describe('owner-auth', () => {
   const TOKEN = 'super-secret-owner-token';
-  const HMAC_MESSAGE = 'lain-owner-v1';
+  let prevToken: string | undefined;
 
-  function deriveOwnerCookie(ownerToken: string): string {
-    return createHmac('sha256', ownerToken).update(HMAC_MESSAGE).digest('hex');
+  beforeEach(() => {
+    prevToken = process.env['LAIN_OWNER_TOKEN'];
+  });
+  afterEach(() => {
+    if (prevToken === undefined) delete process.env['LAIN_OWNER_TOKEN'];
+    else process.env['LAIN_OWNER_TOKEN'] = prevToken;
+  });
+
+  function withToken(token: string | undefined, fn: () => void) {
+    if (token === undefined) delete process.env['LAIN_OWNER_TOKEN'];
+    else process.env['LAIN_OWNER_TOKEN'] = token;
+    fn();
   }
 
-  function isOwner(req: IncomingMessage, envToken?: string): boolean {
-    const ownerToken = envToken ?? process.env['LAIN_OWNER_TOKEN'];
-    if (!ownerToken) return false;
-
-    const cookie = req.headers['cookie'];
-    if (!cookie) return false;
-
-    const match = cookie.match(/(?:^|;\s*)lain_owner=([a-f0-9]+)/);
-    if (!match?.[1]) return false;
-
-    const expected = deriveOwnerCookie(ownerToken);
-    const provided = match[1];
-
-    if (expected.length !== provided.length) return false;
-    return timingSafeEqual(Buffer.from(expected), Buffer.from(provided));
-  }
-
-  // --- deriveOwnerCookie ---
-  describe('deriveOwnerCookie', () => {
-    it('returns a hex string', () => {
-      const result = deriveOwnerCookie(TOKEN);
-      expect(result).toMatch(/^[a-f0-9]+$/);
+  // --- v2 cookie builder ---
+  describe('v2 cookie builder', () => {
+    it('produces a {payload}.{sig} string with base64url payload and hex sig', () => {
+      expect(makeV2CookieValue(TOKEN)).toMatch(/^[A-Za-z0-9_-]+\.[a-f0-9]+$/);
     });
 
-    it('returns a 64-char SHA-256 hex digest', () => {
-      expect(deriveOwnerCookie(TOKEN)).toHaveLength(64);
+    it('hex signature is 64 chars (SHA-256)', () => {
+      const [, sig] = makeV2CookieValue(TOKEN).split('.');
+      expect(sig).toHaveLength(64);
     });
 
-    it('is deterministic — same token always yields same value', () => {
-      expect(deriveOwnerCookie(TOKEN)).toBe(deriveOwnerCookie(TOKEN));
+    it('is deterministic for fixed iat+nonce', () => {
+      const opts = { iat: 1, nonce: 'fixed' };
+      expect(makeV2CookieValue(TOKEN, opts)).toBe(makeV2CookieValue(TOKEN, opts));
     });
 
-    it('changes when the token changes', () => {
-      expect(deriveOwnerCookie(TOKEN)).not.toBe(deriveOwnerCookie('different-token'));
+    it('signature changes when the token changes', () => {
+      const opts = { iat: 1, nonce: 'fixed' };
+      expect(makeV2CookieValue(TOKEN, opts)).not.toBe(
+        makeV2CookieValue('different-token', opts),
+      );
     });
 
-    it('works with an empty-ish short token', () => {
-      const r = deriveOwnerCookie('a');
-      expect(r).toHaveLength(64);
+    it('signature changes when the nonce changes', () => {
+      expect(makeV2CookieValue(TOKEN, { iat: 1, nonce: 'a' })).not.toBe(
+        makeV2CookieValue(TOKEN, { iat: 1, nonce: 'b' }),
+      );
     });
 
     it('works with a token containing special chars', () => {
-      const r = deriveOwnerCookie('tok!@#$%^&*()en');
-      expect(r).toMatch(/^[a-f0-9]+$/);
+      expect(makeV2CookieValue('tok!@#$%^&*()en')).toMatch(/^[A-Za-z0-9_-]+\.[a-f0-9]+$/);
     });
   });
 
   // --- isOwner ---
-  describe('isOwner', () => {
+  describe('isOwner (v2)', () => {
     it('returns false when no LAIN_OWNER_TOKEN is set', () => {
-      const req = makeReq({ headers: { cookie: `lain_owner=${deriveOwnerCookie(TOKEN)}` } });
-      expect(isOwner(req, undefined)).toBe(false);
+      const req = makeReq({ headers: { cookie: makeV2Cookie(TOKEN) } });
+      withToken(undefined, () => expect(realIsOwner(req)).toBe(false));
     });
 
     it('returns false when cookie header is absent', () => {
       const req = makeReq({ headers: {} });
-      expect(isOwner(req, TOKEN)).toBe(false);
+      withToken(TOKEN, () => expect(realIsOwner(req)).toBe(false));
     });
 
-    it('returns true for a valid HMAC cookie', () => {
-      const value = deriveOwnerCookie(TOKEN);
-      const req = makeReq({ headers: { cookie: `lain_owner=${value}` } });
-      expect(isOwner(req, TOKEN)).toBe(true);
+    it('returns true for a valid v2 cookie', () => {
+      const req = makeReq({ headers: { cookie: makeV2Cookie(TOKEN) } });
+      withToken(TOKEN, () => expect(realIsOwner(req)).toBe(true));
     });
 
     it('returns false for a wrong cookie value', () => {
-      const req = makeReq({ headers: { cookie: 'lain_owner=deadbeef' } });
-      expect(isOwner(req, TOKEN)).toBe(false);
+      const req = makeReq({ headers: { cookie: `${OWNER_COOKIE_NAME}=deadbeef.cafebabe` } });
+      withToken(TOKEN, () => expect(realIsOwner(req)).toBe(false));
     });
 
-    it('returns false for a different token cookie', () => {
-      const value = deriveOwnerCookie('wrong-token');
-      const req = makeReq({ headers: { cookie: `lain_owner=${value}` } });
-      expect(isOwner(req, TOKEN)).toBe(false);
+    it('returns false for a cookie signed with a different token', () => {
+      const req = makeReq({ headers: { cookie: makeV2Cookie('wrong-token') } });
+      withToken(TOKEN, () => expect(realIsOwner(req)).toBe(false));
     });
 
-    it('finds the cookie among multiple cookies', () => {
-      const value = deriveOwnerCookie(TOKEN);
-      const req = makeReq({ headers: { cookie: `session=abc; lain_owner=${value}; other=xyz` } });
-      expect(isOwner(req, TOKEN)).toBe(true);
+    it('returns false for legacy v1 cookies (rejected outright)', () => {
+      const req = makeReq({ headers: { cookie: 'lain_owner=aabbccddeeff0011' } });
+      withToken(TOKEN, () => expect(realIsOwner(req)).toBe(false));
     });
 
-    it('is case-sensitive — upper-case cookie name is not matched', () => {
-      const value = deriveOwnerCookie(TOKEN);
-      const req = makeReq({ headers: { cookie: `LAIN_OWNER=${value}` } });
-      expect(isOwner(req, TOKEN)).toBe(false);
+    it('finds the v2 cookie among multiple cookies', () => {
+      const val = makeV2CookieValue(TOKEN);
+      const req = makeReq({
+        headers: { cookie: `session=abc; ${OWNER_COOKIE_NAME}=${val}; other=xyz` },
+      });
+      withToken(TOKEN, () => expect(realIsOwner(req)).toBe(true));
+    });
+
+    it('is case-sensitive on cookie name', () => {
+      const val = makeV2CookieValue(TOKEN);
+      const req = makeReq({
+        headers: { cookie: `${OWNER_COOKIE_NAME.toUpperCase()}=${val}` },
+      });
+      withToken(TOKEN, () => expect(realIsOwner(req)).toBe(false));
     });
 
     it('returns false for an empty cookie string', () => {
       const req = makeReq({ headers: { cookie: '' } });
-      expect(isOwner(req, TOKEN)).toBe(false);
+      withToken(TOKEN, () => expect(realIsOwner(req)).toBe(false));
     });
 
     it('returns false when cookie is only whitespace', () => {
       const req = makeReq({ headers: { cookie: '   ' } });
-      expect(isOwner(req, TOKEN)).toBe(false);
+      withToken(TOKEN, () => expect(realIsOwner(req)).toBe(false));
     });
 
-    it('returns false for a cookie with wrong length (timing-safe path)', () => {
-      const req = makeReq({ headers: { cookie: 'lain_owner=abc' } });
-      expect(isOwner(req, TOKEN)).toBe(false);
+    it('returns false for a cookie value missing the signature', () => {
+      const req = makeReq({ headers: { cookie: `${OWNER_COOKIE_NAME}=abc` } });
+      withToken(TOKEN, () => expect(realIsOwner(req)).toBe(false));
     });
 
     it('returns false when token env is empty string', () => {
-      const req = makeReq({ headers: { cookie: `lain_owner=${deriveOwnerCookie('')}` } });
-      expect(isOwner(req, '')).toBe(false);
+      const req = makeReq({ headers: { cookie: makeV2Cookie('') } });
+      withToken('', () => expect(realIsOwner(req)).toBe(false));
     });
 
-    it('returns true when cookie has no leading spaces', () => {
-      const value = deriveOwnerCookie(TOKEN);
-      const req = makeReq({ headers: { cookie: `lain_owner=${value}` } });
-      expect(isOwner(req, TOKEN)).toBe(true);
+    it('rejects a cookie whose signature has been flipped', () => {
+      const val = makeV2CookieValue(TOKEN);
+      const [payload, sig] = val.split('.');
+      const flipped = sig!.slice(0, -1) + (sig!.endsWith('a') ? 'b' : 'a');
+      const req = makeReq({
+        headers: { cookie: `${OWNER_COOKIE_NAME}=${payload}.${flipped}` },
+      });
+      withToken(TOKEN, () => expect(realIsOwner(req)).toBe(false));
     });
 
-    it('handles cookie value that looks almost correct', () => {
-      const value = deriveOwnerCookie(TOKEN);
-      // Flip last char
-      const flipped = value.slice(0, -1) + (value.endsWith('a') ? 'b' : 'a');
-      const req = makeReq({ headers: { cookie: `lain_owner=${flipped}` } });
-      expect(isOwner(req, TOKEN)).toBe(false);
-    });
-
-    it('rejects cookie with non-hex chars in value (regex mismatch)', () => {
-      const req = makeReq({ headers: { cookie: 'lain_owner=ZZZZZZZZ' } });
-      expect(isOwner(req, TOKEN)).toBe(false);
+    it('rejects a cookie with non-hex chars in the signature', () => {
+      const req = makeReq({
+        headers: { cookie: `${OWNER_COOKIE_NAME}=eyJhIjoxfQ.ZZZZZZZZ` },
+      });
+      withToken(TOKEN, () => expect(realIsOwner(req)).toBe(false));
     });
 
     it('works with a token that has unicode characters', () => {
       const unicodeToken = 'tök€n-αβγ';
-      const value = deriveOwnerCookie(unicodeToken);
-      const req = makeReq({ headers: { cookie: `lain_owner=${value}` } });
-      expect(isOwner(req, unicodeToken)).toBe(true);
+      const req = makeReq({ headers: { cookie: makeV2Cookie(unicodeToken) } });
+      withToken(unicodeToken, () => expect(realIsOwner(req)).toBe(true));
     });
 
-    it('processes cookie correctly when lain_owner appears after semicolon with spaces', () => {
-      const value = deriveOwnerCookie(TOKEN);
-      const req = makeReq({ headers: { cookie: `foo=bar;  lain_owner=${value}` } });
-      expect(isOwner(req, TOKEN)).toBe(true);
+    it('processes cookie correctly when v2 cookie appears after semicolon with spaces', () => {
+      const val = makeV2CookieValue(TOKEN);
+      const req = makeReq({ headers: { cookie: `foo=bar;  ${OWNER_COOKIE_NAME}=${val}` } });
+      withToken(TOKEN, () => expect(realIsOwner(req)).toBe(true));
     });
 
-    it('returns false when cookie contains lain_owner but with wrong separator', () => {
-      const value = deriveOwnerCookie(TOKEN);
-      // Pipe instead of semicolon — not a real cookie separator
-      const req = makeReq({ headers: { cookie: `foo=bar|lain_owner=${value}` } });
-      expect(isOwner(req, TOKEN)).toBe(false);
+    it('returns false when cookie uses a non-semicolon separator', () => {
+      const val = makeV2CookieValue(TOKEN);
+      const req = makeReq({ headers: { cookie: `foo=bar|${OWNER_COOKIE_NAME}=${val}` } });
+      withToken(TOKEN, () => expect(realIsOwner(req)).toBe(false));
     });
   });
 });
@@ -423,7 +427,15 @@ vi.mock('../src/commune/weather.js', () => ({
     description: 'crisp',
     computed_at: Date.now(),
   }),
+  getTownWeather: vi.fn().mockResolvedValue({
+    condition: 'clear',
+    intensity: 0.3,
+    description: 'crisp',
+    computed_at: Date.now(),
+  }),
+  peekCachedTownWeather: vi.fn().mockReturnValue(null),
   startWeatherLoop: vi.fn().mockReturnValue(() => {}),
+  startTownWeatherRefreshLoop: vi.fn().mockReturnValue(() => {}),
 }));
 
 vi.mock('../src/agent/internal-state.js', () => ({
@@ -552,6 +564,7 @@ vi.mock('../src/agent/feed-health.js', () => ({
 
 vi.mock('../src/memory/embeddings.js', () => ({
   generateEmbeddings: vi.fn().mockResolvedValue([new Float32Array([0.1, 0.2, 0.3])]),
+  CURRENT_EMBEDDING_MODEL: 'Xenova/all-MiniLM-L6-v2',
 }));
 
 vi.mock('../src/objects/store.js', () => ({
@@ -573,6 +586,8 @@ vi.mock('../src/events/town-events.js', () => ({
   getAllTownEvents: vi.fn().mockReturnValue([]),
   endTownEvent: vi.fn().mockReturnValue(true),
   expireStaleEvents: vi.fn(),
+  // findings.md P2:285 — shared scheduler helper; returns a no-op stop fn.
+  startExpireStaleEventsLoop: vi.fn().mockReturnValue(() => {}),
   getActiveEffects: vi.fn().mockReturnValue([]),
 }));
 
@@ -596,6 +611,7 @@ vi.mock('../src/agent/persona.js', () => ({
 
 vi.mock('../src/providers/index.js', () => ({
   createProvider: vi.fn().mockReturnValue({
+    supportsStreaming: true,
     completeWithTools: vi.fn().mockResolvedValue({ content: 'Hello', toolCalls: [] }),
     completeWithToolsStream: vi.fn().mockResolvedValue({ content: 'Hello', toolCalls: [] }),
     continueWithToolResults: vi.fn().mockResolvedValue({ content: 'Done', toolCalls: [] }),
@@ -646,8 +662,7 @@ vi.mock('../src/utils/crypto.js', () => ({
 const OWNER_TOKEN = 'test-owner-token-12345';
 
 function ownerCookieFor(token: string): string {
-  const value = createHmac('sha256', token).update('lain-owner-v1').digest('hex');
-  return `lain_owner=${value}`;
+  return makeV2Cookie(token);
 }
 
 // ============================================================
@@ -1268,15 +1283,15 @@ describe('GET /gate', () => {
     expect(res.headers['location']).toBe('/');
   });
 
-  it('sets HMAC cookie on valid token', () => {
+  it('sets v2 HMAC cookie on valid token', () => {
     const res = makeRes();
-    const value = createHmac('sha256', OWNER_TOKEN).update('lain-owner-v1').digest('hex');
+    const value = makeV2CookieValue(OWNER_TOKEN);
     res.writeHead(302, {
       Location: '/',
-      'Set-Cookie': `lain_owner=${value}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`,
+      'Set-Cookie': `${OWNER_COOKIE_NAME}=${value}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`,
     });
     res.end();
-    expect(res.headers['set-cookie']).toContain('lain_owner=');
+    expect(res.headers['set-cookie']).toContain(`${OWNER_COOKIE_NAME}=`);
     expect(res.headers['set-cookie']).toContain('HttpOnly');
   });
 
@@ -2219,11 +2234,8 @@ describe('Character server', () => {
       expect(res.statusCode).toBe(302);
     });
 
-    it('path traversal is stripped in character server serveStatic', () => {
-      const path = '../../etc/passwd';
-      const safe = path.replace(/\.\./g, '').replace(/^\/+/, '');
-      expect(safe).toBe('etc/passwd');
-    });
+    // serveStatic in character-server was removed (findings.md P1:27) —
+    // inhabitant servers are API-only, so no static file path to traverse.
   });
 
   describe('GET /api/telemetry', () => {
@@ -2530,26 +2542,22 @@ describe('owner-only dashboard endpoints', () => {
 // ============================================================
 
 describe('verifyApiAuth (main server)', () => {
+  // Mirrors server.ts verifyApiAuth: v2 owner cookie OR Bearer API key.
   function verifyApiAuth(
     req: IncomingMessage,
     res: MockResponse,
     ownerToken?: string,
     apiKey?: string
   ): boolean {
-    // isOwner check
-    const cookie = req.headers['cookie'] as string | undefined;
-    if (cookie && ownerToken) {
-      const match = cookie.match(/(?:^|;\s*)lain_owner=([a-f0-9]+)/);
-      if (match?.[1]) {
-        const expected = createHmac('sha256', ownerToken).update('lain-owner-v1').digest('hex');
-        if (expected.length === match[1].length) {
-          try {
-            if (timingSafeEqual(Buffer.from(expected), Buffer.from(match[1]))) return true;
-          } catch { /* */ }
-        }
-      }
+    const prev = process.env['LAIN_OWNER_TOKEN'];
+    try {
+      if (ownerToken === undefined) delete process.env['LAIN_OWNER_TOKEN'];
+      else process.env['LAIN_OWNER_TOKEN'] = ownerToken;
+      if (realIsOwner(req)) return true;
+    } finally {
+      if (prev === undefined) delete process.env['LAIN_OWNER_TOKEN'];
+      else process.env['LAIN_OWNER_TOKEN'] = prev;
     }
-    // Bearer check
     if (apiKey) {
       const auth = req.headers['authorization'] as string | undefined;
       if (auth?.startsWith('Bearer ')) {
@@ -2586,7 +2594,7 @@ describe('verifyApiAuth (main server)', () => {
   });
 
   it('returns 401 when cookie is wrong and no bearer', () => {
-    const req = makeReq({ headers: { cookie: 'lain_owner=deadbeef' } });
+    const req = makeReq({ headers: { cookie: `${OWNER_COOKIE_NAME}=deadbeef.cafebabe` } });
     const res = makeRes();
     const ok = verifyApiAuth(req, res, 'token', undefined);
     expect(ok).toBe(false);

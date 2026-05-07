@@ -155,11 +155,25 @@ export function updateSession(key: string, updates: SessionUpdateInput): Session
 }
 
 /**
- * Delete a session
+ * Delete a session and the `messages` rows that belong to it.
+ *
+ * findings.md P2:368 — `messages.session_key` was a logical reference
+ * with no `ON DELETE CASCADE`, so plain `DELETE FROM sessions` left the
+ * message rows dangling. We delete messages inside the same transaction
+ * so the two tables stay consistent. `memories.session_key` is
+ * intentionally NOT cascaded: memories are long-term character state
+ * whose `session_key` is provenance metadata only — a session cleanup
+ * must not wipe the character's memories. See `deleteOldSessions` for
+ * the same invariant on bulk cleanup.
+ *
+ * Returns true if a session row was actually removed.
  */
 export function deleteSession(key: string): boolean {
-  const result = execute('DELETE FROM sessions WHERE key = ?', [key]);
-  return result.changes > 0;
+  return transaction(() => {
+    execute('DELETE FROM messages WHERE session_key = ?', [key]);
+    const result = execute('DELETE FROM sessions WHERE key = ?', [key]);
+    return result.changes > 0;
+  });
 }
 
 /**
@@ -210,15 +224,37 @@ export function countSessions(agentId: string, channel?: string): number {
 }
 
 /**
- * Delete old sessions (cleanup)
+ * Delete old sessions and the `messages` rows that belong to them.
+ *
+ * findings.md P2:368 — runs inside a single transaction so messages and
+ * sessions stay consistent. Before the fix, repeated cleanup left
+ * orphan `messages` rows pointing at deleted session keys, which bloated
+ * the DB over time and never surfaced in any query path. `memories`
+ * rows are intentionally preserved (see `deleteSession` for the same
+ * invariant) — they are long-term character state whose `session_key`
+ * is provenance metadata rather than a lifecycle FK.
+ *
+ * Returns the number of session rows removed.
  */
 export function deleteOldSessions(agentId: string, maxAge: number): number {
   const cutoff = Date.now() - maxAge;
-  const result = execute(
-    'DELETE FROM sessions WHERE agent_id = ? AND updated_at < ?',
-    [agentId, cutoff]
-  );
-  return result.changes;
+  return transaction(() => {
+    // Delete messages that belong to sessions about to be removed. We
+    // use an EXISTS subquery instead of collecting keys first so the
+    // join is done entirely inside SQLite.
+    execute(
+      `DELETE FROM messages
+       WHERE session_key IN (
+         SELECT key FROM sessions WHERE agent_id = ? AND updated_at < ?
+       )`,
+      [agentId, cutoff]
+    );
+    const result = execute(
+      'DELETE FROM sessions WHERE agent_id = ? AND updated_at < ?',
+      [agentId, cutoff]
+    );
+    return result.changes;
+  });
 }
 
 /**

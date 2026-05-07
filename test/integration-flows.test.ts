@@ -25,6 +25,7 @@ vi.mock('../src/memory/embeddings.js', () => ({
   cosineSimilarity: vi.fn().mockReturnValue(0.85),
   serializeEmbedding: vi.fn((arr: Float32Array) => Buffer.from(arr.buffer)),
   deserializeEmbedding: vi.fn((buf: Buffer) => new Float32Array(buf.buffer)),
+  CURRENT_EMBEDDING_MODEL: 'Xenova/all-MiniLM-L6-v2',
 }));
 
 // ─── Shared DB setup helpers ────────────────────────────────────────────────
@@ -360,8 +361,8 @@ describe('Commune loop flow', () => {
     const { eventBus } = await import('../src/events/bus.js');
     const { setCurrentLocation, getLocationHistory } = await import('../src/commune/location.js');
     eventBus.setCharacterId('lain');
-    setCurrentLocation('library', 'first move');
-    setCurrentLocation('library', 'still here');
+    setCurrentLocation('bar', 'first move');
+    setCurrentLocation('bar', 'still here');
     const history = getLocationHistory();
     expect(history).toHaveLength(1);
   });
@@ -856,20 +857,24 @@ describe('Auth → API → Response flow', () => {
     delete process.env['LAIN_OWNER_TOKEN'];
   });
 
-  it('deriveOwnerCookie produces a hex string', async () => {
-    const { deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    const cookie = deriveOwnerCookie('some-token');
-    expect(cookie).toMatch(/^[a-f0-9]+$/);
+  it('v2 cookie signature is a hex string', async () => {
+    const { makeV2Cookie } = await import('./fixtures/owner-cookie-v2.js');
+    const cookie = makeV2Cookie('some-token');
+    expect(cookie).toMatch(/^lain_owner_v2=[A-Za-z0-9_-]+\.[a-f0-9]+$/);
   });
 
-  it('deriveOwnerCookie is deterministic for same input', async () => {
-    const { deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    expect(deriveOwnerCookie('abc')).toBe(deriveOwnerCookie('abc'));
+  it('v2 cookie signature is deterministic for fixed iat+nonce', async () => {
+    const { makeV2Cookie } = await import('./fixtures/owner-cookie-v2.js');
+    const a = makeV2Cookie('abc', { iat: 1, nonce: 'n' });
+    const b = makeV2Cookie('abc', { iat: 1, nonce: 'n' });
+    expect(a).toBe(b);
   });
 
-  it('deriveOwnerCookie differs for different tokens', async () => {
-    const { deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    expect(deriveOwnerCookie('token-a')).not.toBe(deriveOwnerCookie('token-b'));
+  it('v2 cookie signature differs for different tokens', async () => {
+    const { makeV2Cookie } = await import('./fixtures/owner-cookie-v2.js');
+    expect(makeV2Cookie('token-a', { iat: 1, nonce: 'n' })).not.toBe(
+      makeV2Cookie('token-b', { iat: 1, nonce: 'n' }),
+    );
   });
 
   it('isOwner returns false when no cookie header is provided', async () => {
@@ -880,20 +885,28 @@ describe('Auth → API → Response flow', () => {
 
   it('isOwner returns false when LAIN_OWNER_TOKEN is not set', async () => {
     const { isOwner } = await import('../src/web/owner-auth.js');
+    const { makeV2Cookie } = await import('./fixtures/owner-cookie-v2.js');
     delete process.env['LAIN_OWNER_TOKEN'];
-    const req = { headers: { cookie: 'lain_owner=abc123' } } as any;
+    const req = { headers: { cookie: makeV2Cookie('some-token') } } as any;
     expect(isOwner(req)).toBe(false);
   });
 
-  it('isOwner returns true with valid HMAC cookie', async () => {
-    const { isOwner, deriveOwnerCookie } = await import('../src/web/owner-auth.js');
+  it('isOwner returns true with valid v2 cookie', async () => {
+    const { isOwner } = await import('../src/web/owner-auth.js');
+    const { makeV2Cookie } = await import('./fixtures/owner-cookie-v2.js');
     process.env['LAIN_OWNER_TOKEN'] = 'test-owner-token-abc';
-    const cookieVal = deriveOwnerCookie('test-owner-token-abc');
-    const req = { headers: { cookie: `lain_owner=${cookieVal}` } } as any;
+    const req = { headers: { cookie: makeV2Cookie('test-owner-token-abc') } } as any;
     expect(isOwner(req)).toBe(true);
   });
 
   it('isOwner returns false with tampered cookie value', async () => {
+    const { isOwner } = await import('../src/web/owner-auth.js');
+    process.env['LAIN_OWNER_TOKEN'] = 'test-owner-token-abc';
+    const req = { headers: { cookie: 'lain_owner_v2=aabbccddeeff0011.deadbeef' } } as any;
+    expect(isOwner(req)).toBe(false);
+  });
+
+  it('isOwner returns false with legacy v1 cookie (rejected outright)', async () => {
     const { isOwner } = await import('../src/web/owner-auth.js');
     process.env['LAIN_OWNER_TOKEN'] = 'test-owner-token-abc';
     const req = { headers: { cookie: 'lain_owner=aabbccddeeff0011' } } as any;
@@ -906,11 +919,12 @@ describe('Auth → API → Response flow', () => {
     expect(isOwner(req)).toBe(false);
   });
 
-  it('isOwner handles multiple cookies — only lain_owner matters', async () => {
-    const { isOwner, deriveOwnerCookie } = await import('../src/web/owner-auth.js');
+  it('isOwner handles multiple cookies — only lain_owner_v2 matters', async () => {
+    const { isOwner } = await import('../src/web/owner-auth.js');
+    const { makeV2CookieValue } = await import('./fixtures/owner-cookie-v2.js');
     process.env['LAIN_OWNER_TOKEN'] = 'test-owner-token-abc';
-    const val = deriveOwnerCookie('test-owner-token-abc');
-    const req = { headers: { cookie: `session=xyz; lain_owner=${val}; other=abc` } } as any;
+    const val = makeV2CookieValue('test-owner-token-abc');
+    const req = { headers: { cookie: `session=xyz; lain_owner_v2=${val}; other=abc` } } as any;
     expect(isOwner(req)).toBe(true);
   });
 
@@ -956,10 +970,13 @@ describe('Auth → API → Response flow', () => {
     }
   });
 
-  it('cookie value is 64 hex chars (SHA-256 output)', async () => {
-    const { deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    const cookie = deriveOwnerCookie('any-token');
-    expect(cookie).toHaveLength(64);
+  it('v2 cookie signature is 64 hex chars (SHA-256 output)', async () => {
+    // findings.md P2:2348 — v2 cookie is `<payload>.<sig>`; signature alone
+    // remains a 64-char hex SHA-256 HMAC.
+    const { makeV2CookieValue } = await import('./fixtures/owner-cookie-v2.js');
+    const [, sig] = makeV2CookieValue('any-token').split('.');
+    expect(sig).toHaveLength(64);
+    expect(sig).toMatch(/^[a-f0-9]+$/);
   });
 
   it('interlink token auth: missing bearer header rejected', async () => {
@@ -1128,10 +1145,11 @@ describe('Memory palace integration', () => {
     expect(result.wingName).toBe('self');
   });
 
-  it('resolveWingForMemory maps visitor ID to per-visitor wing', async () => {
+  it('resolveWingForMemory routes visitors to shared wing with per-user room (findings.md P2:652)', async () => {
     const { resolveWingForMemory } = await import('../src/memory/palace.js');
     const result = resolveWingForMemory('web:unknown', 'user-123', {});
-    expect(result.wingName).toBe('visitor-user-123');
+    expect(result.wingName).toBe('visitors');
+    expect(result.roomName).toBe('visitor-user-123');
   });
 
   it('memory saved with saveMemory gets valid palace placement', async () => {

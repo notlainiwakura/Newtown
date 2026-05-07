@@ -95,26 +95,20 @@ describe('Default config completeness', () => {
     expect(getDefaultConfig().security.keyDerivation.parallelism).toBeGreaterThanOrEqual(1);
   });
 
-  it('default agents is a non-empty array', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    expect(Array.isArray(getDefaultConfig().agents)).toBe(true);
-    expect(getDefaultConfig().agents.length).toBeGreaterThan(0);
+  // findings.md P2:171 — `config.agents` no longer exists. Defaults export
+  // the provider chain directly as `DEFAULT_PROVIDERS`.
+  it('DEFAULT_PROVIDERS is a non-empty array', async () => {
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    expect(Array.isArray(DEFAULT_PROVIDERS)).toBe(true);
+    expect(DEFAULT_PROVIDERS.length).toBeGreaterThan(0);
   });
 
-  it('default agent has id, name, enabled, workspace, providers', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    const agent = getDefaultConfig().agents[0]!;
-    expect(typeof agent.id).toBe('string');
-    expect(typeof agent.name).toBe('string');
-    expect(typeof agent.enabled).toBe('boolean');
-    expect(typeof agent.workspace).toBe('string');
-    expect(Array.isArray(agent.providers)).toBe(true);
-  });
-
-  it('default agent providers array is non-empty', async () => {
-    const { getDefaultConfig } = await import('../src/config/defaults.js');
-    const agent = getDefaultConfig().agents[0]!;
-    expect(agent.providers.length).toBeGreaterThan(0);
+  it('DEFAULT_PROVIDERS entries have type and model fields', async () => {
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    for (const p of DEFAULT_PROVIDERS) {
+      expect(typeof p.type).toBe('string');
+      expect(typeof p.model).toBe('string');
+    }
   });
 
   it('default logging.level is a valid level string', async () => {
@@ -557,10 +551,15 @@ describe('Tool definitions type safety', () => {
     expect(names).toContain('expand_memory');
   });
 
-  it('create_tool meta-tool is registered', async () => {
+  it('create_tool / list_my_tools / delete_tool are NOT registered (P1 findings.md:1561)', async () => {
+    // These meta-tools used `new Function()` + `require` + `process` to
+    // execute LLM-authored JavaScript, which made every cross-peer
+    // injection vector a path to host RCE. Removed; skills.ts deleted.
     const { getToolDefinitions } = await import('../src/agent/tools.js');
     const names = getToolDefinitions().map((d) => d.name);
-    expect(names).toContain('create_tool');
+    expect(names).not.toContain('create_tool');
+    expect(names).not.toContain('list_my_tools');
+    expect(names).not.toContain('delete_tool');
   });
 
   it('send_letter tool is registered', async () => {
@@ -569,19 +568,9 @@ describe('Tool definitions type safety', () => {
     expect(names).toContain('send_letter');
   });
 
-  it('telegram_call tool requires approval', async () => {
-    const { toolRequiresApproval } = await import('../src/agent/tools.js');
-    expect(toolRequiresApproval('telegram_call')).toBe(true);
-  });
-
-  it('calculate tool does not require approval', async () => {
-    const { toolRequiresApproval } = await import('../src/agent/tools.js');
-    expect(toolRequiresApproval('calculate')).toBe(false);
-  });
-
-  it('unknown tool does not require approval', async () => {
-    const { toolRequiresApproval } = await import('../src/agent/tools.js');
-    expect(toolRequiresApproval('__nonexistent__')).toBe(false);
+  it('dead toolRequiresApproval helper has been removed (P1 findings.md)', async () => {
+    const mod = await import('../src/agent/tools.js') as Record<string, unknown>;
+    expect(mod['toolRequiresApproval']).toBeUndefined();
   });
 
   it('tools count is at least 10 (core set)', async () => {
@@ -841,5 +830,89 @@ describe('Enum exhaustiveness — finishReason mapping', () => {
     for (const [key, expected] of knownPrefixes) {
       expect(parseEventType(key)).toBe(expected);
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// findings.md P2:199 — MediaPayload narrowing
+// ─────────────────────────────────────────────────────────
+
+describe('MediaPayload narrowing (findings.md P2:199)', () => {
+  it('ImageContent accepts a url-only payload', async () => {
+    const { ImageContent } = await import('../src/types/message.js').then((m) => ({ ImageContent: {} as unknown as import('../src/types/message.js').ImageContent }));
+    void ImageContent;
+    const img: import('../src/types/message.js').ImageContent = {
+      type: 'image',
+      mimeType: 'image/png',
+      url: 'https://example/img.png',
+    };
+    expect(img.type).toBe('image');
+  });
+
+  it('ImageContent accepts a base64-only payload', () => {
+    const img: import('../src/types/message.js').ImageContent = {
+      type: 'image',
+      mimeType: 'image/png',
+      base64: 'data:image/png;base64,abc',
+    };
+    expect(img.type).toBe('image');
+  });
+
+  it('ImageContent accepts both url and base64 (cached download)', () => {
+    const img: import('../src/types/message.js').ImageContent = {
+      type: 'image',
+      mimeType: 'image/png',
+      url: 'https://example/img.png',
+      base64: 'data:image/png;base64,abc',
+    };
+    expect(img.type).toBe('image');
+  });
+
+  it('ImageContent rejects a payload with neither url nor base64 (compile-time)', () => {
+    // @ts-expect-error — MediaPayload requires url or base64
+    const bad: import('../src/types/message.js').ImageContent = {
+      type: 'image',
+      mimeType: 'image/png',
+    };
+    expect(bad.type).toBe('image');
+  });
+
+  it('FileContent rejects a payload with neither url nor base64 (compile-time)', () => {
+    // @ts-expect-error — MediaPayload requires url or base64
+    const bad: import('../src/types/message.js').FileContent = {
+      type: 'file',
+      mimeType: 'application/pdf',
+      filename: 'x.pdf',
+    };
+    expect(bad.type).toBe('file');
+  });
+
+  it('AudioContent rejects a payload with neither url nor base64 (compile-time)', () => {
+    // @ts-expect-error — MediaPayload requires url or base64
+    const bad: import('../src/types/message.js').AudioContent = {
+      type: 'audio',
+      mimeType: 'audio/ogg',
+    };
+    expect(bad.type).toBe('audio');
+  });
+
+  it('FileContent accepts url-only payload with filename', () => {
+    const f: import('../src/types/message.js').FileContent = {
+      type: 'file',
+      mimeType: 'application/pdf',
+      filename: 'doc.pdf',
+      url: 'https://example/doc.pdf',
+    };
+    expect(f.filename).toBe('doc.pdf');
+  });
+
+  it('AudioContent accepts base64-only payload with optional duration', () => {
+    const a: import('../src/types/message.js').AudioContent = {
+      type: 'audio',
+      mimeType: 'audio/ogg',
+      base64: 'data:audio/ogg;base64,xyz',
+      duration: 12,
+    };
+    expect(a.duration).toBe(12);
   });
 });

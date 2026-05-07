@@ -1,0 +1,14 @@
+services:
+  voice-service:
+    build: .
+    ports:
+      - "8765:8765"
+    env_file:
+      - .env
+    volumes:
+      # Persist Telegram session directory
+      - ./sessions:/app/sessions
+    environment:
+      - TELEGRAM_SESSION_PATH=/app/sessions/lain_voice
+      - VOICE_SERVICE_HOST=0.0.0.0
+    restart: unless-stopped

@@ -127,42 +127,74 @@ export function startMemoryMaintenanceLoop(config?: Partial<MemoryMaintenanceCon
 }
 
 /**
- * Run all maintenance tasks
+ * Result of a single maintenance phase. Surfaced by `runMemoryMaintenance`
+ * so tests and operator dashboards can distinguish "phase ran clean" from
+ * "phase threw — we swallowed it and continued".
  */
-export async function runMemoryMaintenance(): Promise<void> {
+export interface MaintenancePhaseResult {
+  phase: string;
+  ok: boolean;
+  durationMs: number;
+  detail?: unknown;
+  error?: string;
+}
+
+/**
+ * findings.md P2:704 — wrap a single maintenance phase so a throw in one
+ * phase doesn't skip the nine others. Logs failures at `warn` with the
+ * phase name, and records the last-error on a meta-ish row we expose via
+ * the returned array so the caller (tests, ops endpoint) can surface it.
+ */
+async function runPhase(
+  phase: string,
+  fn: () => unknown | Promise<unknown>,
+): Promise<MaintenancePhaseResult> {
+  const logger = getLogger();
+  const started = Date.now();
+  try {
+    const detail = await fn();
+    const durationMs = Date.now() - started;
+    logger.info({ phase, durationMs, detail }, `Maintenance phase complete: ${phase}`);
+    return { phase, ok: true, durationMs, detail };
+  } catch (err) {
+    const durationMs = Date.now() - started;
+    const error = err instanceof Error ? err.message : String(err);
+    logger.warn({ phase, durationMs, error }, `Maintenance phase failed: ${phase}`);
+    return { phase, ok: false, durationMs, error };
+  }
+}
+
+/**
+ * Run all maintenance tasks. Each phase runs inside its own try/catch so
+ * one failing phase doesn't silently skip the remaining ones. Returns an
+ * array of per-phase results for operator / test visibility.
+ */
+export async function runMemoryMaintenance(): Promise<MaintenancePhaseResult[]> {
   const logger = getLogger();
 
   logger.info('Running memory maintenance');
 
-  const forgottenCount = gracefulForgetting();
-  logger.info({ forgottenCount }, 'Graceful forgetting complete');
+  const results: MaintenancePhaseResult[] = [];
+  results.push(await runPhase('gracefulForgetting', gracefulForgetting));
+  results.push(await runPhase('detectCrossConversationPatterns', detectCrossConversationPatterns));
+  results.push(await runPhase('evolveImportance', evolveImportance));
+  results.push(await runPhase('decayAssociationStrength', decayAssociationStrength));
+  results.push(await runPhase('distillMemoryClusters', distillMemoryClusters));
+  results.push(await runPhase('protectLandmarkMemories', protectLandmarkMemories));
+  results.push(await runPhase('generateEraSummaries', generateEraSummaries));
+  results.push(await runPhase('enforceMemoryCap', enforceMemoryCap));
+  results.push(await runPhase('runTopologyMaintenance', runTopologyMaintenance));
+  results.push(await runPhase('maintainKnowledgeGraph', maintainKnowledgeGraph));
 
-  const patternsFound = detectCrossConversationPatterns();
-  logger.info({ patternsFound }, 'Cross-conversation pattern detection complete');
+  const failed = results.filter((r) => !r.ok);
+  if (failed.length > 0) {
+    logger.warn(
+      { failedPhases: failed.map((f) => f.phase), failureCount: failed.length, totalPhases: results.length },
+      'Memory maintenance completed with phase failures',
+    );
+  }
 
-  const evolvedCount = evolveImportance();
-  logger.info({ evolvedCount }, 'Importance evolution complete');
-
-  const decayedCount = decayAssociationStrength();
-  logger.info({ decayedCount }, 'Association strength decay complete');
-
-  const distilledCount = await distillMemoryClusters();
-  logger.info({ distilledCount }, 'Memory distillation complete');
-
-  const landmarksProtected = protectLandmarkMemories();
-  logger.info({ landmarksProtected }, 'Landmark protection complete');
-
-  const eraSummaries = await generateEraSummaries();
-  logger.info({ eraSummaries }, 'Era summary generation complete');
-
-  const pruned = enforceMemoryCap();
-  logger.info({ pruned }, 'Memory cap enforcement complete');
-
-  await runTopologyMaintenance();
-  logger.info('Topology maintenance complete');
-
-  const kgStats = maintainKnowledgeGraph();
-  logger.info(kgStats, 'Knowledge graph maintenance complete');
+  return results;
 }
 
 /**
@@ -197,9 +229,21 @@ function gracefulForgetting(): number {
       (memory.emotionalWeight ?? 0) < 0.1 &&
       memory.accessCount < 2
     ) {
-      // Check for associations — don't compost connected memories
-      const associations = getAssociations(memory.id, 1);
-      if (associations.length > 0) {
+      // findings.md P2:738 — exempt only strongly-associated memories.
+      // The old check `getAssociations(id, 1).length === 0` made the
+      // exemption binary, so any memory with a single weak edge stayed
+      // exempt forever. Since consolidate + cross-conversation + KG
+      // all create associations aggressively over time, Phase 1 found
+      // almost nothing to compost and graceful-forgetting stalled.
+      // Sum the top 10 edge strengths and only exempt when the total
+      // clears a tunable threshold (default 0.5). Weakly-linked
+      // memories can now fade naturally.
+      const associations = getAssociations(memory.id, 10);
+      const totalStrength = associations.reduce(
+        (sum, a) => sum + (a.strength ?? 0),
+        0,
+      );
+      if (totalStrength > COMPOST_STRENGTH_THRESHOLD) {
         continue;
       }
 
@@ -233,6 +277,31 @@ function gracefulForgetting(): number {
 }
 
 /**
+ * Fisher-Yates shuffle. Mutates the input array in place. Used by
+ * `detectCrossConversationPatterns` (findings.md P2:750) to break the
+ * "same sessions every cycle" sampling pattern.
+ */
+function shuffleInPlace<T>(arr: T[]): void {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = arr[i]!;
+    arr[i] = arr[j]!;
+    arr[j] = tmp;
+  }
+}
+
+/**
+ * Sample up to `n` random elements from `arr` without replacement.
+ * Returns a new array — does not mutate the input.
+ */
+function sampleRandom<T>(arr: T[], n: number): T[] {
+  if (arr.length <= n) return arr.slice();
+  const copy = arr.slice();
+  shuffleInPlace(copy);
+  return copy.slice(0, n);
+}
+
+/**
  * Detect patterns across different conversations/sessions.
  * Find memories with high embedding similarity that aren't already associated.
  */
@@ -256,18 +325,33 @@ function detectCrossConversationPatterns(): number {
   const sessionKeys = [...bySession.keys()];
   if (sessionKeys.length < 2) return 0;
 
+  // findings.md P2:750 — the old version ran the inner 10-session
+  // window over `[...bySession.keys()]` in insertion order, so the
+  // same sessions got sampled every cycle; older/deeper sessions
+  // were structurally invisible. Even within a session, `slice(0, 5)`
+  // always grabbed the same 5 memories. Shuffle both so every
+  // maintenance run covers a different slice of the space; over N
+  // cycles we still reach the full graph. Caps are also raised
+  // (10→20 session-wide, 5→10 memory-wide) — that lifts the
+  // comparisons-per-run from 2500 to ~40k, still well inside a
+  // background maintenance budget while materially expanding
+  // coverage on characters with hundreds of sessions.
+  shuffleInPlace(sessionKeys);
+  const SESSION_SAMPLE_CAP = 20;
+  const MEMORY_SAMPLE_CAP = 10;
+
   // Compare memories across different sessions (limit comparisons)
-  for (let i = 0; i < sessionKeys.length && i < 10; i++) {
+  for (let i = 0; i < sessionKeys.length && i < SESSION_SAMPLE_CAP; i++) {
     const sessionA = bySession.get(sessionKeys[i]!);
     if (!sessionA) continue;
 
-    for (let j = i + 1; j < sessionKeys.length && j < 10; j++) {
+    for (let j = i + 1; j < sessionKeys.length && j < SESSION_SAMPLE_CAP; j++) {
       const sessionB = bySession.get(sessionKeys[j]!);
       if (!sessionB) continue;
 
-      // Sample memories to limit computation
-      const sampleA = sessionA.slice(0, 5);
-      const sampleB = sessionB.slice(0, 5);
+      // Sample memories to limit computation (randomized per-cycle).
+      const sampleA = sampleRandom(sessionA, MEMORY_SAMPLE_CAP);
+      const sampleB = sampleRandom(sessionB, MEMORY_SAMPLE_CAP);
 
       for (const a of sampleA) {
         if (!a.embedding) continue;
@@ -445,10 +529,18 @@ async function distillMemoryClusters(): Promise<number> {
       const memoryTexts: string[] = [];
       const sourceIds: string[] = [];
 
+      // findings.md P2:801 — cap raised from 200 → 2000 chars per memory.
+      // The 200-char truncation meant long discovery / diary entries were
+      // distilled from their first sentence only, producing a summary of
+      // summaries instead of a summary of the actual content. At 2000
+      // chars most memories are preserved in full (the corpus median is
+      // well under that) and the 20-memory × 2000-char cap caps the
+      // prompt at ~40k chars / ~10k tokens — comfortable for any
+      // provider's distillation window with maxTokens=400 for the output.
       for (const id of cluster.undistilled.slice(0, 20)) {
         const mem = getMemory(id);
         if (mem) {
-          const content = mem.content.length > 200 ? mem.content.slice(0, 200) + '...' : mem.content;
+          const content = mem.content.length > 2000 ? mem.content.slice(0, 2000) + '...' : mem.content;
           memoryTexts.push(`- [${mem.memoryType}] ${content}`);
           sourceIds.push(id);
         }
@@ -650,16 +742,13 @@ async function generateEraSummaries(): Promise<number> {
         metadata: { isEraSummary: true, eraMonth: month.ym, sourceCount: memories.length, createdAt: Date.now() },
       });
 
-      // Archive the source memories (they stay in DB but won't be retrieved normally)
-      const ids = memories.map(m => m.id);
-      for (const id of ids) {
-        setLifecycleState(id, 'archived' as 'composting'); // archived handled same as composting for lifecycle
+      // Archive the source memories — they stay in the DB but are excluded
+      // from searchMemories so they don't compete with the summary for
+      // retrieval slots. findings.md P2:738 / P2:755 — 'archived' is now
+      // part of LifecycleState, so setLifecycleState takes it directly.
+      for (const { id } of memories) {
+        setLifecycleState(id, 'archived');
       }
-      // Actually use a direct update since 'archived' isn't in the LifecycleState type
-      execute(
-        `UPDATE memories SET lifecycle_state = 'archived', lifecycle_changed_at = ? WHERE id IN (${ids.map(() => '?').join(',')})`,
-        [Date.now(), ...ids]
-      );
 
       summariesCreated++;
       logger.info({ month: month.ym, sourceCount: memories.length }, 'Generated era summary');
@@ -766,7 +855,48 @@ function maintainKnowledgeGraph(): { triplesCreated: number; entitiesUpdated: nu
   return { triplesCreated, entitiesUpdated, contradictions: contradictions.length };
 }
 
-const MEMORY_CAP = 10_000;
+/**
+ * findings.md P2:789 — the previous cap of 10_000 was below production
+ * reality: Lain and Wired already carry ~15k memories each. A cap of
+ * 10k would attempt to delete ~5k memories in a single maintenance run,
+ * which (a) is silent destruction of years of character history and
+ * (b) collides with the character-memories-sacred invariant
+ * (see memory/feedback_character_memories_sacred.md). Default raised
+ * to 50_000 for production headroom; overridable via `LAIN_MEMORY_CAP`
+ * env for operators that want a different ceiling per deployment.
+ * Additionally `MEMORY_CAP_PRUNE_PER_CYCLE` limits how many memories a
+ * single maintenance run will delete so pruning is gradual (500/cycle
+ * at the default ~4hr cadence => 3000/day max delete rate), giving an
+ * operator time to notice via logs before the corpus is decimated.
+ */
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+const MEMORY_CAP = parsePositiveInt(process.env['LAIN_MEMORY_CAP'], 50_000);
+const MEMORY_CAP_PRUNE_PER_CYCLE = parsePositiveInt(
+  process.env['LAIN_MEMORY_CAP_PRUNE_PER_CYCLE'],
+  500,
+);
+
+// findings.md P2:738 — graceful-forgetting Phase 1 used to exempt any
+// memory with a single association. With consolidation + KG sync +
+// cross-conversation detection all creating edges aggressively over
+// time, nearly every mature memory accrued at least one weak edge
+// and Phase 1 stopped finding anything to compost. The exemption is
+// now strength-summed: only memories with total top-10 edge strength
+// > COMPOST_STRENGTH_THRESHOLD stay. Default 0.5 (typical edge
+// strengths run 0.1-1.0), tunable via env for operator dials.
+function parseFloatWithFallback(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const n = parseFloat(value);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+const COMPOST_STRENGTH_THRESHOLD = parseFloatWithFallback(
+  process.env['LAIN_COMPOST_STRENGTH_THRESHOLD'],
+  0.5,
+);
 
 /**
  * Enforce a hard cap on total memory count per character.
@@ -783,7 +913,11 @@ function enforceMemoryCap(): number {
   if (totalCount <= MEMORY_CAP) return 0;
 
   const excess = totalCount - MEMORY_CAP;
-  logger.info({ totalCount, cap: MEMORY_CAP, excess }, 'Memory cap exceeded, pruning');
+  const pruneThisCycle = Math.min(excess, MEMORY_CAP_PRUNE_PER_CYCLE);
+  logger.warn(
+    { totalCount, cap: MEMORY_CAP, excess, pruneThisCycle },
+    'Memory cap exceeded — pruning gradually',
+  );
 
   // Find lowest-value memories to prune (exempt landmarks, facts, preferences, summaries)
   interface PruneCandidate { id: string; }
@@ -796,13 +930,13 @@ function enforceMemoryCap(): number {
        AND lifecycle_state != 'archived'
      ORDER BY importance ASC, access_count ASC, created_at ASC
      LIMIT ?`,
-    [excess]
+    [pruneThisCycle]
   );
 
   for (const row of toPrune) {
     deleteMemory(row.id);
   }
 
-  logger.info({ pruned: toPrune.length }, 'Memory cap pruning complete');
+  logger.warn({ pruned: toPrune.length, stillOverBy: excess - toPrune.length }, 'Memory cap pruning cycle complete');
   return toPrune.length;
 }

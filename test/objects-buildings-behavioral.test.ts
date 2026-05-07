@@ -33,6 +33,14 @@ vi.mock('../src/config/characters.js', () => ({
   getCharacterEntry: vi.fn().mockReturnValue(undefined),
   getWebCharacter: vi.fn().mockReturnValue(undefined),
   getPeersFor: vi.fn().mockReturnValue([]),
+  getDossierSubjects: vi.fn().mockReturnValue([
+    { id: 'lain', name: 'Lain', port: 3001 },
+    { id: 'dr-claude', name: 'Dr. Claude', port: 3002 },
+    { id: 'pkd', name: 'Philip K. Dick', port: 3003 },
+    { id: 'mckenna', name: 'Terence McKenna', port: 3004 },
+    { id: 'john', name: 'John', port: 3005 },
+    { id: 'hiru', name: 'Hiru', port: 3006 },
+  ]),
   loadManifest: vi.fn().mockReturnValue({ town: { name: 'Test Town', description: '' }, characters: [] }),
 }));
 
@@ -187,10 +195,17 @@ describe('Object store behavioral', () => {
     expect(retrieved!.metadata).toEqual(meta);
   });
 
-  it('object with fixture metadata is detected as fixture', async () => {
+  // findings.md P2:3334 — fixture metadata requires the isSystem opt-in.
+  it('object with fixture metadata + isSystem:true is detected as fixture', async () => {
+    const { createObject, isFixture } = await import('../src/objects/store.js');
+    const obj = createObject('Table', 'A table', 'lain', 'Lain', 'bar', { fixture: true }, { isSystem: true });
+    expect(isFixture(obj.id)).toBe(true);
+  });
+
+  it('fixture metadata is stripped when isSystem is not set', async () => {
     const { createObject, isFixture } = await import('../src/objects/store.js');
     const obj = createObject('Table', 'A table', 'lain', 'Lain', 'bar', { fixture: true });
-    expect(isFixture(obj.id)).toBe(true);
+    expect(isFixture(obj.id)).toBe(false);
   });
 
   it('non-fixture object is not detected as fixture', async () => {
@@ -412,6 +427,79 @@ describe('Object store behavioral', () => {
   it('getAllObjects returns empty array when no objects exist', async () => {
     const { getAllObjects } = await import('../src/objects/store.js');
     expect(getAllObjects()).toHaveLength(0);
+  });
+
+  // ── Ground object expiry ────────────────────────────────────
+
+  it('created ground objects receive a default expiry timestamp', async () => {
+    const { createObject, DEFAULT_GROUND_OBJECT_TTL_MS } = await import('../src/objects/store.js');
+    const now = Date.now();
+    const obj = createObject('Dew', 'A small transient thing', 'lain', 'Lain', 'field', undefined, { now });
+    expect(obj.expiresAt).toBe(now + DEFAULT_GROUND_OBJECT_TTL_MS);
+  });
+
+  it('system fixtures stay permanent', async () => {
+    const { createObject } = await import('../src/objects/store.js');
+    const obj = createObject(
+      'Bench',
+      'Bolted to the floor',
+      'system',
+      'System',
+      'library',
+      { fixture: true },
+      { isSystem: true, expiresAt: Date.now() - 1 },
+    );
+    expect(obj.expiresAt).toBeNull();
+  });
+
+  it('expired ground objects are hidden from location, count, and all-object queries', async () => {
+    const { createObject, getObjectsByLocation, countByLocation, getAllObjects } = await import('../src/objects/store.js');
+    createObject('Expired', 'Gone soon', 'lain', 'Lain', 'library', undefined, { expiresAt: Date.now() - 1 });
+    createObject('Fresh', 'Still here', 'lain', 'Lain', 'library', undefined, { ttlMs: 60_000 });
+
+    const locationObjects = getObjectsByLocation('library');
+    expect(locationObjects).toHaveLength(1);
+    expect(locationObjects[0]!.name).toBe('Fresh');
+    expect(countByLocation('library')).toBe(1);
+    expect(getAllObjects().map((obj) => obj.name)).not.toContain('Expired');
+  });
+
+  it('expireStaleObjects deletes expired loose objects and logs an expire event', async () => {
+    const { createObject, expireStaleObjects, getObject, getObjectEvents } = await import('../src/objects/store.js');
+    const obj = createObject('Wilted Flower', 'It has done its work', 'lain', 'Lain', 'field', undefined, { expiresAt: Date.now() - 1 });
+
+    expect(expireStaleObjects()).toBe(1);
+    expect(getObject(obj.id)).toBeNull();
+
+    const events = getObjectEvents(obj.id);
+    const expire = events.find((event) => event.eventType === 'expire');
+    expect(expire).toBeDefined();
+    expect(expire!.actorId).toBe('system');
+    expect(expire!.metadata['name']).toBe('Wilted Flower');
+  });
+
+  it('expireStaleObjects preserves inventory even if an expiry timestamp exists', async () => {
+    const { createObject, pickupObject, expireStaleObjects, getObject } = await import('../src/objects/store.js');
+    const { execute } = await import('../src/storage/database.js');
+    const obj = createObject('Pocket Note', 'Carried away', 'lain', 'Lain', 'library');
+    pickupObject(obj.id, 'pkd', 'PKD');
+    execute('UPDATE objects SET expires_at = ? WHERE id = ?', [Date.now() - 1, obj.id]);
+
+    expect(expireStaleObjects()).toBe(0);
+    expect(getObject(obj.id)!.ownerId).toBe('pkd');
+  });
+
+  it('dropObject renews expiry for returned ground objects', async () => {
+    const { createObject, pickupObject, dropObject, getObject } = await import('../src/objects/store.js');
+    const obj = createObject('Lantern', 'Briefly carried', 'lain', 'Lain', 'library');
+    pickupObject(obj.id, 'pkd', 'PKD');
+    const beforeDrop = Date.now();
+    dropObject(obj.id, 'pkd', 'bar');
+
+    const dropped = getObject(obj.id)!;
+    expect(dropped.ownerId).toBeNull();
+    expect(dropped.location).toBe('bar');
+    expect(dropped.expiresAt).toBeGreaterThanOrEqual(beforeDrop);
   });
 
   // ── Unicode and long content ────────────────────────────────
@@ -705,6 +793,98 @@ describe('Object store behavioral', () => {
     const ground = getObjectsByLocation('library');
     expect(ground).toHaveLength(1);
     expect(ground[0]!.name).toBe('B');
+  });
+
+  // ── Audit ledger (findings.md P2:3364) ───────────────────────
+
+  it('createObject logs a create event', async () => {
+    const { createObject, getObjectEvents } = await import('../src/objects/store.js');
+    const obj = createObject('Rune', 'Glyph', 'lain', 'Lain', 'library');
+    const events = getObjectEvents(obj.id);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.eventType).toBe('create');
+    expect(events[0]!.actorId).toBe('lain');
+    expect(events[0]!.location).toBe('library');
+  });
+
+  it('pickupObject logs a pickup event with prior location', async () => {
+    const { createObject, pickupObject, getObjectEvents } = await import('../src/objects/store.js');
+    const obj = createObject('Rune', 'Glyph', 'lain', 'Lain', 'library');
+    pickupObject(obj.id, 'pkd', 'PKD');
+    const events = getObjectEvents(obj.id);
+    const pickup = events.find((e) => e.eventType === 'pickup');
+    expect(pickup).toBeDefined();
+    expect(pickup!.actorId).toBe('pkd');
+    expect(pickup!.location).toBe('library');
+  });
+
+  it('dropObject logs a drop event at new location', async () => {
+    const { createObject, pickupObject, dropObject, getObjectEvents } = await import('../src/objects/store.js');
+    const obj = createObject('Rune', 'Glyph', 'lain', 'Lain', 'library');
+    pickupObject(obj.id, 'pkd', 'PKD');
+    dropObject(obj.id, 'pkd', 'field');
+    const events = getObjectEvents(obj.id);
+    const drop = events.find((e) => e.eventType === 'drop');
+    expect(drop).toBeDefined();
+    expect(drop!.actorId).toBe('pkd');
+    expect(drop!.location).toBe('field');
+  });
+
+  it('transferObject logs a transfer event with subject', async () => {
+    const { createObject, pickupObject, transferObject, getObjectEvents } = await import('../src/objects/store.js');
+    const obj = createObject('Rune', 'Glyph', 'lain', 'Lain', 'library');
+    pickupObject(obj.id, 'pkd', 'PKD');
+    transferObject(obj.id, 'pkd', 'mckenna', 'McKenna');
+    const events = getObjectEvents(obj.id);
+    const transfer = events.find((e) => e.eventType === 'transfer');
+    expect(transfer).toBeDefined();
+    expect(transfer!.actorId).toBe('pkd');
+    expect(transfer!.subjectId).toBe('mckenna');
+    expect(transfer!.subjectName).toBe('McKenna');
+  });
+
+  it('destroyObject logs a destroy event AND events survive the DELETE', async () => {
+    const { createObject, destroyObject, getObject, getObjectEvents } = await import('../src/objects/store.js');
+    const obj = createObject('Rune', 'Glyph', 'lain', 'Lain', 'library');
+    destroyObject(obj.id, 'lain');
+    expect(getObject(obj.id)).toBeNull();
+    const events = getObjectEvents(obj.id);
+    expect(events.find((e) => e.eventType === 'destroy')).toBeDefined();
+    expect(events.find((e) => e.eventType === 'create')).toBeDefined();
+    const destroy = events.find((e) => e.eventType === 'destroy')!;
+    expect(destroy.metadata['name']).toBe('Rune');
+    expect(destroy.metadata['description']).toBe('Glyph');
+  });
+
+  it('failed pickup (already owned) logs no event', async () => {
+    const { createObject, pickupObject, getObjectEvents } = await import('../src/objects/store.js');
+    const obj = createObject('Rune', 'Glyph', 'lain', 'Lain', 'library');
+    pickupObject(obj.id, 'pkd', 'PKD');
+    const ok = pickupObject(obj.id, 'mckenna', 'McKenna');
+    expect(ok).toBe(false);
+    const pickups = getObjectEvents(obj.id).filter((e) => e.eventType === 'pickup');
+    expect(pickups).toHaveLength(1);
+    expect(pickups[0]!.actorId).toBe('pkd');
+  });
+
+  it('failed destroy (wrong actor) logs no event', async () => {
+    const { createObject, pickupObject, destroyObject, getObjectEvents } = await import('../src/objects/store.js');
+    const obj = createObject('Rune', 'Glyph', 'lain', 'Lain', 'library');
+    pickupObject(obj.id, 'pkd', 'PKD');
+    const ok = destroyObject(obj.id, 'mckenna');
+    expect(ok).toBe(false);
+    const destroys = getObjectEvents(obj.id).filter((e) => e.eventType === 'destroy');
+    expect(destroys).toHaveLength(0);
+  });
+
+  it('getRecentObjectEvents returns events across all objects newest first', async () => {
+    const { createObject, getRecentObjectEvents } = await import('../src/objects/store.js');
+    createObject('A', 'd', 'lain', 'Lain', 'library');
+    await new Promise((r) => setTimeout(r, 2));
+    createObject('B', 'd', 'lain', 'Lain', 'library');
+    const events = getRecentObjectEvents(10);
+    expect(events.length).toBeGreaterThanOrEqual(2);
+    expect(events[0]!.createdAt).toBeGreaterThanOrEqual(events[1]!.createdAt);
   });
 });
 
@@ -1097,8 +1277,11 @@ describe('Building operations behavioral', () => {
       }
     });
 
-    it('pruning removes events older than 48h', async () => {
-      const { storeBuildingEventLocal, queryBuildingEvents } = await import('../src/commune/building-memory.js');
+    it('pruneBuildingEvents removes events older than 48h', async () => {
+      // findings.md P2:1473 — prune is no longer on the read path.
+      // Callers schedule `startBuildingMemoryPruneLoop`; tests invoke
+      // `pruneBuildingEvents` directly.
+      const { storeBuildingEventLocal, queryBuildingEvents, pruneBuildingEvents } = await import('../src/commune/building-memory.js');
       const now = Date.now();
       const fiftyHoursAgo = now - 50 * 60 * 60 * 1000;
       storeBuildingEventLocal(db, {
@@ -1109,7 +1292,8 @@ describe('Building operations behavioral', () => {
         id: 'fresh', building: 'threshold', event_type: 'arrival',
         summary: 'fresh event', emotional_tone: 0, actors: [], created_at: now,
       });
-      // queryBuildingEvents prunes > 48h events
+      const removed = pruneBuildingEvents(db);
+      expect(removed).toBeGreaterThanOrEqual(1);
       const events = queryBuildingEvents(db, 'threshold', 100);
       expect(events.some(e => e.id === 'ancient')).toBe(false);
       expect(events.some(e => e.id === 'fresh')).toBe(true);
@@ -1284,10 +1468,12 @@ describe('Location management behavioral', () => {
   });
 
   it('getCurrentLocation returns default on fresh database', async () => {
+    // findings.md P2:1402 — fallback timestamp is 0, a sentinel
+    // meaning "no persisted record yet" (previously Date.now()).
     const { getCurrentLocation } = await import('../src/commune/location.js');
     const loc = getCurrentLocation();
     expect(loc.building).toBeTruthy();
-    expect(loc.timestamp).toBeGreaterThan(0);
+    expect(loc.timestamp).toBe(0);
   });
 
   it('default location falls back to lighthouse for unknown character', async () => {

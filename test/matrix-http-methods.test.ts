@@ -39,7 +39,7 @@ interface EndpointDef {
 const MAIN_ENDPOINTS: EndpointDef[] = [
   { path: '/api/health',                       allowedMethods: ['GET'],            server: 'main', description: 'health check' },
   { path: '/api/characters',                   allowedMethods: ['GET'],            server: 'main', description: 'character manifest' },
-  { path: '/gate',                             allowedMethods: ['GET'],            server: 'main', description: 'owner auth gate' },
+  { path: '/gate',                             allowedMethods: ['GET', 'POST'],    server: 'main', description: 'owner auth gate (POST preferred per findings.md P2:2466)' },
   { path: '/api/location',                     allowedMethods: ['GET'],            server: 'main', description: 'current location' },
   { path: '/api/internal-state',               allowedMethods: ['GET'],            server: 'main', description: 'emotional state' },
   { path: '/api/weather',                      allowedMethods: ['GET'],            server: 'main', description: 'town weather' },

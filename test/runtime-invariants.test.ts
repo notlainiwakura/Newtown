@@ -685,7 +685,12 @@ describe('Memory system runtime invariants', () => {
 
     it('content is never truncated in save/retrieve cycle', async () => {
       const { saveMessage, getRecentMessages } = await import('../src/memory/store.js');
+      const { eventBus } = await import('../src/events/bus.js');
       const longContent = 'x'.repeat(10000);
+      const activityEvents: Array<{ content: string }> = [];
+      eventBus._resetForTests();
+      eventBus.setCharacterId('test-character');
+      eventBus.on('activity', (event) => activityEvents.push(event));
       saveMessage({
         sessionKey: 'test:long',
         userId: null,
@@ -696,6 +701,8 @@ describe('Memory system runtime invariants', () => {
       });
       const msgs = getRecentMessages('test:long');
       expect(msgs[0]!.content).toBe(longContent);
+      expect(activityEvents[0]!.content).toBe(longContent);
+      eventBus.removeAllListeners('activity');
     });
 
     it('empty session returns empty array (not error)', async () => {
@@ -970,10 +977,13 @@ describe('Building/location runtime invariants', () => {
     });
 
     it('returns a timestamp', async () => {
+      // findings.md P2:1402 — unpersisted fallback uses timestamp:0 as a
+      // sentinel. Verify the field type and non-negative value rather
+      // than forcing > 0, since the test runs without persisted meta.
       const { getCurrentLocation } = await import('../src/commune/location.js');
       const loc = getCurrentLocation('test');
       expect(typeof loc.timestamp).toBe('number');
-      expect(loc.timestamp).toBeGreaterThan(0);
+      expect(loc.timestamp).toBeGreaterThanOrEqual(0);
     });
   });
 
@@ -1489,13 +1499,13 @@ describe('Desire system runtime invariants', () => {
       expect(ctx).toContain('pkd');
     });
 
-    it('uses intensity-aware adverbs', async () => {
+    it('uses intensity-aware pull labels', async () => {
       const { createDesire, getDesireContext } = await import('../src/agent/desires.js');
       createDesire({ type: 'social', description: 'strong desire', source: 'test', intensity: 0.9 });
       createDesire({ type: 'emotional', description: 'faint desire', source: 'test', intensity: 0.2 });
       const ctx = getDesireContext();
-      expect(ctx).toContain('strongly');
-      expect(ctx).toContain('faintly');
+      expect(ctx).toContain('[pull: strong]');
+      expect(ctx).toContain('[pull: faint]');
     });
   });
 });
@@ -2063,15 +2073,26 @@ describe('Knowledge graph property-based invariants', () => {
     });
   });
 
-  describe('triple with same SPO can coexist', () => {
-    it('duplicate SPO triples get different IDs (not unique constraint)', async () => {
+  describe('triples with same SPO dedupe on active row (findings.md P2:576)', () => {
+    it('duplicate active SPO collapses to the existing row', async () => {
       const { addTriple, queryTriples } = await import('../src/memory/knowledge-graph.js');
       const id1 = addTriple('A', 'is', 'B');
       const id2 = addTriple('A', 'is', 'B');
-      expect(id1).not.toBe(id2);
-      // Both exist
+      expect(id1).toBe(id2);
       const results = queryTriples({ subject: 'A', predicate: 'is', object: 'B' });
-      expect(results.length).toBe(2);
+      expect(results.length).toBe(1);
+    });
+
+    it('a re-asserted SPO after invalidation is a distinct new active row', async () => {
+      const { addTriple, invalidateTriple, queryTriples } = await import(
+        '../src/memory/knowledge-graph.js'
+      );
+      const id1 = addTriple('C', 'is', 'D');
+      invalidateTriple(id1);
+      const id2 = addTriple('C', 'is', 'D');
+      expect(id2).not.toBe(id1);
+      const all = queryTriples({ subject: 'C', predicate: 'is', object: 'D' });
+      expect(all.length).toBe(2);
     });
   });
 
@@ -2711,13 +2732,13 @@ describe('Cross-system runtime invariants', () => {
     }
   });
 
-  it('desire types match desire context adverbs', async () => {
+  it('desire types match desire context pull labels', async () => {
     const { ensureDesireTable, createDesire, getDesireContext } = await import('../src/agent/desires.js');
     ensureDesireTable();
     createDesire({ type: 'social', description: 'reach out to a friend', source: 'test', intensity: 0.5 });
     const ctx = getDesireContext();
-    // Mid intensity should use "somewhat"
-    expect(ctx).toContain('somewhat');
+    // Mid intensity should use "[pull: moderate]"
+    expect(ctx).toContain('[pull: moderate]');
   });
 
   it('multiple KG entities of different types coexist', async () => {
@@ -2733,15 +2754,40 @@ describe('Cross-system runtime invariants', () => {
     expect(concepts.length).toBe(1);
   });
 
-  it('session + messages + deletion: deleting session does not delete messages', async () => {
+  it('session + messages + deletion: deleting session cascades messages but NOT memories (findings.md P2:368)', async () => {
     const { createSession, deleteSession } = await import('../src/storage/sessions.js');
-    const { saveMessage, getRecentMessages } = await import('../src/memory/store.js');
+    const { saveMessage, getRecentMessages, saveMemory, getAllMemories } = await import(
+      '../src/memory/store.js'
+    );
     const s = createSession({ agentId: 'lain', channel: 'web', peerKind: 'user', peerId: 'v' });
-    saveMessage({ sessionKey: s.key, userId: null, role: 'user', content: 'persist me', timestamp: Date.now(), metadata: {} });
+    saveMessage({
+      sessionKey: s.key,
+      userId: null,
+      role: 'user',
+      content: 'persist me',
+      timestamp: Date.now(),
+      metadata: {},
+    });
+    await saveMemory({
+      sessionKey: s.key,
+      userId: null,
+      content: 'a memory tied to this session',
+      memoryType: 'episode',
+      importance: 0.5,
+      emotionalWeight: 0,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {},
+    });
+
     deleteSession(s.key);
-    // Messages should still exist (no cascade)
+
+    // Messages cascade (consistency with sessions table — P2:368).
     const msgs = getRecentMessages(s.key);
-    expect(msgs.length).toBe(1);
+    expect(msgs.length).toBe(0);
+    // Memories are long-term character state — session_key is provenance only.
+    const mems = getAllMemories().filter((m) => m.sessionKey === s.key);
+    expect(mems.length).toBe(1);
   });
 
   it('weather getWeatherEffect values are small adjustments', async () => {

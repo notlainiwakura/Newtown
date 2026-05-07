@@ -1,5 +1,5 @@
 /**
- * NEWTOWN GAME — Chibi Character Sprites (Yami Kawaii)
+ * LAINTOWN GAME — Chibi Character Sprites (Yami Kawaii)
  * Detailed procedural chibi sprites with skin, hair, outfits, and expressive eyes.
  * Each character has unique hair style, outfit, and accessories.
  */
@@ -42,121 +42,36 @@ function renderPixelSprites(scene) {
   const BODY_TOP = 46;
   const BODY_BOT = H - 8;
 
-  // Per-character visual config
-  const charVisuals = {
-    'neo': {
-      hairColor: '#1b1f26', hairLight: '#2c313b',
-      outfit: '#151920', outfitAccent: '#2f6e58',
-      drawHair: (ctx, charId) => {
-        ctx.fillStyle = getSkinProp(charId, 'hairColor', '#1b1f26');
-        ctx.beginPath();
-        ctx.ellipse(HEAD_CX, HEAD_CY - 10, 20, 15, 0, Math.PI, 0);
-        ctx.fill();
-        ctx.fillRect(12, HEAD_CY - 8, 6, 12);
-        ctx.fillRect(46, HEAD_CY - 8, 6, 12);
-        ctx.fillStyle = getSkinProp(charId, 'hairLight', '#2c313b');
-        ctx.fillRect(17, HEAD_CY - 12, 20, 4);
-        ctx.beginPath();
-        ctx.moveTo(36, HEAD_CY - 12);
-        ctx.lineTo(46, HEAD_CY - 8);
-        ctx.lineTo(34, HEAD_CY - 4);
-        ctx.fill();
-      },
-      drawOutfit: (ctx, mR, mG, mB, charId) => {
-        ctx.fillStyle = getSkinProp(charId, 'outfitColor', '#151920');
-        ctx.fillRect(16, BODY_TOP + 1, 32, BODY_BOT - BODY_TOP - 4);
-        ctx.strokeStyle = getSkinProp(charId, 'accentColor', '#2f6e58');
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(HEAD_CX, BODY_TOP + 2);
-        ctx.lineTo(HEAD_CX, BODY_BOT - 6);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(HEAD_CX - 2, BODY_TOP + 3);
-        ctx.lineTo(HEAD_CX - 7, BODY_TOP + 16);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(HEAD_CX + 2, BODY_TOP + 3);
-        ctx.lineTo(HEAD_CX + 7, BODY_TOP + 16);
-        ctx.stroke();
-        ctx.fillStyle = '#0f1318';
-        ctx.fillRect(27, BODY_TOP + 5, 10, 10);
-      },
+  // Default visual config — used for all characters without custom overrides
+  const defaultVisual = {
+    hairColor: '#3a3030', hairLight: '#4a4040',
+    outfit: '#404048', outfitAccent: '#505058',
+    drawHair: (ctx, charId) => {
+      ctx.fillStyle = getSkinProp(charId, 'hairColor', '#3a3030');
+      ctx.beginPath();
+      ctx.ellipse(HEAD_CX, HEAD_CY - 10, 20, 15, 0, Math.PI, 0);
+      ctx.fill();
+      ctx.fillRect(11, HEAD_CY - 8, 6, 12);
+      ctx.fillRect(47, HEAD_CY - 8, 6, 12);
+      ctx.fillStyle = getSkinProp(charId, 'hairLight', '#4a4040');
+      ctx.fillRect(16, HEAD_CY - 14, 32, 6);
     },
-    'plato': {
-      hairColor: '#d6d0c0', hairLight: '#ece6d6',
-      outfit: '#f1ead8', outfitAccent: '#c4a85a',
-      drawHair: (ctx, charId) => {
-        ctx.fillStyle = getSkinProp(charId, 'hairLight', '#ece6d6');
-        ctx.beginPath();
-        ctx.ellipse(HEAD_CX, HEAD_CY - 10, 18, 10, 0, Math.PI, 0);
-        ctx.fill();
-        ctx.fillRect(12, HEAD_CY - 8, 5, 10);
-        ctx.fillRect(47, HEAD_CY - 8, 5, 10);
-        ctx.fillStyle = getSkinProp(charId, 'hairColor', '#d6d0c0');
-        ctx.beginPath();
-        ctx.moveTo(20, HEAD_CY + 10);
-        ctx.quadraticCurveTo(HEAD_CX, HEAD_CY + 25, 44, HEAD_CY + 10);
-        ctx.fill();
-        ctx.beginPath();
-        ctx.ellipse(HEAD_CX, HEAD_CY + 9, 9, 3.5, 0, 0, Math.PI);
-        ctx.fill();
-      },
-      drawOutfit: (ctx, mR, mG, mB, charId) => {
-        ctx.fillStyle = getSkinProp(charId, 'outfitColor', '#f1ead8');
-        ctx.beginPath();
-        ctx.moveTo(16, BODY_TOP + 2);
-        ctx.lineTo(48, BODY_TOP + 2);
-        ctx.lineTo(44, BODY_BOT - 2);
-        ctx.lineTo(20, BODY_BOT - 2);
-        ctx.closePath();
-        ctx.fill();
-        ctx.strokeStyle = getSkinProp(charId, 'accentColor', '#c4a85a');
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(23, BODY_TOP + 5);
-        ctx.lineTo(23, BODY_BOT - 4);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(41, BODY_TOP + 5);
-        ctx.lineTo(41, BODY_BOT - 4);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(HEAD_CX, BODY_TOP + 2);
-        ctx.lineTo(HEAD_CX, BODY_BOT - 4);
-        ctx.stroke();
-      },
-    },
-    'joe': {
-      hairColor: '#4a3326', hairLight: '#6b4b38',
-      outfit: '#53606b', outfitAccent: '#6f8290',
-      drawHair: (ctx, charId) => {
-        ctx.fillStyle = getSkinProp(charId, 'hairColor', '#4a3326');
-        ctx.beginPath();
-        ctx.ellipse(HEAD_CX, HEAD_CY - 9, 19, 13, 0, Math.PI, 0);
-        ctx.fill();
-        ctx.fillRect(12, HEAD_CY - 7, 5, 9);
-        ctx.fillRect(47, HEAD_CY - 7, 5, 9);
-        ctx.fillStyle = getSkinProp(charId, 'hairLight', '#6b4b38');
-        ctx.fillRect(18, HEAD_CY - 11, 28, 4);
-      },
-      drawOutfit: (ctx, mR, mG, mB, charId) => {
-        ctx.fillStyle = getSkinProp(charId, 'outfitColor', '#53606b');
-        ctx.fillRect(18, BODY_TOP + 2, 28, BODY_BOT - BODY_TOP - 6);
-        ctx.strokeStyle = getSkinProp(charId, 'accentColor', '#6f8290');
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.arc(HEAD_CX, BODY_TOP + 4, 8, 0, Math.PI);
-        ctx.stroke();
-        ctx.fillStyle = '#46505a';
-        ctx.fillRect(24, BODY_TOP + 18, 16, 10);
-      },
+    drawOutfit: (ctx, mR, mG, mB, charId) => {
+      ctx.fillStyle = getSkinProp(charId, 'outfitColor', '#404048');
+      ctx.fillRect(18, BODY_TOP + 2, 28, BODY_BOT - BODY_TOP - 6);
+      ctx.strokeStyle = getSkinProp(charId, 'accentColor', '#505058');
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(HEAD_CX, BODY_TOP + 4, 8, 0, Math.PI);
+      ctx.stroke();
     },
   };
 
+  // Per-character visual config (custom overrides — populated by skin system or instance config)
+  const charVisuals = {};
+
   for (const [charId, charData] of Object.entries(CHARACTERS)) {
-    const vis = charVisuals[charId];
-    if (!vis) continue;
+    const vis = charVisuals[charId] || defaultVisual;
 
     const canvas = scene.textures.createCanvas('char_' + charId, W, H);
     const ctx = canvas.getContext();

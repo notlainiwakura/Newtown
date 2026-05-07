@@ -656,13 +656,16 @@ describe('Location', () => {
   });
 
   it('getCurrentLocation returns a location when nothing is persisted', async () => {
+    // findings.md P2:1402 — un-persisted fallback uses timestamp:0 as
+    // a sentinel. Consumers previously saw ever-incrementing
+    // Date.now() values when they probed before any move landed.
     const { getCurrentLocation } = await import('../src/commune/location.js');
     const { eventBus } = await import('../src/events/bus.js');
     eventBus.setCharacterId('test-char');
     const loc = getCurrentLocation();
     expect(typeof loc.building).toBe('string');
     expect(loc.building.length).toBeGreaterThan(0);
-    expect(loc.timestamp).toBeGreaterThan(0);
+    expect(loc.timestamp).toBe(0);
   });
 
   it('default fallback location is lighthouse', async () => {

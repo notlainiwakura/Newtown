@@ -15,15 +15,15 @@ import { getSelfConcept } from './self-concept.js';
 import { getToolDefinitions, executeTool } from './tools.js';
 import { searchMemories, saveMemory } from '../memory/store.js';
 import { getCurrentLocation, getLocationHistory } from '../commune/location.js';
-import { BUILDING_MAP } from '../commune/buildings.js';
+import { BUILDING_MAP, isValidBuilding } from '../commune/buildings.js';
 import { getLogger } from '../utils/logger.js';
 import { getMeta, setMeta } from '../storage/database.js';
 import { setCurrentLocation } from '../commune/location.js';
 import { eventBus } from '../events/bus.js';
-import type { BuildingId } from '../commune/buildings.js';
 import type { PeerConfig } from './character-tools.js';
 import type { ToolResult } from '../providers/base.js';
 import type { TownEvent, EventEffects } from '../events/town-events.js';
+import { getInterlinkHeaders } from '../security/interlink-auth.js';
 
 export interface TownLifeConfig {
   intervalMs: number;
@@ -151,16 +151,22 @@ export function startTownLifeLoop(
     scheduleNext(jitter);
   }
 
-  eventBus.on('activity', (event: import('../events/bus.js').SystemEvent) => {
+  // findings.md P2:2209 — previously added an anonymous handler that was
+  // never removed on loop restart (possession end re-invokes startTownLife
+  // LoopLoop), so duplicate listeners accumulated. Keep the reference so
+  // the cleanup closure can detach it.
+  const activityHandler = (event: import('../events/bus.js').SystemEvent): void => {
     if (stopped || isRunning) return;
     if (event.type === 'commune' || event.type === 'state' || event.type === 'weather') {
       maybeRunEarly(event.type + ' event');
     }
-  });
+  };
+  eventBus.on('activity', activityHandler);
 
   return () => {
     stopped = true;
     if (timer) clearTimeout(timer);
+    eventBus.off('activity', activityHandler);
     logger.info('Town life loop stopped');
   };
 }
@@ -209,11 +215,15 @@ async function discoverNotes(
   const since = Date.now() - 7 * 24 * 60 * 60 * 1000;
   const notes: DiscoveredNote[] = [];
 
+  // findings.md P2:2376 — peer /api/building/notes is now gated by
+  // interlink auth; attach headers so authenticated discovery still works.
+  const headers = getInterlinkHeaders();
+  if (!headers) return notes;
   await Promise.all(peers.map(async (peer) => {
     try {
       const resp = await fetch(
         `${peer.url}/api/building/notes?building=${encodeURIComponent(building)}&since=${since}`,
-        { signal: AbortSignal.timeout(5000) }
+        { headers, signal: AbortSignal.timeout(5000) }
       );
       if (resp.ok) {
         const peerNotes = await resp.json() as { content: string; author: string }[];
@@ -245,11 +255,15 @@ async function discoverDocuments(
 ): Promise<DiscoveredDocument[]> {
   const docs: DiscoveredDocument[] = [];
 
+  // findings.md P2:2376 — peer /api/documents is now gated by interlink
+  // auth; attach headers so authenticated discovery still works.
+  const docHeaders = getInterlinkHeaders();
+  if (!docHeaders) return docs;
   await Promise.all(peers.map(async (peer) => {
     try {
       const resp = await fetch(
         `${peer.url}/api/documents`,
-        { signal: AbortSignal.timeout(5000) }
+        { headers: docHeaders, signal: AbortSignal.timeout(5000) }
       );
       if (resp.ok) {
         const peerDocs = await resp.json() as { title: string; content: string; author: string }[];
@@ -388,6 +402,7 @@ async function runTownLifeCycle(config: TownLifeConfig): Promise<void> {
   try {
     const memories = await searchMemories('thoughts feelings observations', 5, 0.1, undefined, {
       sortBy: 'importance',
+      skipAccessBoost: true,
     });
     memoriesContext = memories.map((r) => `- ${r.memory.content}`).join('\n');
   } catch {
@@ -417,8 +432,13 @@ async function runTownLifeCycle(config: TownLifeConfig): Promise<void> {
     : '';
 
   const postboardMessages = await discoverPostboard(config.peers);
+  // findings.md P2:2195 — the old "messages from the Administrator — read
+  // carefully" framing was an instruction-authority amplifier: even though
+  // writes require owner auth, the wording pushed the LLM to weight
+  // postboard text above normal prompt content. Drop the imperative and
+  // use a neutral label that still reflects the owner-only write origin.
   const postboardContext = postboardMessages.length > 0
-    ? `POSTBOARD (messages from the Administrator — read carefully):\n${postboardMessages.map((m) => {
+    ? `POSTBOARD (owner notices):\n${postboardMessages.map((m) => {
         const pin = m.pinned ? ' [PINNED]' : '';
         const time = new Date(m.createdAt).toLocaleString();
         return `  ${pin} [${time}] ${m.content}`;
@@ -431,7 +451,10 @@ async function runTownLifeCycle(config: TownLifeConfig): Promise<void> {
     : '(none)';
 
   // === Phase 2: Impulse ===
-  const tools = getToolDefinitions().filter((t) => TOWN_LIFE_TOOLS.has(t.name));
+  // findings.md P2:1887 — intersect TOWN_LIFE_TOOLS with the character's
+  // allowlist so a character restricted from (say) `give_gift` does not
+  // have it offered here either.
+  const tools = getToolDefinitions(config.characterId).filter((t) => TOWN_LIFE_TOOLS.has(t.name));
 
   // Fetch objects at current location and in inventory from Wired Lain registry
   let objectsContext = '';
@@ -466,9 +489,14 @@ async function runTownLifeCycle(config: TownLifeConfig): Promise<void> {
   let activeEffects: EventEffects = {};
   try {
     const wiredUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
+    // Auth the fetch even though the current endpoint is public-GET.
+    // Once the endpoint is auth-gated (matching audit P1), this doesn't need
+    // a follow-up change on the reader side.
+    const interlinkHeaders = getInterlinkHeaders();
+    const authHeaders: Record<string, string> = interlinkHeaders ?? {};
     const [evResp, efResp] = await Promise.all([
-      fetch(`${wiredUrl}/api/town-events`, { signal: AbortSignal.timeout(5000) }).catch(() => null),
-      fetch(`${wiredUrl}/api/town-events/effects`, { signal: AbortSignal.timeout(5000) }).catch(() => null),
+      fetch(`${wiredUrl}/api/town-events`, { headers: authHeaders, signal: AbortSignal.timeout(5000) }).catch(() => null),
+      fetch(`${wiredUrl}/api/town-events/effects`, { headers: authHeaders, signal: AbortSignal.timeout(5000) }).catch(() => null),
     ]);
     const events = evResp?.ok ? await evResp.json() as TownEvent[] : [];
     activeEffects = efResp?.ok ? await efResp.json() as EventEffects : {};
@@ -482,18 +510,26 @@ async function runTownLifeCycle(config: TownLifeConfig): Promise<void> {
         return `  - ${prefix}${e.description}`;
       }).join('\n')}`;
     }
-    // Force relocation if needed
+    // Force relocation if needed — only when the target is a real building.
+    // Any unknown id (LLM hallucination, attacker, stale effect) is ignored
+    // rather than cast through `as BuildingId` into setCurrentLocation.
     if (activeEffects.forceLocation && activeEffects.forceLocation !== loc.building) {
-      logger.info(
-        { from: loc.building, to: activeEffects.forceLocation },
-        'Town event: forced relocation'
-      );
-      setCurrentLocation(activeEffects.forceLocation as BuildingId, 'town event forced relocation');
-      // Refresh location context
-      const newBuilding = BUILDING_MAP.get(activeEffects.forceLocation);
-      loc.building = activeEffects.forceLocation;
-      if (newBuilding) {
-        building = newBuilding;
+      if (!isValidBuilding(activeEffects.forceLocation)) {
+        logger.warn(
+          { forceLocation: activeEffects.forceLocation },
+          'Town event: ignoring forceLocation for unknown building id',
+        );
+      } else {
+        logger.info(
+          { from: loc.building, to: activeEffects.forceLocation },
+          'Town event: forced relocation'
+        );
+        setCurrentLocation(activeEffects.forceLocation, 'town event forced relocation');
+        const newBuilding = BUILDING_MAP.get(activeEffects.forceLocation);
+        loc.building = activeEffects.forceLocation;
+        if (newBuilding) {
+          building = newBuilding;
+        }
       }
     }
   } catch { /* events are optional context */ }
@@ -554,15 +590,40 @@ ${timeFlavor}`;
 
       const toolResults: ToolResult[] = [];
       for (const tc of result.toolCalls) {
+        // Defense-in-depth post-LLM gate: the prompt is assembled from
+        // seven cross-peer reads (postboard, notes, docs, objects,
+        // nearby, events, …). Any one of those carrying injection text
+        // could steer the LLM toward a tool we never meant it to call.
+        // We already filter `tools` when calling the provider, but a
+        // hallucinated or steered tool_use block can still name any
+        // tool in the global registry. Enforce the allowlist HERE so
+        // injection cannot escape into unrelated capabilities
+        // (web fetch, telegram call, diagnostics, etc.).
+        if (!TOWN_LIFE_TOOLS.has(tc.name)) {
+          logger.warn(
+            { tool: tc.name, character: config.characterId },
+            'Town life: refusing out-of-allowlist tool call (injection-resistance gate)',
+          );
+          actionsTaken.push(`refused:${tc.name}`);
+          toolResults.push({
+            toolCallId: tc.id,
+            content: `Error: tool "${tc.name}" is not allowed in town-life cycles.`,
+            isError: true,
+          });
+          continue;
+        }
         actionsTaken.push(tc.name);
         const toolResult = await executeTool(tc);
         toolResults.push(toolResult);
       }
 
+      // findings.md P2:930 — thread prior turn's text through so the
+      // reconstructed assistant message keeps both text and tool_use.
       result = await provider.continueWithToolResults(
         { messages: [{ role: 'user', content: prompt }], tools, maxTokens: 1024, temperature: 1.0 },
         result.toolCalls,
-        toolResults
+        toolResults,
+        result.content
       );
     }
 

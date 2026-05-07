@@ -26,6 +26,8 @@ const TOOLS_PATH = join(process.cwd(), 'src', 'agent', 'tools.ts');
 const SSRF_PATH = join(process.cwd(), 'src', 'security', 'ssrf.ts');
 const SANITIZER_PATH = join(process.cwd(), 'src', 'security', 'sanitizer.ts');
 const CRYPTO_PATH = join(process.cwd(), 'src', 'utils', 'crypto.ts');
+const INTERLINK_AUTH_PATH = join(process.cwd(), 'src', 'security', 'interlink-auth.ts');
+const CORS_PATH = join(process.cwd(), 'src', 'web', 'cors.ts');
 
 const ownerAuthSource = readFileSync(OWNER_AUTH_PATH, 'utf-8');
 const serverSource = readFileSync(SERVER_PATH, 'utf-8');
@@ -34,12 +36,14 @@ const toolsSource = readFileSync(TOOLS_PATH, 'utf-8');
 const ssrfSource = readFileSync(SSRF_PATH, 'utf-8');
 const sanitizerSource = readFileSync(SANITIZER_PATH, 'utf-8');
 const cryptoSource = readFileSync(CRYPTO_PATH, 'utf-8');
+const interlinkAuthSource = readFileSync(INTERLINK_AUTH_PATH, 'utf-8');
+const corsSource = readFileSync(CORS_PATH, 'utf-8');
 
 // ─────────────────────────────────────────────────────────
-// 1. OWNER COOKIE DERIVATION — HMAC-SHA256 based
+// 1. OWNER COOKIE — v2 HMAC-signed payload (findings.md P2:2348)
 // ─────────────────────────────────────────────────────────
-describe('Owner Cookie Derivation', () => {
-  it('uses HMAC-SHA256 for cookie derivation', () => {
+describe('Owner Cookie v2', () => {
+  it('uses HMAC-SHA256 to sign the cookie payload', () => {
     expect(ownerAuthSource).toContain("createHmac('sha256'");
   });
 
@@ -47,16 +51,16 @@ describe('Owner Cookie Derivation', () => {
     expect(ownerAuthSource).toContain('createHmac');
   });
 
-  it('uses a fixed message for HMAC input', () => {
-    expect(ownerAuthSource).toContain("const HMAC_MESSAGE = 'lain-owner-v1'");
+  it('binds the signature to a v2 message prefix', () => {
+    expect(ownerAuthSource).toContain("const HMAC_MESSAGE_PREFIX = 'lain-owner-v2'");
   });
 
-  it('digests as hex string', () => {
+  it('digests signature as hex string', () => {
     expect(ownerAuthSource).toContain(".digest('hex')");
   });
 
-  it('exports deriveOwnerCookie function', () => {
-    expect(ownerAuthSource).toContain('export function deriveOwnerCookie(ownerToken: string): string');
+  it('exports issueOwnerCookie function', () => {
+    expect(ownerAuthSource).toContain('export function issueOwnerCookie');
   });
 });
 
@@ -76,20 +80,25 @@ describe('isOwner Authentication', () => {
     expect(ownerAuthSource).toContain("process.env['LAIN_OWNER_TOKEN']");
   });
 
-  it('returns false when owner token is not set', () => {
-    expect(ownerAuthSource).toContain('if (!ownerToken) return false');
+  it('returns null when owner token is not set', () => {
+    // findings.md P2:2348 — verifyOwnerCookie returns null (not false) on
+    // missing token, and `isOwner` converts null → false. The branch still
+    // emits warn-once so the operator sees the disabled state in logs.
+    expect(ownerAuthSource).toMatch(/if \(!ownerToken\)\s*\{[\s\S]{0,160}return null/);
+    expect(ownerAuthSource).toContain('warnMissingTokenOnce()');
   });
 
-  it('returns false when no cookie is present', () => {
-    expect(ownerAuthSource).toContain('if (!cookie) return false');
+  it('returns null when no cookie is present', () => {
+    expect(ownerAuthSource).toContain('if (!cookie) return null');
   });
 
   it('short-circuits on length mismatch before comparison', () => {
-    expect(ownerAuthSource).toContain('if (expected.length !== provided.length) return false');
+    // Guard against a signature-length oracle before the timing-safe compare.
+    expect(ownerAuthSource).toContain('if (expected.length !== provided.length) return null');
   });
 
-  it('uses correct cookie regex pattern', () => {
-    expect(ownerAuthSource).toContain('/(?:^|;\\s*)lain_owner=([a-f0-9]+)/');
+  it('uses correct v2 cookie regex pattern (payload.sig)', () => {
+    expect(ownerAuthSource).toContain('/(?:^|;\\s*)lain_owner_v2=([A-Za-z0-9_\\-]+)\\.([a-f0-9]+)/');
   });
 });
 
@@ -97,8 +106,8 @@ describe('isOwner Authentication', () => {
 // 3. OWNER COOKIE SETTINGS — HttpOnly, SameSite
 // ─────────────────────────────────────────────────────────
 describe('Owner Cookie Settings', () => {
-  it('cookie name is lain_owner', () => {
-    expect(ownerAuthSource).toContain("const COOKIE_NAME = 'lain_owner'");
+  it('cookie name is lain_owner_v2', () => {
+    expect(ownerAuthSource).toContain("const COOKIE_NAME = 'lain_owner_v2'");
   });
 
   it('sets HttpOnly flag', () => {
@@ -117,24 +126,29 @@ describe('Owner Cookie Settings', () => {
     expect(ownerAuthSource).toContain('Max-Age=31536000');
   });
 
-  it('exports setOwnerCookie function', () => {
-    expect(ownerAuthSource).toContain('export function setOwnerCookie');
+  it('exports issueOwnerCookie function', () => {
+    expect(ownerAuthSource).toContain('export function issueOwnerCookie');
+  });
+
+  it('exports clearOwnerCookie function (for /owner/logout)', () => {
+    expect(ownerAuthSource).toContain('export function clearOwnerCookie');
   });
 });
 
 // ─────────────────────────────────────────────────────────
-// 4. FUNCTIONAL — deriveOwnerCookie and isOwner
+// 4. FUNCTIONAL — v2 cookie issuance and isOwner verification
 // ─────────────────────────────────────────────────────────
 describe('Owner Auth Functional', () => {
-  let deriveOwnerCookie: (token: string) => string;
   let isOwner: (req: import('node:http').IncomingMessage) => boolean;
+  let makeV2Cookie: (token: string, opts?: { signWith?: string; nonce?: string; iat?: number }) => string;
 
   const originalToken = process.env['LAIN_OWNER_TOKEN'];
 
   beforeEach(async () => {
     const mod = await import('../src/web/owner-auth.js');
-    deriveOwnerCookie = mod.deriveOwnerCookie;
     isOwner = mod.isOwner;
+    const helper = await import('./fixtures/owner-cookie-v2.js');
+    makeV2Cookie = helper.makeV2Cookie;
   });
 
   afterEach(() => {
@@ -145,22 +159,14 @@ describe('Owner Auth Functional', () => {
     }
   });
 
-  it('deriveOwnerCookie returns consistent hex string', () => {
-    const cookie1 = deriveOwnerCookie('test-token');
-    const cookie2 = deriveOwnerCookie('test-token');
-    expect(cookie1).toBe(cookie2);
-    expect(cookie1).toMatch(/^[a-f0-9]+$/);
-  });
-
-  it('different tokens produce different cookies', () => {
-    const cookie1 = deriveOwnerCookie('token-a');
-    const cookie2 = deriveOwnerCookie('token-b');
-    expect(cookie1).not.toBe(cookie2);
+  it('v2 cookie signature is token-specific', () => {
+    const fixedOpts = { nonce: 'n', iat: 1 };
+    expect(makeV2Cookie('a', fixedOpts)).not.toBe(makeV2Cookie('b', fixedOpts));
   });
 
   it('isOwner returns false when LAIN_OWNER_TOKEN is not set', () => {
     delete process.env['LAIN_OWNER_TOKEN'];
-    const fakeReq = { headers: { cookie: 'lain_owner=abc123' } } as unknown as import('node:http').IncomingMessage;
+    const fakeReq = { headers: { cookie: makeV2Cookie('test-token') } } as unknown as import('node:http').IncomingMessage;
     expect(isOwner(fakeReq)).toBe(false);
   });
 
@@ -170,24 +176,33 @@ describe('Owner Auth Functional', () => {
     expect(isOwner(fakeReq)).toBe(false);
   });
 
-  it('isOwner returns false for wrong cookie value', () => {
+  it('isOwner returns false for wrong-token signature', () => {
     process.env['LAIN_OWNER_TOKEN'] = 'test-token';
-    const fakeReq = { headers: { cookie: 'lain_owner=wrongvalue' } } as unknown as import('node:http').IncomingMessage;
+    const fakeReq = {
+      headers: { cookie: makeV2Cookie('test-token', { signWith: 'other-token' }) },
+    } as unknown as import('node:http').IncomingMessage;
     expect(isOwner(fakeReq)).toBe(false);
   });
 
-  it('isOwner returns true for correct cookie value', () => {
+  it('isOwner returns true for correct v2 cookie', () => {
     process.env['LAIN_OWNER_TOKEN'] = 'test-token';
-    const correctCookie = deriveOwnerCookie('test-token');
-    const fakeReq = { headers: { cookie: `lain_owner=${correctCookie}` } } as unknown as import('node:http').IncomingMessage;
+    const fakeReq = { headers: { cookie: makeV2Cookie('test-token') } } as unknown as import('node:http').IncomingMessage;
     expect(isOwner(fakeReq)).toBe(true);
   });
 
-  it('isOwner handles cookie among multiple cookies', () => {
+  it('isOwner handles v2 cookie among multiple cookies', () => {
     process.env['LAIN_OWNER_TOKEN'] = 'test-token';
-    const correctCookie = deriveOwnerCookie('test-token');
-    const fakeReq = { headers: { cookie: `other=abc; lain_owner=${correctCookie}; another=xyz` } } as unknown as import('node:http').IncomingMessage;
+    const v2 = makeV2Cookie('test-token');
+    const fakeReq = { headers: { cookie: `other=abc; ${v2}; another=xyz` } } as unknown as import('node:http').IncomingMessage;
     expect(isOwner(fakeReq)).toBe(true);
+  });
+
+  it('isOwner rejects legacy v1 cookies outright', () => {
+    process.env['LAIN_OWNER_TOKEN'] = 'test-token';
+    const fakeReq = {
+      headers: { cookie: 'lain_owner=' + 'a'.repeat(64) },
+    } as unknown as import('node:http').IncomingMessage;
+    expect(isOwner(fakeReq)).toBe(false);
   });
 });
 
@@ -249,11 +264,13 @@ describe('Server Auth Middleware', () => {
 // ─────────────────────────────────────────────────────────
 describe('CORS Configuration', () => {
   it('CORS origin is configurable via LAIN_CORS_ORIGIN', () => {
-    expect(serverSource).toContain("LAIN_CORS_ORIGIN");
+    // findings.md P2:2366 — CORS lookup lives in the shared cors.ts helper now.
+    expect(corsSource).toContain("LAIN_CORS_ORIGIN");
   });
 
   it('CORS defaults to wildcard when not configured', () => {
-    expect(serverSource).toContain("process.env['LAIN_CORS_ORIGIN'] || '*'");
+    // findings.md P2:2366 — server.ts delegates to getCorsOrigin('*') via cors.ts helper.
+    expect(serverSource).toContain("getCorsOrigin('*')");
   });
 
   it('sets Access-Control-Allow-Origin header', () => {
@@ -311,32 +328,42 @@ describe('Input Sanitization', () => {
 // 8. INTERLINK TOKEN — Peer communication auth
 // ─────────────────────────────────────────────────────────
 describe('Interlink Token Authentication', () => {
-  it('server requires LAIN_INTERLINK_TOKEN for peer communication', () => {
-    expect(serverSource).toContain("LAIN_INTERLINK_TOKEN");
+  // Per-character tokens (findings.md P1:2289): the interlink verifier lives in
+  // src/security/interlink-auth.ts and derives per-character tokens via HMAC.
+  // server.ts / character-server.ts call verifyInterlinkRequest() and treat the
+  // authenticated X-Interlink-From as the source of truth for identity.
+  it('interlink-auth references LAIN_INTERLINK_TOKEN as the master secret', () => {
+    expect(interlinkAuthSource).toContain('LAIN_INTERLINK_TOKEN');
+  });
+
+  it('server delegates to verifyInterlinkRequest', () => {
+    expect(serverSource).toContain('verifyInterlinkRequest');
   });
 
   it('character server verifies interlink auth on protected endpoints', () => {
     expect(charServerSource).toContain('verifyInterlinkAuth');
+    expect(charServerSource).toContain('verifyInterlinkRequest');
   });
 
   it('interlink auth checks for Bearer token in Authorization header', () => {
-    expect(charServerSource).toContain("authHeader.startsWith('Bearer ')");
+    expect(interlinkAuthSource).toContain("auth.startsWith('Bearer ')");
   });
 
   it('interlink auth returns 401 for missing header', () => {
-    expect(charServerSource).toContain("'Missing or invalid Authorization header'");
+    expect(interlinkAuthSource).toContain("'Missing X-Interlink-From header'");
+    expect(interlinkAuthSource).toContain("'Missing or invalid Authorization header'");
   });
 
   it('interlink auth returns 403 for invalid token', () => {
-    expect(charServerSource).toContain("'Invalid token'");
+    expect(interlinkAuthSource).toContain("'Invalid interlink token'");
   });
 
   it('interlink auth returns 503 when not configured', () => {
-    expect(charServerSource).toContain("'Interlink not configured'");
+    expect(interlinkAuthSource).toContain("'Interlink not configured'");
   });
 
   it('interlink auth uses secureCompare (not ===)', () => {
-    expect(charServerSource).toContain('secureCompare(');
+    expect(interlinkAuthSource).toContain('secureCompare(');
   });
 });
 
@@ -386,12 +413,22 @@ describe('No eval() in Server Code', () => {
 // 11. FETCH_WEBPAGE SECURITY — Blocks non-http(s) URLs
 // ─────────────────────────────────────────────────────────
 describe('Fetch Webpage URL Security', () => {
-  it('validates protocol is http or https', () => {
-    expect(toolsSource).toContain("!['http:', 'https:'].includes(parsedUrl.protocol)");
+  it('routes through safeFetch (protocol + private-IP + DNS-pin)', () => {
+    // Protocol validation and private-IP blocking moved into safeFetch
+    // in src/security/ssrf.ts (see security-deep.test.ts for the full
+    // regression). The fetch_webpage handler now awaits safeFetch so
+    // any non-http/https or private-IP URL throws before a fetch fires.
+    const section = toolsSource.match(
+      /name: 'fetch_webpage'[\s\S]*?\n  \},\n\}\);/
+    );
+    expect(section).not.toBeNull();
+    expect(section![0]).toMatch(/await safeFetch\(url,/);
   });
 
-  it('returns error message for blocked protocols', () => {
-    expect(toolsSource).toContain('error: only http and https URLs are supported');
+  it('safeFetch is imported from security/ssrf', () => {
+    expect(toolsSource).toMatch(
+      /import\s*\{\s*safeFetch,\s*safeFetchFollow\s*\}\s*from\s*'\.\.\/security\/ssrf\.js'/
+    );
   });
 
   it('constructs URL object for validation (catches malformed URLs)', () => {
@@ -598,8 +635,11 @@ describe('Path Traversal Protection', () => {
     expect(serverSource).toContain('!filePath.startsWith(resolve(PUBLIC_DIR))');
   });
 
-  it('character-server.ts strips .. from paths', () => {
-    expect(charServerSource).toContain("path.replace(/\\.\\./g, '')");
+  it('character-server.ts has no path-traversal surface (no static file serving)', () => {
+    // serveStatic was removed in findings.md P1:27 — inhabitant servers are
+    // API-only, so there is no filesystem path to traverse.
+    expect(charServerSource).not.toMatch(/function\s+serveStatic/);
+    expect(charServerSource).not.toMatch(/publicDir:\s*string/);
   });
 });
 
@@ -615,8 +655,11 @@ describe('Owner Gate Endpoint', () => {
     expect(serverSource).toContain('secureCompare(provided, ownerToken)');
   });
 
-  it('gate sets owner cookie on success', () => {
-    expect(serverSource).toContain('setOwnerCookie(res, ownerToken)');
+  it('gate issues the owner cookie on success', () => {
+    // findings.md P2:2348 — issueOwnerCookie replaces v1 setOwnerCookie. It
+    // still takes (res, ownerToken, req) so TLS detection stays intact, but
+    // it additionally writes a nonce to the authoritative store.
+    expect(serverSource).toContain('issueOwnerCookie(res, ownerToken, req)');
   });
 
   it('gate redirects to root on success', () => {

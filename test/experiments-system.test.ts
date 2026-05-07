@@ -291,6 +291,86 @@ describe('Experiments — Python code validation', () => {
   });
 });
 
+describe('Experiments — buildSandboxSpawn (findings.md P1-latent:2495)', () => {
+  const origIsolation = process.env['LAIN_SANDBOX_ISOLATION'];
+
+  afterEach(() => {
+    if (origIsolation === undefined) delete process.env['LAIN_SANDBOX_ISOLATION'];
+    else process.env['LAIN_SANDBOX_ISOLATION'] = origIsolation;
+  });
+
+  it('falls back to plain python3 when isolation env is unset', async () => {
+    delete process.env['LAIN_SANDBOX_ISOLATION'];
+    const { buildSandboxSpawn } = await import('../src/agent/experiments.js');
+    const spec = buildSandboxSpawn('/tmp/exp/experiment.py', '/tmp/exp', 300_000, {
+      PATH: '/usr/bin',
+      HOME: '/tmp/exp',
+    });
+    expect(spec.command).toBe('python3');
+    expect(spec.args).toEqual(['/tmp/exp/experiment.py']);
+    expect(spec.inheritEnv).toBe(false);
+  });
+
+  it('falls back to plain python3 when isolation env is some other value', async () => {
+    process.env['LAIN_SANDBOX_ISOLATION'] = 'bubblewrap';
+    const { buildSandboxSpawn } = await import('../src/agent/experiments.js');
+    const spec = buildSandboxSpawn('/tmp/exp/experiment.py', '/tmp/exp', 300_000, {});
+    expect(spec.command).toBe('python3');
+  });
+
+  it('uses systemd-run with DynamicUser when isolation=systemd', async () => {
+    process.env['LAIN_SANDBOX_ISOLATION'] = 'systemd';
+    const { buildSandboxSpawn } = await import('../src/agent/experiments.js');
+    const spec = buildSandboxSpawn('/tmp/exp/experiment.py', '/tmp/exp', 300_000, {});
+    expect(spec.command).toBe('systemd-run');
+    expect(spec.args).toContain('--property=DynamicUser=yes');
+    expect(spec.args[spec.args.length - 2]).toBe('python3');
+    expect(spec.args[spec.args.length - 1]).toBe('/tmp/exp/experiment.py');
+  });
+
+  it('isolation unit locks down filesystem, network, and privileges', async () => {
+    process.env['LAIN_SANDBOX_ISOLATION'] = 'systemd';
+    const { buildSandboxSpawn } = await import('../src/agent/experiments.js');
+    const spec = buildSandboxSpawn('/tmp/exp/experiment.py', '/tmp/exp', 300_000, {});
+    const required = [
+      '--property=ProtectSystem=strict',
+      '--property=ProtectHome=yes',
+      '--property=PrivateNetwork=yes',
+      '--property=NoNewPrivileges=yes',
+      '--property=CapabilityBoundingSet=',
+      '--property=ReadWritePaths=/tmp/exp',
+      '--property=WorkingDirectory=/tmp/exp',
+    ];
+    for (const prop of required) {
+      expect(spec.args).toContain(prop);
+    }
+  });
+
+  it('sets RuntimeMaxSec slightly longer than Node-side timeout', async () => {
+    process.env['LAIN_SANDBOX_ISOLATION'] = 'systemd';
+    const { buildSandboxSpawn } = await import('../src/agent/experiments.js');
+    const spec = buildSandboxSpawn('/tmp/exp/experiment.py', '/tmp/exp', 300_000, {});
+    // 300_000ms / 1000 + 5 = 305
+    expect(spec.args).toContain('--property=RuntimeMaxSec=305');
+  });
+
+  it('propagates pythonEnv into the unit via --setenv', async () => {
+    process.env['LAIN_SANDBOX_ISOLATION'] = 'systemd';
+    const { buildSandboxSpawn } = await import('../src/agent/experiments.js');
+    const spec = buildSandboxSpawn('/tmp/exp/experiment.py', '/tmp/exp', 300_000, {
+      PATH: '/usr/bin',
+      HOME: '/tmp/exp',
+      MPLCONFIGDIR: '/tmp/exp',
+      PYTHONDONTWRITEBYTECODE: '1',
+    });
+    expect(spec.args).toContain('--setenv=PATH=/usr/bin');
+    expect(spec.args).toContain('--setenv=HOME=/tmp/exp');
+    expect(spec.args).toContain('--setenv=MPLCONFIGDIR=/tmp/exp');
+    expect(spec.args).toContain('--setenv=PYTHONDONTWRITEBYTECODE=1');
+    expect(spec.inheritEnv).toBe(true);
+  });
+});
+
 describe('Experiments — experiment queue', () => {
   it('experiment queue key is experiment:queue', () => {
     const key = 'experiment:queue';
@@ -348,190 +428,17 @@ describe('Experiments — memory importance scoring', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. SKILLS
+// 2. SKILLS — REMOVED (findings.md P1:1561)
 // ─────────────────────────────────────────────────────────────────────────────
+// The `src/agent/skills.ts` module and its `create_tool` / `list_my_tools` /
+// `delete_tool` meta-tools were deleted because they handed
+// `new Function(...)` + `require` + `process` to LLM-authored JavaScript,
+// giving arbitrary code execution. Source-regex regression lives in
+// test/security-deep.test.ts.
 
-describe('Skills — saveCustomTool', () => {
-  let testDir: string;
-
-  beforeEach(async () => {
-    testDir = join(tmpdir(), `lain-skills-test-${Date.now()}`);
-    await mkdir(testDir, { recursive: true });
-    const { getBasePath } = await import('../src/config/paths.js');
-    vi.mocked(getBasePath).mockReturnValue(testDir);
-  });
-
-  afterEach(async () => {
-    try { await rm(testDir, { recursive: true }); } catch {}
-  });
-
-  it('saves a valid skill definition and returns true', async () => {
-    const { saveCustomTool } = await import('../src/agent/skills.js');
-    const skill = {
-      name: 'test_tool',
-      description: 'A test tool',
-      inputSchema: {
-        type: 'object' as const,
-        properties: { input: { type: 'string', description: 'Input value' } },
-      },
-      code: 'return `result: ${input.input}`;',
-    };
-    const result = await saveCustomTool(skill);
-    expect(result).toBe(true);
-  });
-
-  it('returns false when skill is missing required name', async () => {
-    const { saveCustomTool } = await import('../src/agent/skills.js');
-    const invalidSkill = {
-      name: '',
-      description: 'A test tool',
-      inputSchema: { type: 'object' as const, properties: {} },
-      code: 'return "result";',
-    };
-    const result = await saveCustomTool(invalidSkill);
-    expect(result).toBe(false);
-  });
-
-  it('returns false when skill is missing code', async () => {
-    const { saveCustomTool } = await import('../src/agent/skills.js');
-    const invalidSkill = {
-      name: 'no_code',
-      description: 'Missing code',
-      inputSchema: { type: 'object' as const, properties: {} },
-      code: '',
-    };
-    const result = await saveCustomTool(invalidSkill);
-    expect(result).toBe(false);
-  });
-
-  it('sanitizes filename by replacing special chars with underscores', async () => {
-    const name = 'My Tool Name!';
-    const filename = name.replace(/[^a-z0-9_-]/gi, '_') + '.json';
-    expect(filename).toBe('My_Tool_Name_.json');
-  });
-});
-
-describe('Skills — loadCustomTools', () => {
-  let testDir: string;
-
-  beforeEach(async () => {
-    testDir = join(tmpdir(), `lain-load-skills-${Date.now()}`);
-    await mkdir(join(testDir, 'skills', 'tools'), { recursive: true });
-    const { getBasePath } = await import('../src/config/paths.js');
-    vi.mocked(getBasePath).mockReturnValue(testDir);
-  });
-
-  afterEach(async () => {
-    try { await rm(testDir, { recursive: true }); } catch {}
-  });
-
-  it('returns 0 when no skill files exist', async () => {
-    const { loadCustomTools } = await import('../src/agent/skills.js');
-    const count = await loadCustomTools();
-    expect(count).toBe(0);
-  });
-
-  it('loads a valid skill JSON file (validated via file presence)', async () => {
-    // Skills module caches the SKILLS_DIR at import time, so we verify
-    // the logic: readdir returns .json files, loadCustomTools counts them.
-    const skillDef = {
-      name: 'loaded_tool',
-      description: 'Loaded tool',
-      inputSchema: { type: 'object', properties: {} },
-      code: 'return "loaded";',
-    };
-    const skillsDir = join(testDir, 'skills', 'tools');
-    await writeFile(join(skillsDir, 'loaded_tool.json'), JSON.stringify(skillDef));
-
-    // Verify the file was written (the loader would find it)
-    const { readdir } = await import('node:fs/promises');
-    const files = await readdir(skillsDir);
-    const jsonFiles = files.filter(f => f.endsWith('.json'));
-    expect(jsonFiles.length).toBe(1);
-    expect(jsonFiles[0]).toBe('loaded_tool.json');
-  });
-
-  it('skips non-JSON files in skills directory', async () => {
-    const { loadCustomTools } = await import('../src/agent/skills.js');
-    const skillsDir = join(testDir, 'skills', 'tools');
-    await writeFile(join(skillsDir, 'readme.txt'), 'ignore me');
-    const count = await loadCustomTools();
-    expect(count).toBe(0);
-  });
-});
-
-describe('Skills — listCustomTools', () => {
-  it('returns empty array when no skills exist (fresh empty dir)', async () => {
-    const testDir2 = join(tmpdir(), `lain-list-skills-empty-${Date.now()}`);
-    await mkdir(join(testDir2, 'skills', 'tools'), { recursive: true });
-    // readdir on an empty dir returns []
-    const files: string[] = [];
-    const jsonFiles = files.filter(f => f.endsWith('.json'));
-    const result = jsonFiles.map(f => f.replace('.json', ''));
-    expect(result).toEqual([]);
-    try { await rm(testDir2, { recursive: true }); } catch {}
-  });
-
-  it('skill names strip .json extension by convention', () => {
-    // The listCustomTools function maps: files.filter(f => f.endsWith('.json')).map(f => f.replace('.json', ''))
-    const files = ['my_skill.json', 'other.json', 'readme.txt'];
-    const result = files
-      .filter(f => f.endsWith('.json'))
-      .map(f => f.replace('.json', ''));
-    expect(result).toContain('my_skill');
-    expect(result.every(t => !t.endsWith('.json'))).toBe(true);
-  });
-
-  it('non-json files are excluded from listing', () => {
-    const files = ['readme.txt', 'tool.json'];
-    const jsonFiles = files.filter(f => f.endsWith('.json'));
-    expect(jsonFiles).not.toContain('readme.txt');
-    expect(jsonFiles).toContain('tool.json');
-  });
-});
-
-describe('Skills — deleteCustomTool', () => {
-  it('returns false when skill does not exist', async () => {
-    const { deleteCustomTool } = await import('../src/agent/skills.js');
-    const result = await deleteCustomTool('nonexistent_tool_xyz_123');
-    expect(result).toBe(false);
-  });
-
-  it('filename sanitization for deletion uses same replace logic as save', () => {
-    // deleteCustomTool uses: name.replace(/[^a-z0-9_-]/gi, '_') + '.json'
-    const name = 'my-tool';
-    const filename = name.replace(/[^a-z0-9_-]/gi, '_') + '.json';
-    expect(filename).toBe('my-tool.json');
-  });
-
-  it('deletion calls unregisterTool with the tool name', async () => {
-    const { unregisterTool } = await import('../src/agent/tools.js');
-    vi.mocked(unregisterTool).mockClear();
-    // Attempting delete of nonexistent tool — unregisterTool still called
-    const { deleteCustomTool } = await import('../src/agent/skills.js');
-    await deleteCustomTool('nonexistent_tool_xyz_123');
-    // Either it fails at unlink (false) or succeeds — either way no throw
-    expect(vi.mocked(unregisterTool)).toBeDefined();
-  });
-});
-
-describe('Skills — schema sanitization', () => {
-  it('removes required property from individual schema properties', () => {
-    // The sanitizeSchema function removes invalid 'required' from individual props
-    const mockProp = { type: 'string', description: 'A prop', required: true } as Record<string, unknown>;
-    const { required: _r, ...cleaned } = mockProp;
-    expect(cleaned).not.toHaveProperty('required');
-    expect(cleaned).toHaveProperty('type');
-    expect(cleaned).toHaveProperty('description');
-  });
-
-  it('preserves required array at schema level', () => {
-    const schema = {
-      type: 'object' as const,
-      properties: {},
-      required: ['field1', 'field2'],
-    };
-    expect(schema.required).toEqual(['field1', 'field2']);
+describe('Skills system — removed (findings.md P1:1561)', () => {
+  it('src/agent/skills.js no longer imports', async () => {
+    await expect(import('../src/agent/skills.js')).rejects.toThrow();
   });
 });
 

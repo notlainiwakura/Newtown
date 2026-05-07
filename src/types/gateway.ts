@@ -23,6 +23,11 @@ export interface GatewayErrorPayload {
 export interface AuthenticatedConnection {
   id: string;
   authenticatedAt: number;
+  // findings.md P2:2636 — track idle time for TTL sweeps, and record a
+  // token fingerprint so different admin tokens are distinguishable
+  // in audit logs without exposing the raw token.
+  lastActivityAt: number;
+  tokenFingerprint: string;
   agentId?: string;
   rateLimit: ConnectionRateLimit;
 }

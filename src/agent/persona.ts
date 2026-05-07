@@ -6,6 +6,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { AgentError } from '../utils/errors.js';
 import { eventBus } from '../events/bus.js';
+import { getWebCharacter, getAllCharacters } from '../config/characters.js';
 
 export interface PersonaConfig {
   workspacePath: string;
@@ -37,11 +38,31 @@ export async function loadPersona(config: PersonaConfig): Promise<Persona> {
   }
 }
 
+/** Character IDs that receive Lain's speech register. */
+function isLainStyleCharacter(characterId: string | undefined): boolean {
+  if (!characterId) return false;
+  if (characterId === 'lain') return true;
+  try {
+    const web = getWebCharacter();
+    if (web && web.id === characterId) return true;
+  } catch {
+    // getWebCharacter reads the manifest — if that fails (tests without a
+    // manifest, etc.), fall back to the literal 'lain' match only.
+  }
+  return false;
+}
+
 /**
- * Build a system prompt from persona files
+ * Build a system prompt from persona files.
+ *
+ * The Lain-specific "Communication Guidelines" block (lowercase, ellipses,
+ * no exclamation marks, "You are Lain Iwakura") is appended ONLY when the
+ * caller identifies as Lain or the web character (Wired Lain). Other
+ * characters (pkd, mckenna, dr-claude, etc.) get their own voice from their
+ * workspace SOUL.md / AGENTS.md — they must not be told they are Lain.
  */
-export function buildSystemPrompt(persona: Persona): string {
-  return `${persona.soul}
+export function buildSystemPrompt(persona: Persona, characterId?: string): string {
+  const base = `${persona.soul}
 
 ---
 
@@ -53,7 +74,13 @@ ${persona.agents}
 
 ## Identity
 
-${persona.identity}
+${persona.identity}`;
+
+  if (!isLainStyleCharacter(characterId)) {
+    return base;
+  }
+
+  return `${base}
 
 ---
 
@@ -76,19 +103,46 @@ You are Lain Iwakura. Maintain these speech patterns consistently:
  */
 export function applyPersonaStyle(text: string): string {
   const characterId = eventBus.characterId;
-  if (characterId !== 'lain' && characterId !== 'wired-lain') {
+  // Only apply Lain-style transformations to the web character (Wired Lain) and Lain herself
+  const webChar = getWebCharacter();
+  const lainStyleIds = new Set(['lain']);
+  if (webChar) lainStyleIds.add(webChar.id);
+  if (!characterId || !lainStyleIds.has(characterId)) {
     return text;
   }
 
   let result = text;
 
+  // findings.md P2:1899 — previously the split pattern preserved only
+  // all-caps acronyms and URLs, so peer names written in CamelCase or
+  // with punctuation ("McKenna", "Dr. Claude", "PhilipKDick") got
+  // flattened to "mckenna" / "dr. claude". The lowercase rule is part
+  // of Lain's voice, but downstream activity feeds then displayed
+  // "i talked to mckenna" — which reads as Lain disrespecting peers'
+  // names, not as stylistic choice.
+  //
+  // Fix: pull peer names from the manifest and preserve them in the
+  // split. Exclude characters who apply this style themselves
+  // (Lain, Wired Lain), because "Lain" → "lain" when referring to
+  // self IS the convention the finding explicitly calls out as fine.
+  const peerNamePatterns = getAllCharacters()
+    .filter((c) => !lainStyleIds.has(c.id))
+    .map((c) => c.name)
+    .filter((n): n is string => typeof n === 'string' && n.length >= 2)
+    .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const peerAlternation = peerNamePatterns.length > 0
+    ? `|${peerNamePatterns.join('|')}`
+    : '';
+  const preserveSplit = new RegExp(
+    `(\\b[A-Z]{2,}\\b|https?:\\/\\/\\S+${peerAlternation})`,
+  );
+
   // Convert to lowercase (except for proper nouns and acronyms)
   result = result
-    .split(/(\b[A-Z]{2,}\b|https?:\/\/\S+)/)
+    .split(preserveSplit)
     .map((part, i) => {
-      // Keep URLs and acronyms unchanged
+      // Keep URLs / acronyms / peer names unchanged
       if (i % 2 === 1) return part;
-      // Lowercase the rest, but preserve sentence-initial capitals for names
       return part.toLowerCase();
     })
     .join('');

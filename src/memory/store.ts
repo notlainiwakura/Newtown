@@ -5,13 +5,13 @@
 
 import { nanoid } from 'nanoid';
 import { execute, query, queryOne, transaction } from '../storage/database.js';
-import { serializeEmbedding, deserializeEmbedding, generateEmbedding, cosineSimilarity } from './embeddings.js';
+import { serializeEmbedding, deserializeEmbedding, generateEmbedding, cosineSimilarity, CURRENT_EMBEDDING_MODEL } from './embeddings.js';
 import { getLogger } from '../utils/logger.js';
 import { eventBus, parseEventType } from '../events/bus.js';
 import { mirrorMemoryToChroma } from './chroma.js';
 
 export type MemorySortBy = 'relevance' | 'recency' | 'importance' | 'access_count';
-export type LifecycleState = 'seed' | 'growing' | 'mature' | 'complete' | 'composting';
+export type LifecycleState = 'seed' | 'growing' | 'mature' | 'complete' | 'composting' | 'archived';
 export type CausalType = 'prerequisite' | 'tension' | 'completion' | 'reinforcement';
 
 export interface Memory {
@@ -37,6 +37,14 @@ export interface Memory {
   hall: string | null;
   aaakContent: string | null;
   aaakCompressedAt: number | null;
+  /**
+   * findings.md P2:517 — identifier of the embedding model that produced
+   * this row's `embedding`. NULL for rows written before the column was
+   * added; new rows carry `CURRENT_EMBEDDING_MODEL`. Search code skips
+   * rows whose stamp is non-NULL and differs from the current model to
+   * avoid comparing cosines across incompatible vector spaces.
+   */
+  embeddingModel: string | null;
 }
 
 export interface Association {
@@ -90,6 +98,7 @@ interface MemoryRow {
   hall: string | null;
   aaak_content: string | null;
   aaak_compressed_at: number | null;
+  embedding_model: string | null;
 }
 
 interface CoherenceGroupRow {
@@ -144,7 +153,7 @@ export function saveMessage(message: Omit<StoredMessage, 'id'>): string {
   eventBus.emitActivity({
     type: parseEventType(message.sessionKey),
     sessionKey: message.sessionKey,
-    content: message.content.length > 200 ? message.content.slice(0, 200) + '...' : message.content,
+    content: message.content,
     timestamp: message.timestamp,
   });
 
@@ -215,23 +224,46 @@ export function getAllRecentMessages(limit = 50): StoredMessage[] {
 
 /**
  * Get recent messages from visitor/user sessions only.
- * Excludes inter-character traffic: peer conversations, letters,
- * commune sessions, proactive outreach, doctor sessions, and town events.
+ *
+ * findings.md P2:393 — this function used to inline an 8-prefix exclude
+ * list that disagreed with the 22-prefix `BACKGROUND_PREFIXES` constant
+ * used by `getActivity`. The drift meant diary / dream / curiosity /
+ * self-concept / narrative / bibliomancy / alien / therapy / movement /
+ * note / document / gift / research / townlife / object messages
+ * silently counted as "visitor" traffic. Single source of truth is now
+ * `BACKGROUND_PREFIXES` below.
+ *
+ * findings.md P2:818 / P2:393-followup — the original filter only
+ * matched the background prefix as the FIRST segment (`LIKE 'letter:%'`),
+ * so char-namespaced variants like `lain:letter:sent` leaked through as
+ * visitor messages. Context Layer 3a then labelled Lain's own letter
+ * drafts as "a visitor said ...". The filter now excludes the prefix
+ * wherever it appears as a *segment* — first (`prefix:%`), middle
+ * (`%:prefix:%`), trailing (`%:prefix`), or exact match — so
+ * `letter:sent`, `lain:letter:sent`, and `wired-lain:letter` are all
+ * correctly classified as background traffic.
  */
 export function getRecentVisitorMessages(limit = 50): StoredMessage[] {
+  // For each background prefix we reject the session_key if the prefix
+  // appears as first / middle / trailing segment, or exact match.
+  // Four LIKE patterns per prefix, fine for a LIMIT-capped query.
+  const excludeClauses = BACKGROUND_PREFIXES.map(
+    () =>
+      '(session_key NOT LIKE ? AND session_key NOT LIKE ? AND session_key NOT LIKE ? AND session_key <> ?)'
+  ).join(' AND ');
+  const excludeParams: string[] = [];
+  for (const prefix of BACKGROUND_PREFIXES) {
+    excludeParams.push(`${prefix}:%`); // first segment
+    excludeParams.push(`%:${prefix}:%`); // middle segment
+    excludeParams.push(`%:${prefix}`); // trailing segment
+    excludeParams.push(prefix); // exact match
+  }
   const rows = query<MessageRow>(
     `SELECT * FROM messages
-     WHERE session_key NOT LIKE 'peer:%'
-       AND session_key NOT LIKE '%:letter:%'
-       AND session_key NOT LIKE 'wired:letter'
-       AND session_key NOT LIKE 'lain:letter'
-       AND session_key NOT LIKE 'commune:%'
-       AND session_key NOT LIKE 'proactive:%'
-       AND session_key NOT LIKE 'doctor:%'
-       AND session_key NOT LIKE 'town:%'
+     WHERE ${excludeClauses}
      ORDER BY timestamp DESC
      LIMIT ?`,
-    [limit]
+    [...excludeParams, limit]
   );
 
   return rows.reverse().map(rowToMessage);
@@ -241,7 +273,7 @@ export function getRecentVisitorMessages(limit = 50): StoredMessage[] {
  * Save a memory with embedding
  */
 export async function saveMemory(
-  memory: Omit<Memory, 'id' | 'embedding' | 'createdAt' | 'lastAccessed' | 'accessCount' | 'lifecycleState' | 'lifecycleChangedAt' | 'phase' | 'wingId' | 'roomId' | 'hall' | 'aaakContent' | 'aaakCompressedAt'> & {
+  memory: Omit<Memory, 'id' | 'embedding' | 'createdAt' | 'lastAccessed' | 'accessCount' | 'lifecycleState' | 'lifecycleChangedAt' | 'phase' | 'wingId' | 'roomId' | 'hall' | 'aaakContent' | 'aaakCompressedAt' | 'embeddingModel'> & {
     lifecycleState?: LifecycleState;
     skipEmbedding?: boolean;
   }
@@ -252,8 +284,8 @@ export async function saveMemory(
   const lifecycleState = memory.lifecycleState ?? 'seed';
 
   // Generate embedding for the memory content
-  let embedding: Float32Array | null = null;
   let embeddingBuffer: Buffer | null = null;
+  let embedding: Float32Array | null = null;
   if (!memory.skipEmbedding) {
     try {
       embedding = await generateEmbedding(memory.content);
@@ -266,47 +298,65 @@ export async function saveMemory(
   // Assign palace placement
   const { assignHall, resolveWingForMemory, resolveWing, resolveRoom, incrementWingCount, incrementRoomCount } = await import('./palace.js');
   const hall = assignHall(memory.memoryType, memory.sessionKey ?? '');
-  const { wingName, wingDescription } = resolveWingForMemory(memory.sessionKey ?? '', memory.userId ?? null, memory.metadata || {});
+  const { wingName, wingDescription, roomName, roomDescription } =
+    resolveWingForMemory(memory.sessionKey ?? '', memory.userId ?? null, memory.metadata || {});
   const wingId = resolveWing(wingName, wingDescription);
-  const roomId = resolveRoom(wingId, hall, `${hall} in ${wingName}`);
+  // findings.md P2:652 — when the wing-resolver returned a roomName
+  // override (currently only the shared `visitors` wing), use it so
+  // per-user grouping happens at the lighter room level instead of
+  // creating a new wing per visitor.
+  const effectiveRoomName = roomName ?? hall;
+  const effectiveRoomDescription = roomDescription ?? `${hall} in ${wingName}`;
+  const roomId = resolveRoom(wingId, effectiveRoomName, effectiveRoomDescription);
   incrementWingCount(wingId);
   incrementRoomCount(roomId);
 
-  execute(
-    `INSERT INTO memories (id, session_key, user_id, content, memory_type, importance, emotional_weight, embedding, created_at, related_to, source_message_id, metadata, lifecycle_state, lifecycle_changed_at, wing_id, room_id, hall)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      id,
-      memory.sessionKey,
-      memory.userId,
-      memory.content,
-      memory.memoryType,
-      memory.importance,
-      memory.emotionalWeight ?? 0,
-      embeddingBuffer,
-      now,
-      memory.relatedTo,
-      memory.sourceMessageId,
-      JSON.stringify(memory.metadata || {}),
-      lifecycleState,
-      now,
-      wingId,
-      roomId,
-      hall,
-    ]
-  );
+  // findings.md P2:381 — memories row and its vec0 embedding must commit
+  // atomically. The prior code wrapped vec0 INSERT in a silent try/catch, so
+  // a failure left the memory retrievable by id but invisible to any search
+  // using the KNN path. Over time coverage degraded monotonically. Transaction
+  // guarantees either both rows land or neither.
+  transaction(() => {
+    execute(
+      `INSERT INTO memories (id, session_key, user_id, content, memory_type, importance, emotional_weight, embedding, created_at, related_to, source_message_id, metadata, lifecycle_state, lifecycle_changed_at, wing_id, room_id, hall, embedding_model)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        memory.sessionKey,
+        memory.userId,
+        memory.content,
+        memory.memoryType,
+        memory.importance,
+        memory.emotionalWeight ?? 0,
+        embeddingBuffer,
+        now,
+        memory.relatedTo,
+        memory.sourceMessageId,
+        JSON.stringify(memory.metadata || {}),
+        lifecycleState,
+        now,
+        wingId,
+        roomId,
+        hall,
+        // findings.md P2:517 — stamp the generating model so future
+        // searches can detect drift. NULL iff embedding generation failed,
+        // since there's no stamp to compare and brute-force similarity
+        // can't run on a missing vector anyway.
+        embeddingBuffer ? CURRENT_EMBEDDING_MODEL : null,
+      ]
+    );
 
-  // Insert into vec0 if embedding exists
-  if (embedding) {
-    try {
+    if (embeddingBuffer) {
+      const embedding = deserializeEmbedding(embeddingBuffer);
+      const nextEmbeddingRow = queryOne<{ rowid: number | bigint | null }>(
+        'SELECT COALESCE(MAX(rowid), 0) + 1 AS rowid FROM memory_embeddings'
+      );
       execute(
         'INSERT INTO memory_embeddings(rowid, embedding, memory_id) VALUES (?, ?, ?)',
-        [BigInt(Date.now() * 1000 + Math.floor(Math.random() * 1000)), embedding, id]
+        [BigInt(nextEmbeddingRow?.rowid ?? 1), embedding, id]
       );
-    } catch {
-      // vec0 insert failure is non-critical
     }
-  }
+  });
 
   try {
     await mirrorMemoryToChroma({
@@ -336,7 +386,7 @@ export async function saveMemory(
   eventBus.emitActivity({
     type: parseEventType(memory.sessionKey),
     sessionKey: memory.sessionKey ?? 'unknown',
-    content: memory.content.length > 200 ? memory.content.slice(0, 200) + '...' : memory.content,
+    content: memory.content,
     timestamp: now,
   });
 
@@ -344,10 +394,27 @@ export async function saveMemory(
 }
 
 /**
- * Get all memories (for similarity search)
+ * Get all memories (for similarity search + maintenance sweeps).
+ *
+ * findings.md P2:423 — was hard-capped at 2000 rows ordered by
+ * importance DESC. With 15k production memories the bottom 87% of the
+ * corpus was invisible to every consumer: `gracefulForgetting`
+ * couldn't prune low-importance old memories (the whole point),
+ * `evolveImportance` and `detectCrossConversationPatterns` sampled
+ * only the top, and the `searchMemories` brute-force fallback missed
+ * recent-but-low-importance retrievals. Default is now unbounded; the
+ * optional `limit` parameter lets a caller opt into a bounded window
+ * when they genuinely want top-N by importance (e.g. a UI preview).
  */
-export function getAllMemories(): Memory[] {
-  const rows = query<MemoryRow>(`SELECT * FROM memories ORDER BY importance DESC LIMIT 2000`);
+export function getAllMemories(limit?: number): Memory[] {
+  if (limit !== undefined) {
+    const rows = query<MemoryRow>(
+      `SELECT * FROM memories ORDER BY importance DESC LIMIT ?`,
+      [limit],
+    );
+    return rows.map(rowToMemory);
+  }
+  const rows = query<MemoryRow>(`SELECT * FROM memories ORDER BY importance DESC`);
   return rows.map(rowToMemory);
 }
 
@@ -398,6 +465,15 @@ export async function searchMemories(
     memoryTypes?: Memory['memoryType'][];
     wingId?: string;
     hall?: string;
+    // findings.md P2:465 — autonomous background loops (curiosity,
+    // dreams, commune-loop, diary, self-concept, etc.) that sample
+    // memories every N minutes pass skipAccessBoost=true so their
+    // repeated retrievals don't act as "engagement signal" and peg-lock
+    // a small cluster of frequently-sampled memories at importance 1.0
+    // via updateMemoryAccess -> evolveImportance. Only real retrievals
+    // tied to a user turn (processMessage context injection) leave it
+    // undefined so genuine engagement still reinforces.
+    skipAccessBoost?: boolean;
   }
 ): Promise<{ memory: Memory; similarity: number; effectiveScore: number }[]> {
   const logger = getLogger();
@@ -438,7 +514,15 @@ export async function searchMemories(
 
       const memory = getMemory(memory_id);
       if (!memory) continue;
-      if (memory.lifecycleState === 'composting') continue;
+      // findings.md P2:755 — exclude both composting and archived memories
+      // from retrieval. Era-summary-archived rows stay in the DB for the
+      // summary itself to reference, but shouldn't compete with the summary
+      // for retrieval slots.
+      if (memory.lifecycleState === 'composting' || memory.lifecycleState === 'archived') continue;
+      // findings.md P2:517 — skip rows stamped with a non-current embedding
+      // model. NULL (legacy, pre-migration) is grandfathered in as "presumed
+      // current"; only an explicit non-matching stamp is rejected.
+      if (memory.embeddingModel && memory.embeddingModel !== CURRENT_EMBEDDING_MODEL) continue;
       if (userId && memory.userId !== userId && memory.userId !== null) continue;
       if (options?.memoryTypes && options.memoryTypes.length > 0 && !options.memoryTypes.includes(memory.memoryType)) continue;
       if (options?.wingId && memory.wingId !== options.wingId) continue;
@@ -454,7 +538,10 @@ export async function searchMemories(
     }
   } else {
     // ── Brute-force fallback (pre-vec0 memories or empty index) ───────────────
-    let memories = getAllMemories().filter((m) => m.embedding !== null && m.lifecycleState !== 'composting');
+    let memories = getAllMemories().filter(
+      // findings.md P2:755 — brute-force fallback mirrors the KNN lifecycle filter.
+      (m) => m.embedding !== null && m.lifecycleState !== 'composting' && m.lifecycleState !== 'archived'
+    );
 
     if (userId) {
       memories = memories.filter((m) => m.userId === userId || m.userId === null);
@@ -471,6 +558,9 @@ export async function searchMemories(
 
     for (const memory of memories) {
       if (!memory.embedding) continue;
+      // findings.md P2:517 — mirror the KNN-path filter so brute-force
+      // search can't silently include cross-model vectors either.
+      if (memory.embeddingModel && memory.embeddingModel !== CURRENT_EMBEDDING_MODEL) continue;
       const similarity = cosineSimilarity(queryEmbedding, memory.embedding);
       if (similarity < minSimilarity) continue;
       const effectiveImportance = calculateEffectiveImportance(memory);
@@ -500,10 +590,13 @@ export async function searchMemories(
       break;
   }
 
-  // Update access counts for retrieved memories
+  // Update access counts for retrieved memories (unless the caller asked to
+  // skip — see findings.md P2:465 note above on skipAccessBoost).
   const topResults = results.slice(0, limit);
-  for (const { memory } of topResults) {
-    updateMemoryAccess(memory.id);
+  if (!options?.skipAccessBoost) {
+    for (const { memory } of topResults) {
+      updateMemoryAccess(memory.id);
+    }
   }
 
   return topResults;
@@ -627,6 +720,20 @@ export function updateMemoryImportance(memoryId: string, importance: number): vo
 export function deleteMemory(memoryId: string): boolean {
   return transaction(() => {
     execute(`DELETE FROM coherence_memberships WHERE memory_id = ?`, [memoryId]);
+    // findings.md P2:381 — the vec0 row was previously orphaned on delete.
+    // KNN search returned the ghost memory_id, getMemory() returned undefined,
+    // and the result was silently skipped — KNN slots wasted on ghosts,
+    // search quality degraded. Delete the vec0 row inside the same tx.
+    execute(`DELETE FROM memory_embeddings WHERE memory_id = ?`, [memoryId]);
+    // findings.md P2:445 — associations were left dangling on memory delete.
+    // getAssociations returned ghost rows; getAssociatedMemories silently
+    // skipped them after getMemory() returned undefined. The table grew
+    // unbounded. Cascade inside the same transaction on both sides of the
+    // edge (source_id OR target_id).
+    execute(`DELETE FROM memory_associations WHERE source_id = ? OR target_id = ?`, [
+      memoryId,
+      memoryId,
+    ]);
     const result = execute(`DELETE FROM memories WHERE id = ?`, [memoryId]);
     return result.changes > 0;
   });
@@ -856,13 +963,24 @@ export interface GetActivityOptions {
   chatPrefixes?: string[];
 }
 
-// Session key prefixes for autonomous background loops (not user chat)
-const BACKGROUND_PREFIXES = [
+// Session key prefixes for autonomous background loops (not user chat).
+// Exported so memory/index.ts's `extractUserId` can avoid hallucinating a
+// userId out of background session keys (findings.md P2:787).
+export const BACKGROUND_PREFIXES = [
   'diary', 'dream', 'commune', 'curiosity', 'self-concept', 'selfconcept',
   'narrative', 'letter', 'wired', 'bibliomancy', 'alien', 'peer',
   'therapy', 'proactive', 'doctor', 'movement', 'move', 'note', 'document', 'gift',
   'research', 'townlife', 'object',
 ];
+
+/**
+ * Prefixes that identify sessions originating from an external user.
+ * findings.md P2:787 — only these shapes carry a userId as the second
+ * segment. Everything else (background loops, peer/letter/commune, even
+ * char-namespaced variants like `lain:letter:...`) returns null from
+ * `extractUserId`.
+ */
+export const USER_SESSION_PREFIXES = ['web', 'telegram', 'user', 'chat', 'owner'];
 
 const BACKGROUND_SQL_FILTER = BACKGROUND_PREFIXES.map(() => `session_key LIKE ?`).join(' OR ');
 const BACKGROUND_SQL_PARAMS = BACKGROUND_PREFIXES.map((p) => `${p}:%`);
@@ -890,8 +1008,7 @@ function buildVisitorChatFilter(prefixes: string[]): { filter: string; params: s
 /**
  * Get recent activity across both memories and messages tables.
  * Only returns background loop activity (diary, dreams, commune, etc.),
- * excluding user chat sessions by default.
- * Pages that need visible resident conversations can opt into visitor chat.
+ * excluding user chat sessions.
  */
 export function getActivity(from: number, to: number, limit = 500, options?: GetActivityOptions): ActivityEntry[] {
   const memories = query<MemoryRow>(
@@ -984,6 +1101,7 @@ function rowToMemory(row: MemoryRow): Memory {
     hall: row.hall ?? null,
     aaakContent: row.aaak_content ?? null,
     aaakCompressedAt: row.aaak_compressed_at ?? null,
+    embeddingModel: row.embedding_model ?? null,
   };
 }
 
@@ -1318,16 +1436,78 @@ export function togglePostboardPin(id: string): boolean {
 
 // --- Unassigned memories query (for topology formation) ---
 
-export function getUnassignedMemories(lifecycleStates: LifecycleState[], limit = 200): Memory[] {
+/**
+ * findings.md P2:660 — sampling strategy for `getUnassignedMemories`.
+ * The old default ('newest') only ever returned the top-N by created_at,
+ * so any memory that failed to be assigned on its first topology cycle
+ * was effectively invisible forever once N newer memories arrived. The
+ * 'mixed' default now splits the budget ~50/50 between newest and
+ * random, giving stragglers eventual coverage without losing freshness
+ * on brand-new memories. Callers that genuinely want pure-newest or
+ * pure-random behavior can pass the option explicitly.
+ */
+export type UnassignedSampleStrategy = 'newest' | 'random' | 'mixed';
+
+export function getUnassignedMemories(
+  lifecycleStates: LifecycleState[],
+  limit = 200,
+  strategy: UnassignedSampleStrategy = 'mixed',
+): Memory[] {
   const placeholders = lifecycleStates.map(() => '?').join(',');
-  const rows = query<MemoryRow>(
-    `SELECT m.* FROM memories m
-     WHERE m.lifecycle_state IN (${placeholders})
+  const whereBody = `WHERE m.lifecycle_state IN (${placeholders})
        AND m.embedding IS NOT NULL
-       AND m.id NOT IN (SELECT memory_id FROM coherence_memberships)
+       AND m.id NOT IN (SELECT memory_id FROM coherence_memberships)`;
+
+  if (strategy === 'newest') {
+    const rows = query<MemoryRow>(
+      `SELECT m.* FROM memories m
+       ${whereBody}
+       ORDER BY m.created_at DESC
+       LIMIT ?`,
+      [...lifecycleStates, limit]
+    );
+    return rows.map(rowToMemory);
+  }
+
+  if (strategy === 'random') {
+    const rows = query<MemoryRow>(
+      `SELECT m.* FROM memories m
+       ${whereBody}
+       ORDER BY RANDOM()
+       LIMIT ?`,
+      [...lifecycleStates, limit]
+    );
+    return rows.map(rowToMemory);
+  }
+
+  // 'mixed' — half the budget to newest, half to a random sample. De-dup
+  // via a Map<id, Memory> because the two halves can overlap.
+  const newestBudget = Math.max(1, Math.floor(limit / 2));
+  const randomBudget = Math.max(1, limit - newestBudget);
+
+  const newestRows = query<MemoryRow>(
+    `SELECT m.* FROM memories m
+     ${whereBody}
      ORDER BY m.created_at DESC
      LIMIT ?`,
-    [...lifecycleStates, limit]
+    [...lifecycleStates, newestBudget]
   );
-  return rows.map(rowToMemory);
+  const randomRows = query<MemoryRow>(
+    `SELECT m.* FROM memories m
+     ${whereBody}
+     ORDER BY RANDOM()
+     LIMIT ?`,
+    [...lifecycleStates, randomBudget]
+  );
+
+  const merged = new Map<string, Memory>();
+  for (const row of newestRows) {
+    const memory = rowToMemory(row);
+    merged.set(memory.id, memory);
+  }
+  for (const row of randomRows) {
+    const memory = rowToMemory(row);
+    merged.set(memory.id, memory);
+  }
+  return Array.from(merged.values());
 }

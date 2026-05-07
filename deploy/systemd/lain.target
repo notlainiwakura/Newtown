@@ -1,6 +1,6 @@
 [Unit]
-Description=Laintown - All Services
-Wants=lain-wired.service lain-main.service lain-telegram.service lain-gateway.service lain-voice.service lain-dr-claude.service lain-pkd.service lain-mckenna.service lain-john.service lain-hiru.service
+Description=Town - All Services
+Wants=lain-gateway.service lain-telegram.service lain-voice.service
 
 [Install]
 WantedBy=multi-user.target

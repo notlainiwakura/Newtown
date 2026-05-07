@@ -585,7 +585,9 @@ describe('Awareness Context', () => {
 
   it('buildAwarenessContext includes state summary when token is set', async () => {
     const originalToken = process.env['LAIN_INTERLINK_TOKEN'];
+    const originalCharId = process.env['LAIN_CHARACTER_ID'];
     process.env['LAIN_INTERLINK_TOKEN'] = 'test-token';
+    process.env['LAIN_CHARACTER_ID'] = 'test-char';
 
     const { buildAwarenessContext } = await import('../src/agent/awareness.js');
 
@@ -613,6 +615,11 @@ describe('Awareness Context', () => {
         process.env['LAIN_INTERLINK_TOKEN'] = originalToken;
       } else {
         delete process.env['LAIN_INTERLINK_TOKEN'];
+      }
+      if (originalCharId !== undefined) {
+        process.env['LAIN_CHARACTER_ID'] = originalCharId;
+      } else {
+        delete process.env['LAIN_CHARACTER_ID'];
       }
     }
   });
@@ -954,25 +961,25 @@ describe('Desires — Decay', () => {
     expect(ctx).toContain('Current Desires');
   });
 
-  it('getDesireContext includes intensity label "strongly" for high intensity', async () => {
+  it('getDesireContext includes intensity label "[pull: strong]" for high intensity', async () => {
     const { createDesire, getDesireContext } = await import('../src/agent/desires.js');
     createDesire({ type: 'social', description: 'urgent need', source: 'test', intensity: 0.85 });
     const ctx = getDesireContext();
-    expect(ctx).toContain('strongly');
+    expect(ctx).toContain('[pull: strong]');
   });
 
-  it('getDesireContext includes "somewhat" for mid intensity', async () => {
+  it('getDesireContext includes "[pull: moderate]" for mid intensity', async () => {
     const { createDesire, getDesireContext } = await import('../src/agent/desires.js');
     createDesire({ type: 'emotional', description: 'moderate feeling', source: 'test', intensity: 0.5 });
     const ctx = getDesireContext();
-    expect(ctx).toContain('somewhat');
+    expect(ctx).toContain('[pull: moderate]');
   });
 
-  it('getDesireContext includes "faintly" for low intensity', async () => {
+  it('getDesireContext includes "[pull: faint]" for low intensity', async () => {
     const { createDesire, getDesireContext } = await import('../src/agent/desires.js');
     createDesire({ type: 'creative', description: 'gentle urge', source: 'test', intensity: 0.3 });
     const ctx = getDesireContext();
-    expect(ctx).toContain('faintly');
+    expect(ctx).toContain('[pull: faint]');
   });
 });
 

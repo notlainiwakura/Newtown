@@ -16,6 +16,7 @@ import {
 import { getLogger } from '../utils/logger.js';
 import { getMeta, setMeta } from '../storage/database.js';
 import { getBasePath } from '../config/paths.js';
+import { requireCharacterName } from '../config/characters.js';
 import { eventBus } from '../events/bus.js';
 import { getCurrentState } from './internal-state.js';
 
@@ -253,16 +254,19 @@ export function startDiaryLoop(config?: Partial<DiaryConfig>): () => void {
     scheduleNext(jitter);
   }
 
-  eventBus.on('activity', (event: import('../events/bus.js').SystemEvent) => {
+  // findings.md P2:2209 — store handler ref so restart doesn't leak listeners.
+  const activityHandler = (event: import('../events/bus.js').SystemEvent): void => {
     if (stopped || isRunning) return;
     if (event.type === 'state') {
       maybeRunEarly('state shift');
     }
-  });
+  };
+  eventBus.on('activity', activityHandler);
 
   return () => {
     stopped = true;
     if (timer) clearTimeout(timer);
+    eventBus.off('activity', activityHandler);
     logger.info('Diary loop stopped');
   };
 }
@@ -297,7 +301,8 @@ async function runDiaryCycle(): Promise<void> {
   });
 
   // Character identity
-  const characterName = process.env['LAIN_CHARACTER_NAME'] || 'Newtown';
+  // findings.md P2:2271 — fail-closed; see requireCharacterName.
+  const characterName = requireCharacterName();
   const soulContext = getAgent('default')?.persona?.soul || '';
 
   // Recent messages from the day
@@ -321,7 +326,7 @@ async function runDiaryCycle(): Promise<void> {
         8,
         0.1,
         undefined,
-        { sortBy: 'importance' }
+        { sortBy: 'importance', skipAccessBoost: true }
       );
       memoriesContext = memories
         .map((r) => `- ${r.memory.content}`)
@@ -339,7 +344,7 @@ async function runDiaryCycle(): Promise<void> {
       3,
       0.1,
       undefined,
-      { memoryTypes: ['episode'], sortBy: 'recency' }
+      { memoryTypes: ['episode'], sortBy: 'recency', skipAccessBoost: true }
     );
     const browseResults = discoveries.filter(
       (r) => r.memory.sessionKey === 'curiosity:browse'
@@ -383,7 +388,7 @@ async function runDiaryCycle(): Promise<void> {
   let objectsContext = '';
   try {
     const { buildObjectContext } = await import('./objects.js');
-    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+    const charId = process.env['LAIN_CHARACTER_ID'] || 'lain';
     const wiredUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
     objectsContext = await buildObjectContext(charId, wiredUrl);
   } catch {

@@ -38,6 +38,7 @@ vi.mock('../src/memory/embeddings.js', () => ({
   isEmbeddingModelLoaded: vi.fn().mockReturnValue(false),
   isEmbeddingModelLoading: vi.fn().mockReturnValue(false),
   unloadEmbeddingModel: vi.fn(),
+  CURRENT_EMBEDDING_MODEL: 'Xenova/all-MiniLM-L6-v2',
 }));
 
 // ── characters mock (needed by location.ts → buildings.ts) ────────────────
@@ -1414,9 +1415,10 @@ describe('Palace stress', () => {
     expect(wingName).toBe('wired-lain');
   });
 
-  it('resolveWingForMemory: visitor userId → visitor-{id} wing', () => {
-    const { wingName } = resolveWingForMemory('chat:xyz', 'user-42');
-    expect(wingName).toBe('visitor-user-42');
+  it('resolveWingForMemory: visitor userId → shared visitors wing + per-user room (findings.md P2:652)', () => {
+    const { wingName, roomName } = resolveWingForMemory('chat:xyz', 'user-42');
+    expect(wingName).toBe('visitors');
+    expect(roomName).toBe('visitor-user-42');
   });
 
   it('100 wings × 50 rooms each — total room count correct', () => {

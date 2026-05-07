@@ -1,5 +1,5 @@
 /**
- * NEWTOWN GAME — Object Manager
+ * LAINTOWN GAME — Object Manager
  * Renders persistent world objects on the isometric map.
  * Polls the /api/objects endpoint for ground objects.
  */

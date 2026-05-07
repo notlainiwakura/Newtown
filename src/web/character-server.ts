@@ -29,6 +29,7 @@ import { startOfflineCuriosityLoop } from '../agent/curiosity-offline.js';
 import { startCommuneLoop } from '../agent/commune-loop.js';
 import { startTownLifeLoop } from '../agent/town-life.js';
 import { startStateDecayLoop } from '../agent/internal-state.js';
+import { startTownWeatherRefreshLoop } from '../commune/weather.js';
 import { startDiaryLoop } from '../agent/diary.js';
 import { startSelfConceptLoop } from '../agent/self-concept.js';
 import { startDreamLoop } from '../agent/dreams.js';
@@ -39,13 +40,23 @@ import { startDesireLoop } from '../agent/desires.js';
 import { paraphraseLetter, type WiredLetter } from '../agent/membrane.js';
 import { saveMemory, getActivity, getNotesByBuilding, getDocumentsByAuthor, getPostboardMessages, countMemories, countMessages } from '../memory/store.js';
 import { eventBus, isBackgroundEvent, type SystemEvent } from '../events/bus.js';
+import { startExpireStaleEventsLoop } from '../events/town-events.js';
 import { sanitize } from '../security/sanitizer.js';
-import { secureCompare } from '../utils/crypto.js';
+import {
+  verifyInterlinkRequest,
+  assertBodyIdentity,
+  getInterlinkHeaders,
+} from '../security/interlink-auth.js';
 import { isOwner } from './owner-auth.js';
+import { applyCorsHeaders } from './cors.js';
+import { createRateLimiter } from './rate-limit.js';
+import { applySecurityHeaders, API_ONLY_CSP } from './security-headers.js';
+import { buildHtmlCsp } from './csp-hashes.js';
 import { initDatabase, getMeta, query } from '../storage/database.js';
 import { getPaths } from '../config/index.js';
 import { getBasePath } from '../config/paths.js';
 import { getDefaultConfig } from '../config/defaults.js';
+import { isResearchEnabled } from '../config/features.js';
 import {
   isPossessed,
   getPossessionState,
@@ -62,7 +73,9 @@ import {
   getActiveLoopStops,
 } from '../agent/possession.js';
 import type { IncomingMessage, TextContent } from '../types/message.js';
-import type { AgentConfig } from '../types/config.js';
+import type { AgentConfig, ProviderConfig } from '../types/config.js';
+import { getProvidersFor } from '../config/characters.js';
+import { purgeLocalOnlyResearchArtifacts } from '../memory/local-only.js';
 
 const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html',
@@ -76,10 +89,31 @@ const MIME_TYPES: Record<string, string> = {
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const SKINS_DIR = join(__dirname, '..', '..', 'src', 'web', 'skins');
+const PUBLIC_DIR = join(__dirname, '..', '..', 'src', 'web', 'public');
+const CHAT_UI_CSP = buildHtmlCsp(PUBLIC_DIR);
+const CHAT_UI_FILES = new Set(['index.html', 'styles.css', 'app.js']);
+
+async function serveChatUiAsset(pathname: string): Promise<{ content: Buffer; type: string; html: boolean } | null> {
+  const asset = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  if (!CHAT_UI_FILES.has(asset)) return null;
+  const filePath = resolve(PUBLIC_DIR, asset);
+  if (!filePath.startsWith(resolve(PUBLIC_DIR))) return null;
+  try {
+    const content = await readFile(filePath);
+    const ext = extname(filePath);
+    return {
+      content,
+      type: MIME_TYPES[ext] || 'application/octet-stream',
+      html: ext === '.html',
+    };
+  } catch {
+    return null;
+  }
+}
 
 const TOOLS_TO_REMOVE = [
   'web_search', 'fetch_webpage',
-  'create_tool', 'list_my_tools', 'delete_tool',
+  // create_tool / list_my_tools / delete_tool were removed in findings.md P1:1561
   'introspect_list', 'introspect_read', 'introspect_search', 'introspect_info',
   'show_image', 'search_images', 'fetch_and_show_image', 'view_image',
   'send_message', 'telegram_call', 'send_letter',
@@ -89,7 +123,6 @@ export interface CharacterConfig {
   id: string;
   name: string;
   port: number;
-  publicDir: string;
   peers: PeerConfig[];
   possessable?: boolean;
 }
@@ -99,53 +132,56 @@ interface BackgroundLoops {
   restarters: (() => (() => void))[];
 }
 
-function readBody(req: import('node:http').IncomingMessage): Promise<string> {
+/** Max POST body the character server will accept. Matches server.ts. */
+export const MAX_BODY_BYTES = 1_048_576; // 1 MB
+
+/**
+ * Read a request body with a hard size cap. Exceeding the cap destroys the
+ * request and rejects — protects the inhabitant process from OOM via a
+ * single large POST.
+ */
+export function readBody(
+  req: import('node:http').IncomingMessage,
+  maxBytes = MAX_BODY_BYTES,
+): Promise<string> {
   return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
-    req.on('end', () => resolve(body));
+    let size = 0;
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        try { req.destroy(); } catch { /* already gone */ }
+        reject(new Error('PAYLOAD_TOO_LARGE'));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString()));
     req.on('error', reject);
   });
 }
 
+/**
+ * Per-character interlink auth (findings.md P1:2289). Returns the
+ * authenticated caller id on success, or null after sending the error.
+ * Callers MUST use the returned id — never trust body-asserted identity.
+ */
 function verifyInterlinkAuth(
   req: import('node:http').IncomingMessage,
   res: ServerResponse
-): boolean {
-  const token = process.env['LAIN_INTERLINK_TOKEN'];
-  if (!token) {
-    res.writeHead(503, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Interlink not configured' }));
-    return false;
-  }
-  const authHeader = req.headers['authorization'];
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.writeHead(401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Missing or invalid Authorization header' }));
-    return false;
-  }
-  if (!secureCompare(authHeader.slice('Bearer '.length), token)) {
-    res.writeHead(403, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Invalid token' }));
-    return false;
-  }
-  return true;
-}
-
-async function serveStatic(
-  publicDir: string,
-  path: string
-): Promise<{ content: Buffer; type: string } | null> {
-  try {
-    const safePath = path.replace(/\.\./g, '').replace(/^\/+/, '');
-    const filePath = join(publicDir, safePath || 'index.html');
-    const content = await readFile(filePath);
-    const ext = extname(filePath);
-    const type = MIME_TYPES[ext] || 'application/octet-stream';
-    return { content, type };
-  } catch {
+): string | null {
+  const result = verifyInterlinkRequest(req);
+  if (!result.ok) {
+    res.writeHead(result.status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: result.error }));
     return null;
   }
+  return result.fromId;
+}
+
+function rejectBodyIdentityMismatch(res: ServerResponse, reason: string): void {
+  res.writeHead(403, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Body identity mismatch', detail: reason }));
 }
 
 /**
@@ -153,12 +189,14 @@ async function serveStatic(
  */
 function startBackgroundLoops(config: CharacterConfig): BackgroundLoops {
   const wiredLainUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
-  const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
-  const researchEnabled = process.env['ENABLE_RESEARCH'] === '1';
-  const offlineCuriosityEnabled = process.env['ENABLE_OFFLINE_CURIOSITY'] !== '0';
 
   // Each entry: [factory function that starts the loop and returns a stop fn]
   const loopFactories: (() => (() => void))[] = [
+    // findings.md P2:1505 — warm a local cache of WL's /api/weather so
+    // internal-state.ts decay ticks and agent prompt context can see
+    // the town's authoritative weather instead of a process-local
+    // 'weather:current' meta that only WL ever writes to.
+    () => startTownWeatherRefreshLoop(),
     () => startStateDecayLoop(),
     () => startDiaryLoop(),
     () => startSelfConceptLoop(),
@@ -177,6 +215,11 @@ function startBackgroundLoops(config: CharacterConfig): BackgroundLoops {
       characterName: config.name,
       peers: config.peers,
     }),
+    () => startOfflineCuriosityLoop({
+      characterId: config.id,
+      characterName: config.name,
+      wiredLainUrl,
+    }),
     () => startCommuneLoop({
       characterId: config.id,
       characterName: config.name,
@@ -191,16 +234,6 @@ function startBackgroundLoops(config: CharacterConfig): BackgroundLoops {
 
   const stops: (() => void)[] = [];
   const restarters: (() => (() => void))[] = [];
-
-  if (offlineCuriosityEnabled) {
-    loopFactories.splice(7, 0, () => startOfflineCuriosityLoop({
-      characterId: config.id,
-      characterName: config.name,
-      wiredLainUrl,
-      interlinkToken,
-      submitResearchRequests: researchEnabled,
-    }));
-  }
 
   for (const factory of loopFactories) {
     const stop = factory();
@@ -217,35 +250,50 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
 
   console.log(`[${config.name}] Initializing database...`);
   await initDatabase(paths.database, defaultConfig.security.keyDerivation);
+  purgeLocalOnlyResearchArtifacts();
 
-  const providerType = (process.env['CHARACTER_PROVIDER'] || 'openai') as 'openai' | 'google' | 'anthropic';
-  const characterModel = process.env['CHARACTER_MODEL'] || process.env['OPENAI_MODEL'] || 'MiniMax-M2.7';
-  const apiKeyEnv = process.env['CHARACTER_API_KEY_ENV'] || 'OPENAI_API_KEY';
-  const baseURL = process.env['CHARACTER_BASE_URL'] || process.env['OPENAI_BASE_URL'];
-
-  // Model fallback chains — if primary model gets deprecated, try these in order
+  // findings.md P2:171 — character-server resolves its provider chain in
+  // this order:
+  //   1. `CHARACTER_PROVIDER` env-var trio (legacy per-service systemd env)
+  //   2. `providers[]` from the character's characters.json entry
+  //   3. `DEFAULT_PROVIDERS` baked-in chain (3× Anthropic tiers)
+  // The env-var override is preserved so existing systemd unit files that
+  // pin `CHARACTER_PROVIDER=openai`/`CHARACTER_MODEL=...` keep working; new
+  // installs should declare providers in the manifest instead.
   const DEFAULT_FALLBACKS: Record<string, string[]> = {
     'gpt-4o-mini': ['gpt-4o-mini-2024-07-18', 'gpt-4.1-mini', 'gpt-4.1-nano'],
     'gpt-4o': ['gpt-4o-2024-08-06', 'gpt-4.1', 'gpt-4.1-mini'],
   };
-  const fallbackEnv = process.env['CHARACTER_FALLBACK_MODELS'];
-  const fallbackModels = fallbackEnv
-    ? fallbackEnv.split(',').map(s => s.trim()).filter(Boolean)
-    : DEFAULT_FALLBACKS[characterModel] ?? [];
+
+  let providers: ProviderConfig[];
+  const envProvider = process.env['CHARACTER_PROVIDER'];
+  const envModel = process.env['CHARACTER_MODEL'];
+  if (envProvider && envModel) {
+    const providerType = envProvider as 'openai' | 'google' | 'anthropic';
+    const apiKeyEnv = process.env['CHARACTER_API_KEY_ENV'] || 'OPENAI_API_KEY';
+    const fallbackEnv = process.env['CHARACTER_FALLBACK_MODELS'];
+    const fallbackModels = fallbackEnv
+      ? fallbackEnv.split(',').map(s => s.trim()).filter(Boolean)
+      : DEFAULT_FALLBACKS[envModel] ?? [];
+    providers = [
+      { type: providerType, model: envModel, apiKeyEnv, fallbackModels },
+      { type: providerType, model: envModel, apiKeyEnv, fallbackModels },
+      { type: providerType, model: envModel, apiKeyEnv, fallbackModels },
+    ];
+  } else {
+    providers = getProvidersFor(config.id);
+  }
 
   const agentConfig: AgentConfig = {
     id: 'default',
     name: config.name,
     enabled: true,
     workspace: paths.workspace,
-    providers: [
-      { type: providerType, model: characterModel, apiKeyEnv, fallbackModels, ...(baseURL ? { baseURL } : {}) },
-      { type: providerType, model: characterModel, apiKeyEnv, fallbackModels, ...(baseURL ? { baseURL } : {}) },
-      { type: providerType, model: characterModel, apiKeyEnv, fallbackModels, ...(baseURL ? { baseURL } : {}) },
-    ],
+    providers,
   };
 
-  console.log(`[${config.name}] Initializing agent (${providerType}/${characterModel})...`);
+  const primary = providers[0]!;
+  console.log(`[${config.name}] Initializing agent (${primary.type}/${primary.model})...`);
   await initAgent(agentConfig);
 
   eventBus.setCharacterId(config.id);
@@ -257,8 +305,10 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
 
   // Register character-specific tools
   const wiredLainUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
-  const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
-  registerCharacterTools(config.id, config.name, wiredLainUrl, interlinkToken, config.peers);
+  registerCharacterTools(config.id, config.name, wiredLainUrl, config.peers);
+  if (!isResearchEnabled()) {
+    console.log(`[${config.name}] Local-only mode active: remote research tools disabled`);
+  }
 
   // Register doctor-specific diagnostic tools for Dr. Claude
   if (config.id === 'dr-claude') {
@@ -272,6 +322,12 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
 
   console.log(`[${config.name}] Background loops started`);
 
+  // findings.md P2:2494 — gate /api/chat and /api/chat/stream behind a
+  // per-IP cap so an owner cookie or interlink-token leak can't be used
+  // to burst-flood this character process. Shares semantics with the
+  // main server's rate limiter (30 req / minute, XFF-trust aware).
+  const chatLimiter = createRateLimiter();
+
   const server = createServer(async (req, res) => {
     let url: URL;
     try {
@@ -282,9 +338,15 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
       return;
     }
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    // findings.md P2:2366 — CORS origin comes from LAIN_CORS_ORIGIN, default
+    // is no header emitted (character-server serves owner endpoints; it has
+    // no cross-origin use case by default).
+    applyCorsHeaders(res);
+
+    // findings.md P2:2512 — character-server used to emit zero security
+    // headers. Strict API-only CSP is safe here because every response
+    // is JSON or text/event-stream; no HTML is ever rendered.
+    applySecurityHeaders(res, { csp: API_ONLY_CSP });
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
@@ -292,16 +354,32 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
       return;
     }
 
-    // Health check (no auth)
+    // Health check (no auth — used by dashboard service probes)
     if (url.pathname === '/api/health' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'ok',
         characterId: config.id,
-        name: config.name,
         uptime: process.uptime(),
         timestamp: Date.now(),
       }));
+      return;
+    }
+
+    // Character manifest (no auth — public for commune map / game client)
+    if (url.pathname === '/api/characters' && req.method === 'GET') {
+      const { getAllCharacters, loadManifest } = await import('../config/characters.js');
+      const manifest = loadManifest();
+      const characters = getAllCharacters().map(c => ({
+        id: c.id,
+        name: c.name,
+        port: c.port,
+        defaultLocation: c.defaultLocation,
+        possessable: c.possessable === true ? true : undefined,
+        web: c.server === 'web' ? true : undefined,
+      }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ town: manifest.town, characters }));
       return;
     }
 
@@ -416,13 +494,27 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
       return;
     }
 
-    // Meta key read — used by evolution system to fetch self-concept etc.
+    // findings.md P2:2404 — Meta key read used to accept any key, letting any
+    // interlink-token holder probe for book:concluded, book:drafts:*,
+    // mempalace wing names, internal-state checkpoints, dream cycle
+    // timestamps, etc. Restrict to the narrow set the evolution system
+    // actually needs (self-concept:{current,previous}). Identity and
+    // integrity have their own dedicated endpoints above.
     if (url.pathname.startsWith('/api/meta/') && req.method === 'GET') {
       if (!verifyInterlinkAuth(req, res)) return;
       const key = decodeURIComponent(url.pathname.slice('/api/meta/'.length));
       if (!key) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Missing key' }));
+        return;
+      }
+      const ALLOWED_META_KEYS = new Set([
+        'self-concept:current',
+        'self-concept:previous',
+      ]);
+      if (!ALLOWED_META_KEYS.has(key)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Meta key not exposed via interlink' }));
         return;
       }
       const value = getMeta(key);
@@ -489,7 +581,7 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
           avgEmotionalWeight: avgRow[0]?.avg_ew ?? 0,
           sessionActivity: Object.fromEntries(sessionCounts.map(r => [r.prefix, r.count])),
           hotMemories: hotMemories.map(m => ({
-            content: m.content.slice(0, 500),
+            content: m.content,
             emotionalWeight: m.emotional_weight,
           })),
           loopHealth,
@@ -503,11 +595,11 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
 
     // SSE event stream (public — visitors can watch)
     if (url.pathname === '/api/events' && req.method === 'GET') {
+      // CORS set by the top-level applyCorsHeaders() above (P2:2366).
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
       });
       const handler = (event: SystemEvent) => {
         if (!isBackgroundEvent(event)) return;
@@ -541,8 +633,13 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
       return;
     }
 
-    // Building notes (no auth — used for note discovery between characters)
+    // findings.md P2:2376 — building notes and documents leak introspective
+    // LLM-generated content. Previously "public for character discovery"; now
+    // gated by interlink auth so only authenticated peer processes — not the
+    // open web — can enumerate them. Owners also allowed so operators can
+    // read via the dashboard.
     if (url.pathname === '/api/building/notes' && req.method === 'GET') {
+      if (!isOwner(req) && !verifyInterlinkAuth(req, res)) return;
       const building = url.searchParams.get('building');
       if (!building) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -557,8 +654,8 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
       return;
     }
 
-    // Documents by this character (no auth — for document discovery between characters)
     if (url.pathname === '/api/documents' && req.method === 'GET') {
+      if (!isOwner(req) && !verifyInterlinkAuth(req, res)) return;
       const titleParam = url.searchParams.get('title');
       const docs = getDocumentsByAuthor(config.id);
       if (titleParam) {
@@ -596,6 +693,10 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
           res.end(JSON.stringify({ error: 'Unauthorized' }));
           return;
         }
+        // findings.md P2:2494 — rate-limit after auth so legitimate owner
+        // traffic still gets a clean 429 when over cap, but unauthenticated
+        // probes still 403 first (don't advertise the cap to the world).
+        if (!chatLimiter.guard(req, res)) return;
         if (config.possessable && isPossessed()) {
           res.writeHead(503, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'unavailable' }));
@@ -613,6 +714,8 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
           res.end(JSON.stringify({ error: 'Unauthorized' }));
           return;
         }
+        // findings.md P2:2494 — see /api/chat/stream above for rationale.
+        if (!chatLimiter.guard(req, res)) return;
         if (config.possessable && isPossessed()) {
           res.writeHead(503, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'unavailable' }));
@@ -625,10 +728,12 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
         return;
       }
 
-      // Interlink letter (from Wired Lain, through membrane)
+      // Interlink letter (from another resident or the guide, through membrane)
       if (url.pathname === '/api/interlink/letter' && req.method === 'POST') {
+        const senderId = verifyInterlinkAuth(req, res);
+        if (!senderId) return;
         const body = await readBody(req);
-        await handleInterlinkLetter(config, req, res, body);
+        await handleInterlinkLetter(config, senderId, res, body);
         return;
       }
 
@@ -698,12 +803,13 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
 
       // Peer message (direct, no membrane) — intercept during possession (interlink auth required)
       if (url.pathname === '/api/peer/message' && req.method === 'POST') {
-        if (!verifyInterlinkAuth(req, res)) return;
+        const authFromId = verifyInterlinkAuth(req, res);
+        if (!authFromId) return;
         const body = await readBody(req);
         if (config.possessable && isPossessed()) {
-          await handlePeerMessagePossessed(body, res);
+          await handlePeerMessagePossessed(authFromId, body, res);
         } else {
-          await handlePeerMessage(config, body, res);
+          await handlePeerMessage(authFromId, config, body, res);
         }
         return;
       }
@@ -733,46 +839,47 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
         return;
       }
 
-      // Static files — owner auth required for HTML pages (chat UI)
-      const file = await serveStatic(config.publicDir, url.pathname);
-      if (file) {
-        if (file.type === 'text/html') {
-          if (!isOwner(req)) {
-            res.writeHead(302, { Location: '/commune-map.html' });
-            res.end();
-            return;
-          }
-          const html = file.content.toString().replace(
-            '</head>',
-            `  <meta name="lain-owner" content="true">\n</head>`
-          );
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end(html);
-        } else {
-          res.writeHead(200, { 'Content-Type': file.type });
-          res.end(file.content);
-        }
-      } else {
-        // SPA fallback — owner auth required
-        if (!isOwner(req)) {
+      const chatAsset = await serveChatUiAsset(url.pathname);
+      if (chatAsset) {
+        if (chatAsset.html && !isOwner(req)) {
           res.writeHead(302, { Location: '/commune-map.html' });
           res.end();
           return;
         }
-        const index = await serveStatic(config.publicDir, 'index.html');
-        if (index) {
-          const html = index.content.toString().replace(
+        if (chatAsset.html) {
+          res.setHeader('Content-Security-Policy', CHAT_UI_CSP);
+          let html = chatAsset.content.toString();
+          html = html.replace(
             '</head>',
             `  <meta name="lain-owner" content="true">\n</head>`
           );
-          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-cache' });
           res.end(html);
-        } else {
-          res.writeHead(404);
-          res.end('Not found');
+          return;
         }
+        res.writeHead(200, { 'Content-Type': chatAsset.type, 'Cache-Control': 'no-cache' });
+        res.end(chatAsset.content);
+        return;
       }
+
+      // Non-owners go to the commune map; owners hitting a non-chat,
+      // non-API path get a minimal 404.
+      if (!isOwner(req)) {
+        res.writeHead(302, { Location: '/commune-map.html' });
+        res.end();
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not found');
     } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg === 'PAYLOAD_TOO_LARGE') {
+        if (!res.headersSent) {
+          res.writeHead(413, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Payload too large' }));
+        }
+        return;
+      }
       console.error(`[${config.name}] Request error:`, error);
       if (!res.headersSent) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -780,6 +887,11 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
       }
     }
   });
+
+  // findings.md P2:285 — character servers call createTownEvent via
+  // agent/novelty.ts + agent/evolution.ts, so their town_events tables
+  // also accumulate zombie `active` rows without a scheduled expiry pass.
+  const stopExpireLoop = startExpireStaleEventsLoop();
 
   server.listen(config.port, () => {
     const peerNames = config.peers.map((p) => p.id).join(', ') || 'none';
@@ -808,6 +920,7 @@ export async function startCharacterServer(config: CharacterConfig): Promise<voi
       for (const stop of getActiveLoopStops()) {
         try { stop(); } catch { /* already stopped */ }
       }
+      try { stopExpireLoop(); } catch { /* already stopped */ }
       server.close();
       process.exit(0);
     };
@@ -938,15 +1051,25 @@ async function handlePossessionRoutes(
 
     // Send peer message (as Hiru, controlled by player)
     try {
-      const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
+      const headers = getInterlinkHeaders();
+      if (!headers) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Interlink not configured' }));
+        return true;
+      }
       const peerResp = await fetch(`${peer.url}/api/peer/message`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${interlinkToken}` },
+        headers,
         body: JSON.stringify({
           fromId: config.id,
           fromName: config.name,
           message,
           timestamp: Date.now(),
+          // findings.md P2:2942 — owner is typing as this character via
+          // possession. Peer must tag the inbound message as owner-authored
+          // so its memory of the exchange doesn't treat these keystrokes
+          // as authentic voice samples of `config.name`.
+          possessed: true,
         }),
       });
 
@@ -1070,11 +1193,11 @@ async function handlePossessionRoutes(
 
   // GET /api/possession/stream — SSE for possession events
   if (url.pathname === '/api/possession/stream' && req.method === 'GET') {
+    // CORS set by the top-level applyCorsHeaders() above (P2:2366).
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': '*',
     });
 
     addSSEClient(res);
@@ -1144,11 +1267,11 @@ async function handleChatStream(
     : (request.sessionId || `${config.id}:${nanoid(8)}`);
   const messageText = isStranger ? `「STRANGER」 ${request.message}` : request.message;
 
+  // CORS set by the top-level applyCorsHeaders() above (P2:2366).
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
   });
 
   res.write(`data: ${JSON.stringify({ type: 'session', sessionId })}\n\n`);
@@ -1181,13 +1304,11 @@ async function handleChatStream(
 
 async function handleInterlinkLetter(
   config: CharacterConfig,
-  req: import('node:http').IncomingMessage,
+  authenticatedSenderId: string,
   res: ServerResponse,
   body: string
 ): Promise<void> {
-  if (!verifyInterlinkAuth(req, res)) return;
-
-  const letter = JSON.parse(body) as WiredLetter;
+  const letter = JSON.parse(body) as WiredLetter & { senderId?: unknown };
 
   if (!Array.isArray(letter.topics) || !Array.isArray(letter.impressions) ||
       typeof letter.gift !== 'string' || typeof letter.emotionalState !== 'string') {
@@ -1196,10 +1317,31 @@ async function handleInterlinkLetter(
     return;
   }
 
+  // Attribute the letter to the authenticated sender (findings.md P1:2289).
+  // A body-asserted `senderId`, if present, must match the authenticated id —
+  // we reject rather than silently trust either side. Previously this
+  // endpoint accepted any body-asserted sender and defaulted to the web
+  // character when absent, so any process with the shared token could
+  // impersonate any peer.
+  const idCheck = assertBodyIdentity(authenticatedSenderId, letter.senderId);
+  if (!idCheck.ok) {
+    rejectBodyIdentityMismatch(res, idCheck.reason);
+    return;
+  }
+  const { getCharacterEntry } = await import('../config/characters.js');
+  const entry = getCharacterEntry(authenticatedSenderId);
+  if (!entry) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unknown senderId' }));
+    return;
+  }
+  const senderId = entry.id;
+  const senderName = entry.name;
+
   const processed = await paraphraseLetter(letter);
 
   const memoryId = await saveMemory({
-    sessionKey: 'wired:letter',
+    sessionKey: `${senderId}:letter`,
     userId: null,
     content: processed.content,
     memoryType: 'episode',
@@ -1207,7 +1349,7 @@ async function handleInterlinkLetter(
     emotionalWeight: processed.emotionalWeight,
     relatedTo: null,
     sourceMessageId: null,
-    metadata: processed.metadata,
+    metadata: { ...processed.metadata, senderId },
   });
 
   // Clear matching pending question if this is a research response
@@ -1220,16 +1362,18 @@ async function handleInterlinkLetter(
   }
 
   // Deliver as chat message in background
-  const letterSessionId = `wired:letter:${Date.now()}`;
+  const letterSessionId = `${senderId}:letter:${Date.now()}`;
   processMessage({
     sessionKey: letterSessionId,
     message: {
       id: nanoid(16),
-      channel: 'web',
+      // findings.md P2:215 — letter-as-chat delivery is peer-origin,
+      // not user-origin; labelling it `'peer'` keeps analytics clean.
+      channel: 'peer',
       peerKind: 'user',
       peerId: letterSessionId,
-      senderId: 'wired-lain',
-      content: { type: 'text', text: `[LETTER FROM WIRED LAIN]\n\n${processed.content}` } satisfies TextContent,
+      senderId,
+      content: { type: 'text', text: `[LETTER FROM ${senderName.toUpperCase()}]\n\n${processed.content}` } satisfies TextContent,
       timestamp: Date.now(),
     },
   }).catch((err) => console.error(`[${config.name}] Letter delivery error:`, err));
@@ -1290,15 +1434,17 @@ async function handleDreamSeed(
 }
 
 async function handlePeerMessage(
+  authFromId: string,
   _config: CharacterConfig,
   body: string,
   res: ServerResponse
 ): Promise<void> {
-  const { fromId, fromName, message } = JSON.parse(body) as {
+  const { fromId, fromName, message, possessed } = JSON.parse(body) as {
     fromId: string;
     fromName: string;
     message: string;
     timestamp?: number;
+    possessed?: boolean;
   };
 
   if (!fromId || !fromName || !message) {
@@ -1306,16 +1452,33 @@ async function handlePeerMessage(
     res.end(JSON.stringify({ error: 'Missing required fields: fromId, fromName, message' }));
     return;
   }
+  const idCheck = assertBodyIdentity(authFromId, fromId);
+  if (!idCheck.ok) {
+    rejectBodyIdentityMismatch(res, idCheck.reason);
+    return;
+  }
 
   const sessionId = `peer:${fromId}:${Date.now()}`;
+  // findings.md P2:2942 — when the sender advertises `possessed: true`,
+  // the owner is typing as `fromName` via /api/possession/say. Prefix the
+  // content so LLM context is unambiguous and set metadata.peerPossessed
+  // so store.ts persists the flag (see src/memory/store.ts:148). The
+  // reply path already emits the same shape; this closes the symmetric
+  // outgoing vector that previously flowed untagged.
+  const contentText = possessed
+    ? `[${fromName} (possession: owner-authored)]: ${message}`
+    : `[${fromName}]: ${message}`;
   const incomingMessage: IncomingMessage = {
     id: nanoid(16),
-    channel: 'web',
+    // findings.md P2:215 — direct inter-character traffic over the
+    // interlink is a distinct channel from web-user chat.
+    channel: 'peer',
     peerKind: 'user',
     peerId: sessionId,
     senderId: fromName,
-    content: { type: 'text', text: `[${fromName}]: ${message}` } satisfies TextContent,
+    content: { type: 'text', text: contentText } satisfies TextContent,
     timestamp: Date.now(),
+    ...(possessed ? { metadata: { peerPossessed: true } } : {}),
   };
 
   const agentResponse = await processMessage({
@@ -1337,6 +1500,7 @@ async function handlePeerMessage(
  * No LLM call, no memory recording.
  */
 async function handlePeerMessagePossessed(
+  authFromId: string,
   body: string,
   res: ServerResponse
 ): Promise<void> {
@@ -1352,10 +1516,26 @@ async function handlePeerMessagePossessed(
     res.end(JSON.stringify({ error: 'Missing required fields: fromId, fromName, message' }));
     return;
   }
+  const idCheck = assertBodyIdentity(authFromId, fromId);
+  if (!idCheck.ok) {
+    rejectBodyIdentityMismatch(res, idCheck.reason);
+    return;
+  }
 
   // Queue for player — this promise resolves when player replies or timeout
   const response = await addPendingPeerMessage(fromId, fromName, message);
 
+  // findings.md P2:2518 — mark possession-authored replies so peer
+  // callers don't silently save the owner's keystrokes into their own
+  // memory attributed to this character. Callers read `possessed` and
+  // prefix the memory content with "[possession: owner-authored]" so
+  // LLM context is unambiguous and future style-observation loops can
+  // filter possession turns out. Without this, owner voice pollutes
+  // the possessed character's voice model over time.
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ response, sessionId: `peer:${fromId}:possessed` }));
+  res.end(JSON.stringify({
+    response,
+    sessionId: `peer:${fromId}:possessed`,
+    possessed: true,
+  }));
 }

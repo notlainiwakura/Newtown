@@ -27,6 +27,7 @@ vi.mock('../src/memory/embeddings.js', () => ({
   cosineSimilarity: vi.fn().mockReturnValue(0.85),
   serializeEmbedding: vi.fn((arr: Float32Array) => Buffer.from(arr.buffer)),
   deserializeEmbedding: vi.fn((buf: Buffer) => new Float32Array(buf.buffer)),
+  CURRENT_EMBEDDING_MODEL: 'Xenova/all-MiniLM-L6-v2',
 }));
 
 // ─── Shared DB setup helpers ────────────────────────────────────────────────

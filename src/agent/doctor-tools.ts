@@ -2,42 +2,86 @@
  * Dr. Claude's tool set — diagnostics, file operations, shell commands
  */
 
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { exec } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { query, getMeta } from '../storage/database.js';
 import { countMemories, countMessages } from '../memory/store.js';
 import { getBasePath } from '../config/paths.js';
+import { getHealthCheckTargets } from '../config/characters.js';
 import { registerTool } from './tools.js';
 import type { ToolDefinition, ToolCall, ToolResult } from '../providers/base.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const PROJECT_ROOT = resolve(join(__dirname, '..', '..'));
 
-// Security: blocked paths
-const BLOCKED_PATHS = ['.env', 'node_modules', '.git/', 'credentials'];
+// Security: blocked paths.
+//
+// findings.md P2:1959 — the old list had 4 entries and let Dr. Claude
+// read SSH keys, deploy-env secrets, character-integrity files, and the
+// package manifest. Only `read_file` is wired through isPathSafe today,
+// but the belt-and-suspenders reasoning applies to any future write/edit
+// tool: if it ever lands, it MUST route through isPathSafe against this
+// same list so the blocklist cannot be silently sidestepped.
+//
+// Matching is substring-on-relative-path (see isPathSafe). Keep entries
+// as path fragments, not globs.
+const BLOCKED_PATHS = [
+  // Secrets & keys
+  '.env',
+  'credentials',
+  '.ssh/',
+  '.pem',
+  '.key',
+  'id_rsa',
+  'id_ed25519',
+  // Infra / build artifacts
+  'node_modules',
+  '.git/',
+  // Deploy-layer: per-service env files and unit files
+  'deploy/env/',
+  'deploy/systemd/',
+  // Introspection & hook state
+  '.private_journal/',
+  '.claude/',
+  // Character-integrity files — corrupting these silently changes identity
+  'SOUL.md',
+  'AGENTS.md',
+  'IDENTITY.md',
+  'WIRED_SOUL.md',
+  // Package & lockfile — supply-chain risk
+  'package.json',
+  'package-lock.json',
+];
 const ALLOWED_EXTENSIONS = [
   '.ts', '.js', '.json', '.md', '.txt', '.yaml', '.yml',
   '.html', '.css', '.sql', '.sh', '.toml', '.json5',
 ];
 
-// Security: blocked shell commands
-const BLOCKED_COMMANDS = [
-  'rm -rf /',
-  'sudo',
-  'mkfs',
-  'dd if=',
-  ':(){:|:&};:',
-  'chmod -R 777 /',
-];
-
+/**
+ * findings.md P2:1831 — resolve symlinks before enforcing the prefix check.
+ *
+ * Textual `path.resolve` + `startsWith` let a symlink inside the project
+ * smuggle reads of /etc/passwd, /root/.ssh/authorized_keys, or any file
+ * the process can open. `realpathSync` resolves existing symlinks to their
+ * true target. Non-existent paths have no symlink to follow, so we fall
+ * back to the textual resolved form and let the extension / readFile
+ * checks downstream produce a specific error.
+ */
 function isPathSafe(filePath: string): boolean {
-  const normalized = resolve(filePath);
-  const rel = relative(PROJECT_ROOT, normalized);
+  const textual = resolve(filePath);
+  let effective: string;
+  try {
+    effective = realpathSync(textual);
+  } catch {
+    effective = textual;
+  }
 
-  if (rel.startsWith('..') || !normalized.startsWith(PROJECT_ROOT)) {
+  const rel = relative(PROJECT_ROOT, effective);
+
+  if (rel.startsWith('..') || !effective.startsWith(PROJECT_ROOT) || !textual.startsWith(PROJECT_ROOT)) {
     return false;
   }
 
@@ -52,11 +96,6 @@ function isExtensionAllowed(filePath: string): boolean {
   return ALLOWED_EXTENSIONS.some((ext) => filePath.endsWith(ext));
 }
 
-function isCommandSafe(command: string): boolean {
-  const lower = command.toLowerCase();
-  return !BLOCKED_COMMANDS.some((blocked) => lower.includes(blocked));
-}
-
 export interface DoctorTool {
   definition: ToolDefinition;
   handler: (input: Record<string, unknown>) => Promise<string>;
@@ -65,33 +104,6 @@ export interface DoctorTool {
 // ============================================================
 // Tool definitions
 // ============================================================
-
-const runDiagnosticTests: DoctorTool = {
-  definition: {
-    name: 'run_diagnostic_tests',
-    description:
-      'Run diagnostic test suite against Lain\'s codebase. Can run all tests or filter by section name.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        section: {
-          type: 'string',
-          description:
-            'Optional test name filter (passed to vitest -t). E.g., "memory", "config", "gateway".',
-        },
-      },
-    },
-  },
-  handler: async (input) => {
-    const section = input.section as string | undefined;
-    let cmd = 'npx vitest run';
-    if (section) {
-      cmd += ` -t "${section}"`;
-    }
-
-    return runShellCommand(cmd, 60000);
-  },
-};
 
 const checkServiceHealth: DoctorTool = {
   definition: {
@@ -107,15 +119,11 @@ const checkServiceHealth: DoctorTool = {
     const results: string[] = ['=== COMMUNE SERVICE HEALTH ===', ''];
 
     // All character services
-    const services = [
-      { name: 'Wired Lain', port: 3000, identityPath: '/api/meta/identity' },
-      { name: 'Lain', port: 3001, identityPath: '/api/meta/identity' },
-      { name: 'Dr. Claude', port: 3002, identityPath: '/api/meta/identity' },
-      { name: 'PKD', port: 3003, identityPath: '/api/meta/identity' },
-      { name: 'McKenna', port: 3004, identityPath: '/api/meta/identity' },
-      { name: 'John', port: 3005, identityPath: '/api/meta/identity' },
-      { name: 'Hiru', port: 3006, identityPath: '/api/meta/identity' },
-    ];
+    const services = getHealthCheckTargets().map(c => ({
+      name: c.name,
+      port: c.port,
+      identityPath: '/api/meta/identity',
+    }));
 
     for (const svc of services) {
       try {
@@ -156,10 +164,7 @@ const checkServiceHealth: DoctorTool = {
 
     // Check running node processes
     results.push('');
-    const psOutput = await runShellCommand(
-      "pgrep -fa 'node dist/index.js' || echo '(no node processes found)'",
-      5000
-    );
+    const psOutput = await pgrepNodeProcesses();
     results.push(`Node processes:\n${psOutput}`);
 
     return results.join('\n');
@@ -369,121 +374,30 @@ const readFileTool: DoctorTool = {
   },
 };
 
-const editFileTool: DoctorTool = {
-  definition: {
-    name: 'edit_file',
-    description:
-      'Edit a file by replacing an exact string match. Both oldText and newText are required.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: {
-          type: 'string',
-          description: 'File path relative to project root',
-        },
-        old_text: {
-          type: 'string',
-          description: 'Exact text to find and replace',
-        },
-        new_text: {
-          type: 'string',
-          description: 'Replacement text',
-        },
-      },
-      required: ['path', 'old_text', 'new_text'],
-    },
-  },
-  handler: async (input) => {
-    const relPath = input.path as string;
-    const fullPath = join(PROJECT_ROOT, relPath);
-    const oldText = input.old_text as string;
-    const newText = input.new_text as string;
-
-    if (!isPathSafe(fullPath)) {
-      return 'Error: Access denied — path is restricted.';
-    }
-
-    if (!isExtensionAllowed(fullPath)) {
-      return `Error: File type not allowed.`;
-    }
-
-    try {
-      const content = await readFile(fullPath, 'utf-8');
-
-      if (!content.includes(oldText)) {
-        return 'Error: old_text not found in file. Make sure it matches exactly.';
-      }
-
-      const occurrences = content.split(oldText).length - 1;
-      if (occurrences > 1) {
-        return `Error: old_text found ${occurrences} times. Provide more context to make it unique.`;
-      }
-
-      const updated = content.replace(oldText, newText);
-      await writeFile(fullPath, updated, 'utf-8');
-
-      return `Successfully edited ${relPath}. Replaced 1 occurrence.`;
-    } catch (error) {
-      return `Error: ${error instanceof Error ? error.message : String(error)}`;
-    }
-  },
-};
-
-const runCommandTool: DoctorTool = {
-  definition: {
-    name: 'run_command',
-    description:
-      'Execute a shell command in the project directory. Use for builds, tests, process checks, etc.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        command: {
-          type: 'string',
-          description: 'Shell command to execute',
-        },
-        timeout: {
-          type: 'number',
-          description: 'Timeout in milliseconds (default: 30000, max: 60000)',
-        },
-      },
-      required: ['command'],
-    },
-  },
-  handler: async (input) => {
-    const command = input.command as string;
-    const timeout = Math.min((input.timeout as number) || 30000, 60000);
-
-    if (!isCommandSafe(command)) {
-      return 'Error: Command blocked for safety reasons.';
-    }
-
-    return runShellCommand(command, timeout);
-  },
-};
-
 // ============================================================
 // Helpers
 // ============================================================
 
-function runShellCommand(command: string, timeout: number): Promise<string> {
+function pgrepNodeProcesses(): Promise<string> {
   return new Promise((resolvePromise) => {
-    exec(command, { cwd: PROJECT_ROOT, timeout, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
-      const parts: string[] = [];
-      if (stdout) parts.push(stdout.trim());
-      if (stderr) parts.push(`STDERR:\n${stderr.trim()}`);
-      if (error && error.killed) {
-        parts.push(`\n[Command timed out after ${timeout}ms]`);
-      } else if (error) {
-        parts.push(`\nExit code: ${error.code ?? 'unknown'}`);
+    execFile(
+      'pgrep',
+      ['-fa', 'node dist/index.js'],
+      { timeout: 5000, maxBuffer: 1024 * 1024 },
+      (error, stdout) => {
+        // pgrep exits 1 when no matches — treat as empty result, not error.
+        const out = (stdout || '').trim();
+        if (!out) {
+          resolvePromise('(no node processes found)');
+          return;
+        }
+        if (error && !('code' in error && (error as { code: number }).code === 1)) {
+          resolvePromise(`pgrep failed: ${error.message}`);
+          return;
+        }
+        resolvePromise(out);
       }
-
-      let output = parts.join('\n') || '(no output)';
-      if (output.length > 10000) {
-        output = output.substring(0, 10000) + '\n\n[Output truncated]';
-      }
-
-      resolvePromise(output);
-    });
+    );
   });
 }
 
@@ -562,13 +476,10 @@ const getHealthStatus: DoctorTool = {
 };
 
 export const doctorTools: DoctorTool[] = [
-  runDiagnosticTests,
   checkServiceHealth,
   getHealthStatus,
   getTelemetry,
   readFileTool,
-  editFileTool,
-  runCommandTool,
 ];
 
 export function getDoctorToolDefinitions(): ToolDefinition[] {

@@ -5,6 +5,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { getLogger } from '../utils/logger.js';
 
 export interface SystemEvent {
   character: string;
@@ -68,8 +69,21 @@ export function isBackgroundEvent(event: SystemEvent): boolean {
   return BACKGROUND_TYPES.has(event.type);
 }
 
+/**
+ * Sentinel character id used when `emitActivity` is called before
+ * `setCharacterId`. Prefer this over a real character id (like the old
+ * default `'lain'`) so events from a mis-initialised process cannot be
+ * silently merged into another character's activity feed.
+ */
+export const UNSET_CHARACTER = '__unset__';
+
 class ActivityBus extends EventEmitter {
-  private _characterId = 'newtown';
+  // findings.md P2:295 — default used to be `'lain'`, so any character
+  // server that booted without calling `setCharacterId` silently tagged
+  // its events as Lain's. That's the exact "silent character-integrity"
+  // failure class flagged in feedback_character_integrity.md.
+  private _characterId: string | null = null;
+  private _warnedUnsetEmit = false;
 
   constructor() {
     super();
@@ -80,13 +94,30 @@ class ActivityBus extends EventEmitter {
     this._characterId = id;
   }
 
-  get characterId(): string {
+  get characterId(): string | null {
     return this._characterId;
   }
 
   emitActivity(event: Omit<SystemEvent, 'character'>): void {
-    const full: SystemEvent = { ...event, character: this._characterId };
+    let character = this._characterId;
+    if (character == null) {
+      if (!this._warnedUnsetEmit) {
+        this._warnedUnsetEmit = true;
+        getLogger().warn(
+          { eventType: event.type, sessionKey: event.sessionKey },
+          'ActivityBus.emitActivity called before setCharacterId — events will be tagged with sentinel and cannot be attributed. Call eventBus.setCharacterId(<id>) during process init.',
+        );
+      }
+      character = UNSET_CHARACTER;
+    }
+    const full: SystemEvent = { ...event, character };
     this.emit('activity', full);
+  }
+
+  /** Test-only hook: rearm the warn-once guard and clear the character id. */
+  _resetForTests(): void {
+    this._characterId = null;
+    this._warnedUnsetEmit = false;
   }
 }
 

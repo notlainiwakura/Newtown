@@ -125,7 +125,6 @@ src/
 ├── storage/        SQLite database, sessions, OS keychain
 ├── security/       Input sanitization, SSRF protection
 ├── config/         JSON5-based configuration, defaults, paths
-├── browser/        Playwright automation
 ├── plugins/        Plugin loader
 ├── cli/            Commander-based CLI
 └── utils/          Logger, errors, crypto

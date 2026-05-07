@@ -97,6 +97,7 @@ vi.mock('../src/memory/index.js', () => ({
 
 vi.mock('../src/memory/embeddings.js', () => ({
   cosineSimilarity: vi.fn(() => 0.3),
+  CURRENT_EMBEDDING_MODEL: 'Xenova/all-MiniLM-L6-v2',
 }));
 
 // Logger mock
@@ -118,6 +119,7 @@ vi.mock('../src/utils/logger.js', () => ({
 vi.mock('../src/events/bus.js', () => ({
   eventBus: {
     on: vi.fn(),
+    off: vi.fn(),
     emitActivity: vi.fn(),
     characterId: 'test-char',
   },
@@ -1400,6 +1402,10 @@ describe('State integrity after failures', () => {
   it('experiments: cycle completes and sets last_cycle_at even when provider throws (internal error handling)', async () => {
     // Like commune-loop, runExperimentCycle catches its own errors internally,
     // so the outer timer callback proceeds to set last_cycle_at.
+    // findings.md P2:2239 — experiment loop only runs for wired-lain, so
+    // gate the test env accordingly.
+    const prevCharId = process.env['LAIN_CHARACTER_ID'];
+    process.env['LAIN_CHARACTER_ID'] = 'wired-lain';
     mockComplete.mockRejectedValue(new Error('Provider error'));
 
     const mod = await import('../src/agent/experiments.js');
@@ -1415,6 +1421,9 @@ describe('State integrity after failures', () => {
 
     await vi.advanceTimersByTimeAsync(60 * 60 * 1000 + 100);
     cleanup();
+
+    if (prevCharId === undefined) delete process.env['LAIN_CHARACTER_ID'];
+    else process.env['LAIN_CHARACTER_ID'] = prevCharId;
 
     const cycleCalls = mockSetMeta.mock.calls.filter(
       (call: unknown[]) => typeof call[0] === 'string' && (call[0] as string).includes('last_cycle_at')

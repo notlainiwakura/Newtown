@@ -23,11 +23,15 @@ export {
   getAuthenticatedConnectionCount,
   clearAuthentications,
   refreshTokenCache,
+  fingerprintToken,
+  touchConnection,
+  sweepIdleConnections,
 } from './auth.js';
 
 export {
   configureRateLimiter,
   canConnect,
+  canAuthenticate,
   canRequest,
   registerConnection,
   unregisterConnection,

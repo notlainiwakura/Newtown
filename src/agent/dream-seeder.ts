@@ -12,6 +12,8 @@ import { join } from 'node:path';
 
 import { getMeta, setMeta } from '../storage/database.js';
 import { getLogger } from '../utils/logger.js';
+import { getDreamSeedTargets } from '../config/characters.js';
+import { getInterlinkHeaders, type InterlinkHeaders } from '../security/interlink-auth.js';
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -22,8 +24,6 @@ interface SeederConfig {
   minPendingThreshold: number;
   /** How many fragments to seed per replenish cycle */
   batchSize: number;
-  /** Peers to seed */
-  peers: Array<{ id: string; name: string; port: number }>;
 }
 
 interface SourcesConfig {
@@ -35,15 +35,6 @@ const DEFAULT_CONFIG: SeederConfig = {
   checkIntervalMs: 12 * 60 * 60 * 1000, // 12 hours
   minPendingThreshold: 50,
   batchSize: 30,
-  peers: [
-    { id: 'wired-lain', name: 'Wired Lain', port: 3000 },
-    { id: 'lain', name: 'Lain', port: 3001 },
-    { id: 'dr-claude', name: 'Dr. Claude', port: 3002 },
-    { id: 'pkd', name: 'PKD', port: 3003 },
-    { id: 'mckenna', name: 'McKenna', port: 3004 },
-    { id: 'john', name: 'John', port: 3005 },
-    { id: 'hiru', name: 'Hiru', port: 3006 },
-  ],
 };
 
 // ── Content fetching ───────────────────────────────────────
@@ -130,11 +121,11 @@ async function fetchDreamContent(workspaceDir: string, count: number): Promise<s
 
 // ── HTTP helpers ───────────────────────────────────────────
 
-function fetchPeerStats(port: number, token: string): Promise<{ pending: number } | null> {
+function fetchPeerStats(port: number, headers: InterlinkHeaders): Promise<{ pending: number } | null> {
   return new Promise((resolve) => {
     const req = httpRequest(
       { hostname: '127.0.0.1', port, path: '/api/dreams/stats', method: 'GET',
-        headers: { 'Authorization': `Bearer ${token}` }, timeout: 5000 },
+        headers, timeout: 5000 },
       (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (c: Buffer) => chunks.push(c));
@@ -150,13 +141,12 @@ function fetchPeerStats(port: number, token: string): Promise<{ pending: number 
   });
 }
 
-function postSeed(port: number, token: string, content: string): Promise<boolean> {
+function postSeed(port: number, headers: InterlinkHeaders, content: string): Promise<boolean> {
   return new Promise((resolve) => {
     const body = JSON.stringify({ content, emotionalWeight: 0.4 + Math.random() * 0.3 });
     const req = httpRequest(
       { hostname: '127.0.0.1', port, path: '/api/interlink/dream-seed', method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json',
-                   'Content-Length': Buffer.byteLength(body).toString() },
+        headers: { ...headers, 'Content-Length': Buffer.byteLength(body).toString() },
         timeout: 10000 },
       (res) => {
         res.resume(); // drain
@@ -174,19 +164,20 @@ function postSeed(port: number, token: string, content: string): Promise<boolean
 
 async function runSeederCycle(workspaceDir: string, config: SeederConfig): Promise<void> {
   const logger = getLogger();
-  const token = process.env['LAIN_INTERLINK_TOKEN'] || '';
-  if (!token) {
-    logger.warn('Dream seeder: no LAIN_INTERLINK_TOKEN, skipping');
+  const headers = getInterlinkHeaders();
+  if (!headers) {
+    logger.warn('Dream seeder: interlink not configured, skipping');
     return;
   }
 
   logger.info('Dream seeder: checking seed levels');
 
-  // Check each peer's pending count
+  // Check each peer's pending count — manifest read happens at cycle time, not at module load.
+  const peers = getDreamSeedTargets().map(c => ({ id: c.id, name: c.name, port: c.port }));
   const needsSeeding: Array<{ id: string; name: string; port: number; pending: number }> = [];
 
-  for (const peer of config.peers) {
-    const stats = await fetchPeerStats(peer.port, token);
+  for (const peer of peers) {
+    const stats = await fetchPeerStats(peer.port, headers);
     if (stats && stats.pending < config.minPendingThreshold) {
       needsSeeding.push({ ...peer, pending: stats.pending });
       logger.info({ character: peer.name, pending: stats.pending, threshold: config.minPendingThreshold },
@@ -219,7 +210,7 @@ async function runSeederCycle(workspaceDir: string, config: SeederConfig): Promi
   for (const peer of needsSeeding) {
     let seeded = 0;
     for (let i = 0; i < config.batchSize && contentIdx < content.length; i++) {
-      const success = await postSeed(peer.port, token, content[contentIdx]!);
+      const success = await postSeed(peer.port, headers, content[contentIdx]!);
       if (success) seeded++;
       contentIdx++;
     }

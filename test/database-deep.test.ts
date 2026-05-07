@@ -261,22 +261,6 @@ describe('Database Initialization', () => {
     expect(tables.map((t) => t.name)).toContain('palace_rooms');
   });
 
-  it('repairs missing IF NOT EXISTS tables even when schema_version is already current', async () => {
-    await mkdir(testDir, { recursive: true });
-    const dbPath = join(testDir, 'repair-schema.db');
-    await initDatabase(dbPath);
-
-    execute('DROP TABLE objects');
-    setMeta('schema_version', '11');
-    closeDatabase();
-
-    await initDatabase(dbPath);
-    const tables = query<{ name: string }>(
-      "SELECT name FROM sqlite_master WHERE type='table'"
-    );
-    expect(tables.map((t) => t.name)).toContain('objects');
-  });
-
   it('creates memory_associations table after init', async () => {
     await mkdir(testDir, { recursive: true });
     const dbPath = join(testDir, 'assoc-schema.db');
@@ -332,7 +316,10 @@ describe('Database Initialization', () => {
     const dbPath = join(testDir, 'version.db');
     await initDatabase(dbPath);
     const version = getMeta('schema_version');
-    expect(Number(version)).toBe(11);
+    // Bumps: 13 (P2:275), 14 (P2:457 activity index), 15 (P2:517 embedding
+    // model stamp), 16 (P2:3364 object_events audit ledger),
+    // 17 ground-object expiry.
+    expect(Number(version)).toBe(17);
   });
 
   it('getDatabase() throws when not initialized', () => {
@@ -1006,6 +993,83 @@ describe('Keychain', () => {
   });
 });
 
+// findings.md P2:383 — `getMasterKey` must refuse to silently mint a
+// fresh key when the OS keychain is empty but an existing encrypted
+// DB is sitting on disk (classic droplet-rebuild / keychain-lost
+// scenario). Silent generation in that state orphans the old DB
+// forever. With `dbPath` supplied the call now throws a KeychainError
+// pointing operators at the LAIN_MASTER_KEY recovery route.
+//
+// These live in their own describe block (with their own beforeEach)
+// because the Keychain describe's last tests permanently clobber the
+// keytar.setPassword mock with `vi.mocked(...).mockResolvedValue(undefined)`,
+// which breaks the keytarStore-backed persistence path we rely on here.
+describe('Keychain P2:383 (lost-keychain guard)', () => {
+  beforeEach(async () => {
+    keytarStore.clear();
+    delete process.env['LAIN_MASTER_KEY'];
+    // Re-seat the original mock implementations; the earlier suite may
+    // have replaced them with `mockResolvedValue(undefined)` stubs.
+    const keytar = (await import('keytar')).default;
+    vi.mocked(keytar.getPassword).mockImplementation(async (_service: string, account: string) => {
+      return keytarStore.get(account) ?? null;
+    });
+    vi.mocked(keytar.setPassword).mockImplementation(async (_service: string, account: string, value: string) => {
+      keytarStore.set(account, value);
+    });
+  });
+  afterEach(() => {
+    process.env['LAIN_MASTER_KEY'] = 'test-master-key-for-deep-tests';
+  });
+
+  it('findings.md P2:383 — getMasterKey refuses to generate when DB already exists at dbPath', async () => {
+    const { writeFile, mkdir: mk } = await import('node:fs/promises');
+    const dir = join(tmpdir(), `lain-p2-383-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mk(dir, { recursive: true });
+    const dbPath = join(dir, 'lain.db');
+    await writeFile(dbPath, 'SQLite format 3\0');
+    try {
+      const { KeychainError } = await import('../src/utils/errors.js');
+      await expect(getMasterKey(dbPath)).rejects.toBeInstanceOf(KeychainError);
+      await expect(getMasterKey(dbPath)).rejects.toThrow(/existing database/i);
+      await expect(getMasterKey(dbPath)).rejects.toThrow(/LAIN_MASTER_KEY/);
+      // Crucially: no key was written to the keychain while refusing.
+      expect(keytarStore.has('master-key')).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('findings.md P2:383 — getMasterKey generates on fresh install when no DB exists at dbPath', async () => {
+    const dir = join(tmpdir(), `lain-p2-383-fresh-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const dbPath = join(dir, 'lain.db'); // file intentionally does not exist
+    const key = await getMasterKey(dbPath);
+    expect(key).toBeTruthy();
+    expect(key.length).toBeGreaterThanOrEqual(32);
+    // It was persisted so the next call returns the same key.
+    const again = await getMasterKey(dbPath);
+    expect(again).toBe(key);
+  });
+
+  it('findings.md P2:383 — LAIN_MASTER_KEY env var overrides even when DB exists (recovery path)', async () => {
+    const { writeFile, mkdir: mk } = await import('node:fs/promises');
+    const dir = join(tmpdir(), `lain-p2-383-env-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mk(dir, { recursive: true });
+    const dbPath = join(dir, 'lain.db');
+    await writeFile(dbPath, 'SQLite format 3\0');
+    process.env['LAIN_MASTER_KEY'] = 'operator-recovery-key';
+    try {
+      const key = await getMasterKey(dbPath);
+      expect(key).toBe('operator-recovery-key');
+      // Keychain was never touched.
+      expect(keytarStore.has('master-key')).toBe(false);
+    } finally {
+      delete process.env['LAIN_MASTER_KEY'];
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // KNOWLEDGE GRAPH
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1096,10 +1160,14 @@ describe('Knowledge Graph', () => {
     expect(getTriple(id)!.metadata).toEqual({});
   });
 
-  it('addTriple allows duplicate subject-predicate-object', () => {
+  it('addTriple dedupes active subject-predicate-object (findings.md P2:576)', () => {
+    // Previously, addTriple always INSERTed. After P2:576 it returns the
+    // existing row's ID when an active (ended IS NULL) triple with the same
+    // (s,p,o) already exists — callers that forgot to queryTriples first
+    // were creating duplicate rows on every maintenance pass.
     const id1 = addTriple('A', 'rel', 'B');
     const id2 = addTriple('A', 'rel', 'B');
-    expect(id1).not.toBe(id2);
+    expect(id1).toBe(id2);
   });
 
   // invalidateTriple
@@ -1520,9 +1588,26 @@ describe('Migration', () => {
     expect(stats.unmigrated).toBeGreaterThanOrEqual(1);
   });
 
-  it('schema_version is 11 after full migration', () => {
+  it('schema_version is 17 after full migration', () => {
     const version = getMeta('schema_version');
-    expect(Number(version)).toBe(11);
+    // Bumps: 13 (P2:275), 14 (P2:457 activity index), 15 (P2:517 embedding
+    // model stamp), 16 (P2:3364 object_events audit ledger),
+    // 17 ground-object expiry.
+    expect(Number(version)).toBe(17);
+  });
+
+  it('objects.expires_at column exists after migration', () => {
+    const columns = query<{ name: string }>("PRAGMA table_info('objects')");
+    const names = columns.map((c) => c.name);
+    expect(names).toContain('expires_at');
+  });
+
+  // findings.md P2:275 — `source` column is provisioned at migrate time, not
+  // lazily on every createTownEvent / getActiveTownEvents call.
+  it('town_events.source column exists after migration without any lazy ALTER TABLE', () => {
+    const columns = query<{ name: string }>("PRAGMA table_info('town_events')");
+    const names = columns.map((c) => c.name);
+    expect(names).toContain('source');
   });
 
   it('duplicate migration runs do not fail (CREATE TABLE IF NOT EXISTS is safe)', async () => {

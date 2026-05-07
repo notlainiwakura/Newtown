@@ -265,12 +265,14 @@ describe('Awareness — buildAwarenessContext', () => {
   });
   it('includes state summary when token is set', async () => {
     process.env['LAIN_INTERLINK_TOKEN'] = 'tok';
+    process.env['LAIN_CHARACTER_ID'] = 'a-self';
     vi.mocked(fetch)
       .mockResolvedValueOnce({ ok: true, json: async () => ({ location: 'library' }) } as Response)
       .mockResolvedValueOnce({ ok: true, json: async () => ({ summary: 'anxious' }) } as Response);
     const { buildAwarenessContext } = await import('../src/agent/awareness.js');
     expect(await buildAwarenessContext('library', [{ id: 'a', name: 'A', url: 'http://localhost:3001' }])).toContain('anxious');
     delete process.env['LAIN_INTERLINK_TOKEN'];
+    delete process.env['LAIN_CHARACTER_ID'];
   });
   it('handles network error gracefully', async () => {
     vi.mocked(fetch).mockRejectedValueOnce(new Error('network error'));
@@ -352,23 +354,23 @@ describe('Desires — getDesireContext', () => {
     const { getDesireContext } = await import('../src/agent/desires.js');
     expect(getDesireContext()).toBe('');
   });
-  it('"strongly" for intensity > 0.7', async () => {
+  it('"[pull: strong]" for intensity > 0.7', async () => {
     const db = await import('../src/storage/database.js');
     vi.mocked(db.query).mockReturnValueOnce([makeRow(0.8)]);
     const { getDesireContext } = await import('../src/agent/desires.js');
-    expect(getDesireContext()).toContain('strongly');
+    expect(getDesireContext()).toContain('[pull: strong]');
   });
-  it('"somewhat" for mid-range intensity', async () => {
+  it('"[pull: moderate]" for mid-range intensity', async () => {
     const db = await import('../src/storage/database.js');
     vi.mocked(db.query).mockReturnValueOnce([makeRow(0.5)]);
     const { getDesireContext } = await import('../src/agent/desires.js');
-    expect(getDesireContext()).toContain('somewhat');
+    expect(getDesireContext()).toContain('[pull: moderate]');
   });
-  it('"faintly" for low intensity', async () => {
+  it('"[pull: faint]" for low intensity', async () => {
     const db = await import('../src/storage/database.js');
     vi.mocked(db.query).mockReturnValueOnce([makeRow(0.3)]);
     const { getDesireContext } = await import('../src/agent/desires.js');
-    expect(getDesireContext()).toContain('faintly');
+    expect(getDesireContext()).toContain('[pull: faint]');
   });
   it('includes target peer name', async () => {
     const db = await import('../src/storage/database.js');

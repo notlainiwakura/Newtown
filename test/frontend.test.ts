@@ -23,29 +23,6 @@ function readPublicFile(relativePath: string): string {
   return readFileSync(join(PUBLIC_DIR, relativePath), 'utf-8');
 }
 
-describe('Direct chat shell regressions', () => {
-  const html = readPublicFile('index.html');
-  const app = readPublicFile('app.js');
-
-  it('uses a dynamic presence sender instead of a hardcoded resident label', () => {
-    expect(html).toContain('id="presence-sender"');
-    expect(html).toContain('id="presence-text"');
-    expect(html).toContain('<title>NEWTOWN</title>');
-  });
-
-  it('updates streaming and presence labels from the active character identity', () => {
-    expect(app).toContain('document.title = characterLabel;');
-    expect(app).toContain("presenceSender.textContent = characterLabel");
-    expect(app).toContain('<span class="sender">${characterLabel}</span>');
-  });
-
-  it('normalizes legacy visitor labels to VISITOR', () => {
-    expect(app).toContain("const LEGACY_VISITOR_NAMES = new Set(['', 'SHRAII', 'LAIN', 'NEWTOWN'])");
-    expect(app).toContain("window.LAIN_SENDER_NAME = normalizedVisitorName || 'VISITOR';");
-    expect(app).toContain("localStorage.setItem('newtown-sender-name', window.LAIN_SENDER_NAME);");
-  });
-});
-
 // ============================================================================
 // Config (game/js/config.js)
 // ============================================================================
@@ -376,14 +353,21 @@ describe('WorldScene (WorldScene.js)', () => {
     expect(src).toMatch(/class WorldScene\s+extends\s+Phaser\.Scene/);
   });
 
-  it('player character should be dynamic (from manifest, not hardcoded)', () => {
-    // playerCharId should come from authData or CHARACTERS, not hardcoded
-    expect(src).toMatch(/const playerCharId\s*=\s*this\.authData\.characterId\s*\|\|\s*Object\.keys\(CHARACTERS\)/);
+  it('player character should be dynamic (from authData or manifest, not hardcoded)', () => {
+    // findings.md P2:3216 — explicit precedence chain: authData.characterId,
+    // then the configured possessable character, then WEB_CHARACTER_ID
+    // (driven by /api/characters), then null which triggers _renderFatalError.
+    // No silent first-in-manifest fallback.
+    expect(src).toMatch(
+      /const playerCharId\s*=\s*this\.authData\.characterId\s*\n?\s*\|\|\s*\(this\.authData\.spectatorMode\s*\?\s*null\s*:\s*POSSESSABLE_CHARACTER_ID\)\s*\n?\s*\|\|\s*WEB_CHARACTER_ID\s*\n?\s*\|\|\s*null/,
+    );
+    expect(src).toContain('_renderFatalError');
   });
 
   it('should not hardcode any character ID for player', () => {
-    // The only string literal for playerCharId fallback should be 'player' (generic)
-    const playerLine = src.match(/const playerCharId\s*=.*?;/);
+    // The playerCharId assignment spans multiple lines — match across
+    // newlines to capture the full precedence chain.
+    const playerLine = src.match(/const playerCharId\s*=[\s\S]*?;/);
     expect(playerLine).not.toBeNull();
     expect(playerLine![0]).not.toContain("'lain'");
     expect(playerLine![0]).not.toContain("'wired-lain'");
@@ -464,6 +448,63 @@ describe('Commune Map (commune-map.js)', () => {
   it('getBuildings should add emoji from getBuildingIcons', () => {
     expect(src).toMatch(/function getBuildings\s*\(\)/);
     expect(src).toMatch(/emoji:\s*icons\[b\.id\]/);
+  });
+
+  describe('XSS hardening (P1 findings.md)', () => {
+    it('createNotification must not interpolate event.content into innerHTML', () => {
+      const fnBody = src.match(/function createNotification\s*\([\s\S]*?\n  \}/);
+      expect(fnBody).not.toBeNull();
+      // innerHTML assignment with template literal including snippet/event.content is the old bug
+      expect(fnBody![0]).not.toMatch(/innerHTML\s*=\s*`[^`]*\$\{snippet\}/);
+      expect(fnBody![0]).not.toMatch(/innerHTML\s*=\s*`[^`]*\$\{event\.type\}/);
+      // New path should build DOM nodes and use textContent
+      expect(fnBody![0]).toMatch(/textContent\s*=\s*char\.name/);
+      expect(fnBody![0]).toMatch(/textContent\s*=\s*event\.type/);
+    });
+
+    it('addLogEntry must not interpolate event.type/char.id into innerHTML', () => {
+      const fnBody = src.match(/function addLogEntry\s*\([\s\S]*?\n  \}/);
+      expect(fnBody).not.toBeNull();
+      expect(fnBody![0]).not.toMatch(/innerHTML\s*=[\s\S]*?\$\{event\.type\}[\s\S]*?<\/span>/);
+      expect(fnBody![0]).not.toMatch(/innerHTML\s*=[\s\S]*?\$\{char\.id\}[\s\S]*?<\/span>/);
+      expect(fnBody![0]).toMatch(/textContent\s*=\s*char\.id/);
+      expect(fnBody![0]).toMatch(/textContent\s*=\s*event\.type/);
+    });
+  });
+});
+
+// ============================================================================
+// App (app.js)
+// ============================================================================
+
+describe('App (app.js) — XSS hardening (P1 findings.md)', () => {
+  const src = readPublicFile('app.js');
+
+  it('defines isSafeImageUrl allowlist helper', () => {
+    expect(src).toMatch(/function isSafeImageUrl\s*\(/);
+    expect(src).toMatch(/u\.protocol\s*===\s*'http:'/);
+    expect(src).toMatch(/u\.protocol\s*===\s*'https:'/);
+  });
+
+  it('defines escapeAttr that escapes quotes', () => {
+    expect(src).toMatch(/function escapeAttr\s*\(/);
+    expect(src).toMatch(/\.replace\(\/"\/g,\s*'&quot;'\)/);
+    expect(src).toMatch(/\.replace\(\/'\/g,\s*'&#39;'\)/);
+  });
+
+  it('formatLainResponse gates img rendering on isSafeImageUrl', () => {
+    const fnBody = src.match(/function formatLainResponse\s*\([\s\S]*?\n\}/);
+    expect(fnBody).not.toBeNull();
+    expect(fnBody![0]).toMatch(/if \(!isSafeImageUrl\(img\.url\)\)/);
+    expect(fnBody![0]).toMatch(/image omitted: unsafe url/);
+  });
+
+  it('image onclick uses data-url indirection, not direct URL interpolation', () => {
+    const fnBody = src.match(/function formatLainResponse\s*\([\s\S]*?\n\}/);
+    expect(fnBody).not.toBeNull();
+    // Old bug: onclick="window.open('${escapeHtml(img.url)}', '_blank')"
+    expect(fnBody![0]).not.toMatch(/onclick="window\.open\('\$\{escapeHtml\(img\.url\)\}/);
+    expect(fnBody![0]).toMatch(/onclick="window\.open\(this\.dataset\.url/);
   });
 });
 

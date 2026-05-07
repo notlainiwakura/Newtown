@@ -23,6 +23,11 @@ export interface SignalConfig extends ChannelConfig {
   account: string; // Phone number in E.164 format (e.g., +1234567890)
   allowedUsers?: string[];
   allowedGroups?: string[];
+  /**
+   * Opt-in to public mode: when no allowlists are set, messages are
+   * denied by default unless this is `true`.
+   */
+  public?: boolean;
 }
 
 // JSON-RPC types for signal-cli
@@ -119,8 +124,10 @@ export class SignalChannel extends BaseChannel {
     timeout: ReturnType<typeof setTimeout>;
   }>();
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
-  private reconnectDelay = 5000;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private shuttingDown = false;
+  private static readonly MAX_RECONNECT_ATTEMPTS = 15;
+  private static readonly MAX_RECONNECT_DELAY_MS = 5 * 60 * 1000;
   private requestId = 0;
 
   constructor(config: SignalConfig) {
@@ -137,7 +144,24 @@ export class SignalChannel extends BaseChannel {
       return;
     }
 
+    this.shuttingDown = false;
     logger.info({ channelId: this.id, socketPath: this.config.socketPath }, 'Connecting to signal-cli');
+
+    const emptyAllowlists =
+      !this.config.allowedUsers?.length && !this.config.allowedGroups?.length;
+    if (emptyAllowlists) {
+      if (this.config.public === true) {
+        logger.warn(
+          { channelId: this.id },
+          'Signal channel running in PUBLIC mode — every Signal contact is allowed',
+        );
+      } else {
+        logger.warn(
+          { channelId: this.id },
+          'Signal channel has empty allowlists and public !== true — all incoming messages will be rejected. Set public: true or populate allowedUsers/allowedGroups.',
+        );
+      }
+    }
 
     return new Promise((resolve, reject) => {
       this.socket = createConnection(this.config.socketPath);
@@ -176,6 +200,11 @@ export class SignalChannel extends BaseChannel {
   }
 
   private handleDisconnect(): void {
+    const logger = getLogger();
+    // Snapshot the connected state BEFORE emitDisconnect flips _connected to
+    // false — otherwise the reconnect branch becomes unreachable.
+    const wasConnected = this._connected;
+
     if (this.socket) {
       this.socket = null;
       this.emitDisconnect();
@@ -188,16 +217,38 @@ export class SignalChannel extends BaseChannel {
       this.pendingRequests.delete(id);
     }
 
-    // Attempt reconnection
-    if (this.reconnectAttempts < this.maxReconnectAttempts && this._connected) {
-      this.reconnectAttempts++;
-      const logger = getLogger();
-      logger.info(
-        { channelId: this.id, attempt: this.reconnectAttempts },
-        'Attempting to reconnect to signal-cli'
-      );
-      setTimeout(() => this.connect().catch(() => {}), this.reconnectDelay);
+    if (this.shuttingDown) {
+      return;
     }
+
+    // Only attempt reconnect if we had reached the connected state at least
+    // once — initial-connect failures are surfaced via the connect() promise.
+    if (!wasConnected) {
+      return;
+    }
+
+    this.reconnectAttempts++;
+    if (this.reconnectAttempts > SignalChannel.MAX_RECONNECT_ATTEMPTS) {
+      logger.error(
+        { channelId: this.id, attempts: this.reconnectAttempts },
+        'Signal max reconnect attempts reached, giving up'
+      );
+      return;
+    }
+
+    const delay = Math.min(
+      1000 * Math.pow(2, this.reconnectAttempts - 1),
+      SignalChannel.MAX_RECONNECT_DELAY_MS
+    );
+    logger.info(
+      { channelId: this.id, attempt: this.reconnectAttempts, delayMs: delay },
+      'Scheduling signal-cli reconnect'
+    );
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => {
+      if (this.shuttingDown) return;
+      this.connect().catch(() => {});
+    }, delay);
   }
 
   private handleData(data: string): void {
@@ -292,13 +343,18 @@ export class SignalChannel extends BaseChannel {
   async disconnect(): Promise<void> {
     const logger = getLogger();
 
+    this.shuttingDown = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
     if (!this.socket) {
       return;
     }
 
     logger.info({ channelId: this.id }, 'Disconnecting from signal-cli');
 
-    this.maxReconnectAttempts = 0; // Prevent reconnection
     this.socket.destroy();
     this.socket = null;
     this.emitDisconnect();
@@ -357,9 +413,10 @@ export class SignalChannel extends BaseChannel {
   }
 
   private isAllowed(message: IncomingMessage): boolean {
-    // If no restrictions, allow all
+    // Empty allowlists are fail-closed by default. Only allow all when
+    // the operator has explicitly set `public: true`.
     if (!this.config.allowedUsers?.length && !this.config.allowedGroups?.length) {
-      return true;
+      return this.config.public === true;
     }
 
     // Check user whitelist
@@ -397,26 +454,26 @@ export class SignalChannel extends BaseChannel {
       const attachment = dataMessage.attachments[0]!;
       const mimeType = attachment.contentType ?? 'application/octet-stream';
 
+      // findings.md P2:199 — signal-cli writes attachments to local disk
+      // and we don't resolve them to URL/base64 here, so emit a text
+      // placeholder instead of a media content with no data pointer.
       if (mimeType.startsWith('image/')) {
-        const imageContent: IncomingMessage['content'] = {
-          type: 'image',
-          mimeType,
-        };
-        if (attachment.caption) {
-          (imageContent as { caption?: string }).caption = attachment.caption;
-        }
-        content = imageContent;
+        const caption = attachment.caption ? ' ' + attachment.caption : '';
+        content = {
+          type: 'text',
+          text: '[image attachment]' + caption,
+        } satisfies TextContent;
       } else if (mimeType.startsWith('audio/') || attachment.voiceNote) {
         content = {
-          type: 'audio',
-          mimeType,
-        };
+          type: 'text',
+          text: '[audio attachment]',
+        } satisfies TextContent;
       } else {
+        const filename = attachment.filename ?? 'attachment';
         content = {
-          type: 'file',
-          mimeType,
-          filename: attachment.filename ?? 'attachment',
-        };
+          type: 'text',
+          text: '[file attachment: ' + filename + ']',
+        } satisfies TextContent;
       }
     } else {
       return null;

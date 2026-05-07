@@ -256,19 +256,20 @@ describe('Config contract — schema and types', () => {
   });
 
   it('schema has required top-level fields', async () => {
+    // findings.md P2:171 — `agents` removed from LainConfig.
     const { getSchema } = await import('../src/config/schema.js');
     const schema = getSchema();
     expect(schema.required).toContain('version');
     expect(schema.required).toContain('gateway');
     expect(schema.required).toContain('security');
-    expect(schema.required).toContain('agents');
     expect(schema.required).toContain('logging');
+    expect(schema.required).not.toContain('agents');
   });
 
-  it('schema has 5 top-level required fields', async () => {
+  it('schema has 4 top-level required fields', async () => {
     const { getSchema } = await import('../src/config/schema.js');
     const schema = getSchema();
-    expect(schema.required).toHaveLength(5);
+    expect(schema.required).toHaveLength(4);
   });
 
   it('gateway schema requires socketPath, socketPermissions, pidFile, rateLimit', async () => {
@@ -310,34 +311,43 @@ describe('Config contract — schema and types', () => {
     expect(kd.properties.algorithm.const).toBe('argon2id');
   });
 
-  it('agents schema requires array with minItems 1', async () => {
-    const { getSchema } = await import('../src/config/schema.js');
-    const schema = getSchema();
-    const agents = schema.properties.agents;
-    expect((agents as { minItems: number }).minItems).toBe(1);
+  // findings.md P2:171 — `agents` removed from LainConfig; per-character
+  // provider schema lives in the manifest. The three tests below now
+  // probe the manifest schema for the same contract guarantees the old
+  // LainConfig schema offered.
+  it('manifest character item requires id, name, port, server, defaultLocation, workspace', async () => {
+    const fakeManifest = {
+      town: { name: 'T', description: 't' },
+      characters: [{}], // empty entry — should trigger all required-field errors
+    };
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    expect(() => validateManifest(fakeManifest, 'test')).toThrow(
+      /id|name|port|server|defaultLocation|workspace/,
+    );
   });
 
-  it('agent item schema requires id, name, enabled, workspace, providers', async () => {
-    const { getSchema } = await import('../src/config/schema.js');
-    const schema = getSchema();
-    const item = (schema.properties.agents as { items: { required: string[] } }).items;
-    expect(item.required).toContain('id');
-    expect(item.required).toContain('name');
-    expect(item.required).toContain('enabled');
-    expect(item.required).toContain('workspace');
-    expect(item.required).toContain('providers');
-  });
-
-  it('provider type enum covers anthropic, openai, google', async () => {
-    const { getSchema } = await import('../src/config/schema.js');
-    const schema = getSchema();
-    const providerItem = (schema.properties.agents as {
-      items: { properties: { providers: { items: { properties: { type: { enum: string[] } } } } } }
-    }).items.properties.providers.items;
-    expect(providerItem.properties.type.enum).toContain('anthropic');
-    expect(providerItem.properties.type.enum).toContain('openai');
-    expect(providerItem.properties.type.enum).toContain('google');
-    expect(providerItem.properties.type.enum).toHaveLength(3);
+  it('manifest provider type enum covers anthropic, openai, google', async () => {
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    for (const type of ['anthropic', 'openai', 'google']) {
+      const manifest = {
+        town: { name: 'T', description: 't' },
+        characters: [{
+          id: 'x', name: 'X', port: 3000, server: 'character',
+          defaultLocation: 'bar', workspace: 'workspace/characters/x',
+          providers: [{ type, model: 'test' }],
+        }],
+      };
+      expect(() => validateManifest(manifest, 'test'), `${type} should validate`).not.toThrow();
+    }
+    const badManifest = {
+      town: { name: 'T', description: 't' },
+      characters: [{
+        id: 'x', name: 'X', port: 3000, server: 'character',
+        defaultLocation: 'bar', workspace: 'workspace/characters/x',
+        providers: [{ type: 'cohere', model: 'test' }],
+      }],
+    };
+    expect(() => validateManifest(badManifest, 'test')).toThrow();
   });
 
   it('logging schema requires level and prettyPrint', async () => {
@@ -367,11 +377,14 @@ describe('Config contract — schema and types', () => {
   });
 
   it('validate rejects unknown top-level properties', async () => {
+    // findings.md P2:171 — `agents` is now itself an unknown top-level
+    // property and should be rejected alongside `extra`.
     const { validate } = await import('../src/config/schema.js');
-    expect(() => validate({ version: '1', gateway: {}, security: {}, agents: [], logging: {}, extra: true })).toThrow();
+    expect(() => validate({ version: '1', gateway: {}, security: {}, logging: {}, extra: true })).toThrow();
   });
 
   it('validate accepts a minimal valid config', async () => {
+    // findings.md P2:171 — `agents` removed from LainConfig.
     const { validate } = await import('../src/config/schema.js');
     const cfg = {
       version: '1',
@@ -388,26 +401,20 @@ describe('Config contract — schema and types', () => {
         maxMessageLength: 100000,
         keyDerivation: { algorithm: 'argon2id', memoryCost: 65536, timeCost: 3, parallelism: 4 },
       },
-      agents: [{
-        id: 'default',
-        name: 'Test',
-        enabled: true,
-        workspace: '/tmp/workspace',
-        providers: [{ type: 'anthropic', model: 'claude-haiku-4-5-20251001' }],
-      }],
       logging: { level: 'info', prettyPrint: true },
     };
     expect(validate(cfg)).toBe(true);
   });
 
   it('getDefaultConfig returns object with all top-level fields', async () => {
+    // findings.md P2:171 — `agents` removed from LainConfig.
     const { getDefaultConfig } = await import('../src/config/defaults.js');
     const cfg = getDefaultConfig();
     expect(cfg.version).toBeDefined();
     expect(cfg.gateway).toBeDefined();
     expect(cfg.security).toBeDefined();
-    expect(cfg.agents).toBeDefined();
     expect(cfg.logging).toBeDefined();
+    expect((cfg as Record<string, unknown>)['agents']).toBeUndefined();
   });
 
   it('getDefaultConfig version is a string', async () => {
@@ -667,7 +674,10 @@ describe('Event contract', () => {
 
   it('eventBus has characterId getter', async () => {
     const { eventBus } = await import('../src/events/bus.js');
-    expect(typeof eventBus.characterId).toBe('string');
+    // findings.md P2:295 — characterId is `string | null`; defaults to null
+    // until setCharacterId is called so uninitialised processes don't silently
+    // tag every event as a real character.
+    expect(['string', 'object']).toContain(typeof eventBus.characterId);
   });
 
   it('eventBus is an EventEmitter (has on, emit, off)', async () => {
@@ -923,9 +933,12 @@ describe('Export surface — agent tools module', () => {
     expect(typeof mod.unregisterTool).toBe('function');
   });
 
-  it('exports toolRequiresApproval function', async () => {
-    const mod = await import('../src/agent/tools.js');
-    expect(typeof mod.toolRequiresApproval).toBe('function');
+  it('does not export a dead toolRequiresApproval helper', async () => {
+    // Removed as P1 in findings.md: the helper existed but executeTool
+    // never consulted it, so telegram_call ran unattended despite its
+    // metadata. Any future approval gating must live in executeTool.
+    const mod = await import('../src/agent/tools.js') as Record<string, unknown>;
+    expect(mod['toolRequiresApproval']).toBeUndefined();
   });
 
   it('exports extractTextFromHtml function', async () => {

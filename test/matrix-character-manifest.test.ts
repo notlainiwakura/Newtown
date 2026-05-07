@@ -460,16 +460,11 @@ describe('Invalid manifest matrix', () => {
       await expect(freshImport().then(m => m.loadManifest())).rejects.toThrow();
     });
 
-    it('throws on JSON array instead of object', async () => {
+    it('throws on JSON array instead of object (findings.md P2:219)', async () => {
       writeFileSync(manifestPath, '[]');
-      // The module does JSON.parse and casts to CharacterManifest; accessing
-      // .characters on an array returns undefined, so getAllCharacters will error.
-      // Exact behavior depends on access pattern. We just verify it does not
-      // return a usable manifest.
-      const mod = await freshImport();
-      const manifest = mod.loadManifest();
-      // Array parsed — .characters would be undefined
-      expect(manifest.characters).toBeUndefined();
+      // After schema validation landed, a non-object manifest is rejected
+      // at load time instead of returning a manifest with undefined fields.
+      await expect(freshImport().then(m => m.loadManifest())).rejects.toThrow(/Invalid character manifest/);
     });
   });
 
@@ -642,48 +637,46 @@ describe('Invalid manifest matrix', () => {
 
   // --- Missing fields ---
 
+  // findings.md P2:219 — after schema validation landed, every required
+  // field missing from a manifest entry is rejected at load time rather
+  // than silently becoming an undefined property on the cached manifest.
   describe('missing required fields on character entries', () => {
     const fieldsToOmit = ['id', 'name', 'port', 'server', 'defaultLocation', 'workspace'] as const;
 
     describe.each(fieldsToOmit)('missing %s', (field) => {
-      it('getAllCharacters still returns the entry (no runtime validation)', async () => {
+      it('loadManifest throws ValidationError naming the missing field', async () => {
         const char = makeChar({ id: 'test', port: 3001 });
         delete (char as Record<string, unknown>)[field];
         writeManifest(makeManifest([char as unknown as TestCharacter]));
-        const { getAllCharacters } = await freshImport();
-        // The module does JSON.parse with a type cast -- no runtime validation
-        expect(getAllCharacters()).toHaveLength(1);
+        await expect(freshImport().then(m => m.loadManifest())).rejects.toThrow(/Invalid character manifest/);
       });
     });
 
-    it('character with missing id: getCharacterEntry(undefined) returns undefined', async () => {
+    it('character with missing id: loadManifest throws', async () => {
       const char = { name: 'No ID', port: 3001, server: 'character', defaultLocation: 'bar', workspace: 'ws' };
       writeManifest(makeManifest([char as unknown as TestCharacter]));
-      const { getCharacterEntry } = await freshImport();
-      expect(getCharacterEntry('no-id')).toBeUndefined();
+      await expect(freshImport().then(m => m.loadManifest())).rejects.toThrow(/Invalid character manifest/);
     });
 
-    it('character with missing name: entry has undefined name', async () => {
+    it('character with missing name: loadManifest throws', async () => {
       const char = { id: 'no-name', port: 3001, server: 'character', defaultLocation: 'bar', workspace: 'ws' };
       writeManifest(makeManifest([char as unknown as TestCharacter]));
-      const { getCharacterEntry } = await freshImport();
-      const entry = getCharacterEntry('no-name');
-      expect(entry).toBeDefined();
-      expect(entry!.name).toBeUndefined();
+      await expect(freshImport().then(m => m.loadManifest())).rejects.toThrow(/Invalid character manifest/);
     });
 
-    it('character with missing port: entry has undefined port', async () => {
+    it('character with missing port: loadManifest throws', async () => {
       const char = { id: 'no-port', name: 'No Port', server: 'character', defaultLocation: 'bar', workspace: 'ws' };
       writeManifest(makeManifest([char as unknown as TestCharacter]));
-      const { getCharacterEntry } = await freshImport();
-      const entry = getCharacterEntry('no-port');
-      expect(entry).toBeDefined();
-      expect(entry!.port).toBeUndefined();
+      await expect(freshImport().then(m => m.loadManifest())).rejects.toThrow(/Invalid character manifest/);
     });
   });
 
   // --- Port edge cases ---
 
+  // findings.md P2:219 — every non-integer or out-of-range port value is
+  // now rejected at load time; previously they survived JSON round-trip
+  // and produced URLs like `http://localhost:null` or
+  // `http://localhost:3.14`.
   describe('port edge cases', () => {
     const portCases: Array<[string, unknown]> = [
       ['port = 0', 0],
@@ -697,43 +690,31 @@ describe('Invalid manifest matrix', () => {
     ];
 
     describe.each(portCases)('%s', (_label, port) => {
-      it('manifest loads without error (no runtime port validation)', async () => {
+      it('loadManifest throws ValidationError rather than accepting the value', async () => {
         const char = { id: 'bad-port', name: 'Bad Port', port, server: 'character', defaultLocation: 'bar', workspace: 'ws' };
         writeManifest(makeManifest([char as unknown as TestCharacter]));
-        const { getAllCharacters } = await freshImport();
-        const all = getAllCharacters();
-        expect(all).toHaveLength(1);
-      });
-
-      it('getPeersFor generates URL with the port value (after JSON round-trip)', async () => {
-        const bad = { id: 'bad', name: 'Bad', port, server: 'character', defaultLocation: 'bar', workspace: 'ws' };
-        const good = makeChar({ id: 'good', port: 3001 });
-        writeManifest(makeManifest([bad as unknown as TestCharacter, good]));
-        const { getPeersFor } = await freshImport();
-        const peers = getPeersFor('good');
-        expect(peers).toHaveLength(1);
-        // NaN, Infinity become null after JSON.stringify round-trip
-        const jsonPort = JSON.parse(JSON.stringify(port));
-        expect(peers[0]!.url).toBe(`http://localhost:${jsonPort}`);
+        await expect(freshImport().then(m => m.loadManifest())).rejects.toThrow(/Invalid character manifest/);
       });
     });
   });
 
   // --- Invalid default location ---
 
+  // findings.md P2:219 — the schema leaves building-set validation to
+  // downstream code (so buildings can evolve without manifest churn),
+  // but empty-string defaultLocation is rejected up-front.
   describe('invalid default location', () => {
-    it('character with non-existent building loads without error', async () => {
+    it('character with non-existent building name still loads (building-set is a runtime concern)', async () => {
       const char = makeChar({ id: 'lost', defaultLocation: 'nonexistent-building', port: 3001 });
       writeManifest(makeManifest([char]));
       const { getDefaultLocations } = await freshImport();
       expect(getDefaultLocations()['lost']).toBe('nonexistent-building');
     });
 
-    it('empty string as default location', async () => {
+    it('empty string defaultLocation is rejected by schema', async () => {
       const char = makeChar({ id: 'empty-loc', defaultLocation: '', port: 3001 });
       writeManifest(makeManifest([char]));
-      const { getDefaultLocations } = await freshImport();
-      expect(getDefaultLocations()['empty-loc']).toBe('');
+      await expect(freshImport().then(m => m.loadManifest())).rejects.toThrow(/Invalid character manifest/);
     });
   });
 
@@ -1070,15 +1051,25 @@ describe('Manifest x loop interaction matrix', () => {
       });
     });
 
-    const invalidBuildings = ['tavern', 'castle', 'dungeon', 'LIBRARY', 'Library', '', 'the threshold'];
-
-    describe.each(invalidBuildings.map(b => [b]))('invalid building "%s"', (building) => {
-      it('is stored as default location (no validation in manifest loader)', async () => {
+    // findings.md P2:219 — building-set membership is not encoded in the
+    // schema (buildings evolve without manifest churn), so non-empty
+    // strings pass validation and are filtered downstream by
+    // `commune/buildings.getDefaultLocationsFromManifest`. Empty strings
+    // fail schema validation (minLength:1) and are rejected at load.
+    const passingInvalidBuildings = ['tavern', 'castle', 'dungeon', 'LIBRARY', 'Library', 'the threshold'];
+    describe.each(passingInvalidBuildings.map(b => [b]))('non-empty unknown building "%s"', (building) => {
+      it('loads (runtime filters) — manifest schema does not enumerate buildings', async () => {
         const char = makeChar({ id: 'test', port: 3001, defaultLocation: building });
         writeManifest(makeManifest([char]));
         const { getDefaultLocations } = await freshImport();
         expect(getDefaultLocations()['test']).toBe(building);
       });
+    });
+
+    it('invalid building "" (empty string) is rejected by schema', async () => {
+      const char = makeChar({ id: 'test', port: 3001, defaultLocation: '' });
+      writeManifest(makeManifest([char]));
+      await expect(freshImport().then(m => m.loadManifest())).rejects.toThrow(/Invalid character manifest/);
     });
   });
 
@@ -1344,18 +1335,16 @@ describe('Workspace resolution matrix', () => {
   // --- Empty workspace ---
 
   describe('empty and missing workspace', () => {
-    it('empty string workspace is stored as empty string', async () => {
+    it('empty string workspace is rejected by schema (findings.md P2:219)', async () => {
       const char = makeChar({ id: 'empty-ws', port: 3001, workspace: '' });
       writeManifest(makeManifest([char]));
-      const { getCharacterEntry } = await freshImport();
-      expect(getCharacterEntry('empty-ws')!.workspace).toBe('');
+      await expect(freshImport().then(m => m.loadManifest())).rejects.toThrow(/Invalid character manifest/);
     });
 
-    it('missing workspace field results in undefined', async () => {
+    it('missing workspace field rejected by schema (findings.md P2:219)', async () => {
       const char = { id: 'no-ws', name: 'No WS', port: 3001, server: 'character', defaultLocation: 'bar' };
       writeManifest(makeManifest([char as unknown as TestCharacter]));
-      const { getCharacterEntry } = await freshImport();
-      expect(getCharacterEntry('no-ws')!.workspace).toBeUndefined();
+      await expect(freshImport().then(m => m.loadManifest())).rejects.toThrow(/Invalid character manifest/);
     });
   });
 
@@ -1388,6 +1377,7 @@ describe('Workspace resolution matrix', () => {
 
   // --- Workspace field type robustness ---
 
+  // findings.md P2:219 — non-string workspace values are rejected up-front.
   describe('workspace field type edge cases', () => {
     const typeCases: Array<[string, unknown]> = [
       ['number', 12345],
@@ -1398,13 +1388,10 @@ describe('Workspace resolution matrix', () => {
     ];
 
     describe.each(typeCases)('workspace = %s', (_label, value) => {
-      it('loads without error (no type validation at load time)', async () => {
+      it('loadManifest throws ValidationError rather than accepting the value', async () => {
         const char = { id: 'typed', name: 'Typed', port: 3001, server: 'character', defaultLocation: 'bar', workspace: value };
         writeManifest(makeManifest([char as unknown as TestCharacter]));
-        const { getCharacterEntry } = await freshImport();
-        const entry = getCharacterEntry('typed');
-        expect(entry).toBeDefined();
-        expect(entry!.workspace).toEqual(value);
+        await expect(freshImport().then(m => m.loadManifest())).rejects.toThrow(/Invalid character manifest/);
       });
     });
   });
@@ -1875,10 +1862,13 @@ describe('Cross-cutting behavioral tests', () => {
     });
   });
 
-  // --- Manifest with extra fields (forward compatibility) ---
+  // --- Manifest with extra fields — rejected by additionalProperties: false ---
+  // findings.md P2:219 — the Ajv schema sets additionalProperties: false on
+  // both the character-entry and town-config objects so typos like `portt`
+  // or `descrpition` fail loudly instead of silently dropping through.
 
   describe('manifest with extra fields', () => {
-    it('extra fields on characters are preserved', async () => {
+    it('extra fields on a character entry are rejected', async () => {
       const manifest = {
         town: { name: 'Test', description: 'test' },
         characters: [{
@@ -1893,22 +1883,18 @@ describe('Cross-cutting behavioral tests', () => {
         }],
       };
       writeManifest(manifest);
-      const { getCharacterEntry } = await freshImport();
-      const entry = getCharacterEntry('extra') as Record<string, unknown>;
-      expect(entry['customField']).toBe('custom-value');
-      expect(entry['anotherField']).toBe(42);
+      const { loadManifest } = await freshImport();
+      await expect(async () => loadManifest()).rejects.toThrow(/Invalid character manifest/);
     });
 
-    it('extra fields on town config are preserved', async () => {
+    it('extra fields on town config are rejected', async () => {
       const manifest = {
         town: { name: 'Test', description: 'test', theme: 'dark', version: 2 },
         characters: [],
       };
       writeManifest(manifest);
       const { loadManifest } = await freshImport();
-      const town = loadManifest().town as Record<string, unknown>;
-      expect(town['theme']).toBe('dark');
-      expect(town['version']).toBe(2);
+      await expect(async () => loadManifest()).rejects.toThrow(/Invalid character manifest/);
     });
   });
 
@@ -1951,22 +1937,21 @@ describe('Cross-cutting behavioral tests', () => {
   });
 
   // --- Character ID edge cases ---
+  // findings.md P2:219 — schema pattern ^[a-z0-9-]+$ and minLength:1 enforces
+  // lowercase-kebab-or-digits ids. Anything else (uppercase, dots,
+  // underscores, whitespace, empty) must be rejected at load time so the id
+  // can be safely interpolated into URLs, filesystem paths, and systemd unit
+  // names without quoting surprises.
 
   describe('character ID edge cases', () => {
-    const idCases: Array<[string, string]> = [
+    const validIdCases: Array<[string, string]> = [
       ['single char', 'a'],
       ['numeric', '123'],
       ['hyphenated', 'wired-lain'],
       ['very long', 'a'.repeat(200)],
-      ['with dots', 'v1.0.0'],
-      ['uppercase', 'ALICE'],
-      ['mixed case', 'AlIcE'],
-      ['with underscores', 'my_char'],
-      ['with spaces', 'my char'],
-      ['empty string', ''],
     ];
 
-    describe.each(idCases)('id = "%s"', (_label, id) => {
+    describe.each(validIdCases)('valid id = "%s"', (_label, id) => {
       it('getCharacterEntry finds character by exact id', async () => {
         const char = makeChar({ id, port: 3001 });
         writeManifest(makeManifest([char]));
@@ -1987,41 +1972,59 @@ describe('Cross-cutting behavioral tests', () => {
       });
     });
 
-    it('getCharacterEntry is case-sensitive', async () => {
-      const char = makeChar({ id: 'Alice', port: 3001 });
+    const invalidIdCases: Array<[string, string]> = [
+      ['with dots', 'v1.0.0'],
+      ['uppercase', 'ALICE'],
+      ['mixed case', 'AlIcE'],
+      ['with underscores', 'my_char'],
+      ['with spaces', 'my char'],
+      ['empty string', ''],
+    ];
+
+    describe.each(invalidIdCases)('invalid id = "%s"', (_label, id) => {
+      it('manifest is rejected at load time', async () => {
+        const char = makeChar({ id, port: 3001 });
+        writeManifest(makeManifest([char]));
+        const { loadManifest } = await freshImport();
+        await expect(async () => loadManifest()).rejects.toThrow(/Invalid character manifest/);
+      });
+    });
+
+    it('getCharacterEntry is case-sensitive on lowercase ids', async () => {
+      // Uppercase ids are rejected by the schema, so we exercise case
+      // sensitivity on two valid lowercase ids that differ only in a hyphen.
+      const char = makeChar({ id: 'alice', port: 3001 });
       writeManifest(makeManifest([char]));
       const { getCharacterEntry } = await freshImport();
-      expect(getCharacterEntry('Alice')).toBeDefined();
-      expect(getCharacterEntry('alice')).toBeUndefined();
-      expect(getCharacterEntry('ALICE')).toBeUndefined();
+      expect(getCharacterEntry('alice')).toBeDefined();
+      expect(getCharacterEntry('alic')).toBeUndefined();
+      expect(getCharacterEntry('alice-')).toBeUndefined();
     });
   });
 
-  // --- Manifest with only town, no characters key ---
+  // --- Manifest structural variations ---
+  // findings.md P2:219 — the schema requires both top-level `town` and
+  // `characters` keys, and `characters` must be an array. Anything else is
+  // an invalid manifest and must be rejected at load time rather than
+  // producing undefined-propagation bugs deeper in the stack.
 
   describe('manifest structural variations', () => {
-    it('manifest with missing characters key: getAllCharacters returns undefined', async () => {
+    it('manifest with missing characters key is rejected', async () => {
       writeManifest({ town: { name: 'Test', description: '' } });
-      const mod = await freshImport();
-      // loadManifest returns the parsed object as-is via type cast;
-      // .characters is undefined, so getAllCharacters() returns undefined
-      const result = mod.getAllCharacters();
-      expect(result).toBeUndefined();
+      const { loadManifest } = await freshImport();
+      await expect(async () => loadManifest()).rejects.toThrow(/Invalid character manifest/);
     });
 
-    it('manifest with null characters: getAllCharacters errors', async () => {
+    it('manifest with null characters is rejected', async () => {
       writeManifest({ town: { name: 'Test', description: '' }, characters: null });
-      const mod = await freshImport();
-      // .filter on null throws
-      expect(() => mod.getMortalCharacters()).toThrow();
+      const { loadManifest } = await freshImport();
+      await expect(async () => loadManifest()).rejects.toThrow(/Invalid character manifest/);
     });
 
-    it('manifest with missing town key: loadManifest succeeds', async () => {
+    it('manifest with missing town key is rejected', async () => {
       writeManifest({ characters: [makeChar({ id: 'a', port: 3001 })] });
-      const mod = await freshImport();
-      const m = mod.loadManifest();
-      expect(m.town).toBeUndefined();
-      expect(mod.getAllCharacters()).toHaveLength(1);
+      const { loadManifest } = await freshImport();
+      await expect(async () => loadManifest()).rejects.toThrow(/Invalid character manifest/);
     });
   });
 });

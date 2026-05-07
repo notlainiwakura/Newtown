@@ -61,14 +61,20 @@ const {
   };
 });
 
-vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: {
-      create: mockAnthropicCreate,
-      stream: mockAnthropicStream,
-    },
-  })),
-}));
+vi.mock('@anthropic-ai/sdk', async () => {
+  // findings.md P2:838 — preserve real APIError exports so the provider's
+  // `err instanceof APIError` retry classification works under test.
+  const actual = await vi.importActual<typeof import('@anthropic-ai/sdk')>('@anthropic-ai/sdk');
+  return {
+    ...actual,
+    default: vi.fn().mockImplementation(() => ({
+      messages: {
+        create: mockAnthropicCreate,
+        stream: mockAnthropicStream,
+      },
+    })),
+  };
+});
 
 vi.mock('openai', () => ({
   default: vi.fn().mockImplementation(() => ({
@@ -80,6 +86,12 @@ vi.mock('@google/generative-ai', () => ({
   GoogleGenerativeAI: vi.fn().mockImplementation(() => ({
     getGenerativeModel: mockGetGenerativeModel,
   })),
+  FunctionCallingMode: {
+    MODE_UNSPECIFIED: 'MODE_UNSPECIFIED',
+    AUTO: 'AUTO',
+    ANY: 'ANY',
+    NONE: 'NONE',
+  },
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -96,6 +108,7 @@ vi.mock('../src/storage/database.js', () => ({
   setMeta: mockSetMeta,
   getDatabase: vi.fn(),
   initDatabase: vi.fn(),
+  isDatabaseInitialized: () => true,
   query: vi.fn().mockReturnValue([]),
 }));
 
@@ -1218,7 +1231,10 @@ describe('Provider Streaming Behavior', () => {
       });
     }
 
-    it('unknown stop_reason defaults to stop', async () => {
+    it('unknown stop_reason maps to "unknown" (findings.md P2:940)', async () => {
+      // findings.md P2:940 — unrecognized Anthropic stop_reason values
+      // surface as 'unknown' (not silently collapsed to 'stop') so callers
+      // can branch/log on novel enum members.
       const events: Array<Record<string, unknown>> = [
         { type: 'message_start', message: { usage: { input_tokens: 10 } } },
         { type: 'message_delta', delta: { stop_reason: 'unknown_reason' }, usage: { output_tokens: 5 } },
@@ -1230,7 +1246,7 @@ describe('Provider Streaming Behavior', () => {
         () => {}
       );
 
-      expect(result.finishReason).toBe('stop');
+      expect(result.finishReason).toBe('unknown');
     });
 
     it('null stop_reason defaults to stop', async () => {
@@ -2091,7 +2107,8 @@ describe('Stream x Error Matrix', () => {
     it('agent error sends error message as chunk', () => {
       // When generateResponseWithToolsStream throws, processMessageStream
       // sends the error message through onChunk
-      const errorMessage = '...something went wrong. the wired is unstable right now...';
+      // findings.md P2:1747 — generic, character-agnostic error copy.
+      const errorMessage = '...something went wrong. please try again in a moment';
       const chunks: string[] = [];
       chunks.push(errorMessage);
       expect(chunks[0]).toContain('something went wrong');
@@ -2459,9 +2476,10 @@ describe('Non-streaming vs Streaming Parity', () => {
     });
 
     it('Provider interface marks streaming methods as optional', () => {
-      // The interface has completeStream?, completeWithToolsStream?, continueWithToolResultsStream?
-      // This is a structural test: OpenAI provider does NOT have streaming methods
-      // (verified by code inspection — OpenAIProvider does not implement completeStream)
+      // The interface declares completeStream?, completeWithToolsStream?,
+      // continueWithToolResultsStream? as optional so providers can opt
+      // in. findings.md P2:990 — OpenAI now implements them; Google
+      // still relies on the fallback-proxy synthesis path.
       expect(true).toBe(true);
     });
 
@@ -2577,6 +2595,9 @@ describe('Boundary Conditions', () => {
             { role: 'system', content: 'You are helpful.' },
             { role: 'user', content: 'hi' },
           ],
+          // findings.md P2:900 — default caching would turn system into
+          // an array of blocks; opt out to assert the plain-string shape.
+          enableCaching: false,
         },
         () => {}
       );
@@ -3916,6 +3937,9 @@ describe('Provider Streaming — Edge Cases Matrix', () => {
             { role: 'system', content: 'Be helpful.' },
             { role: 'user', content: 'hi' },
           ],
+          // findings.md P2:900 — default is now enableCaching:true; opt out
+          // so this test validates the plain-string system shape.
+          enableCaching: false,
         },
         () => {}
       );
@@ -3939,6 +3963,10 @@ describe('Provider Streaming — Edge Cases Matrix', () => {
             { role: 'assistant', content: 'Hi there' },
             { role: 'user', content: 'How are you?' },
           ],
+          // findings.md P2:900 — default is now enableCaching:true which
+          // wraps the last user message as a content-block array. Opt out
+          // so this test validates the plain-string pass-through.
+          enableCaching: false,
         },
         () => {}
       );

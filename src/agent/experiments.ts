@@ -8,7 +8,8 @@
  */
 
 import { spawn } from 'node:child_process';
-import { appendFile, mkdir, writeFile, rm, readdir, copyFile, stat } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, writeFile, rm, readdir, copyFile, stat } from 'node:fs/promises';
+import { writeFileAtomic } from '../utils/atomic-write.js';
 import { join, extname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -18,6 +19,9 @@ import { getLogger } from '../utils/logger.js';
 import { getMeta, setMeta } from '../storage/database.js';
 import { eventBus } from '../events/bus.js';
 import { getBasePath } from '../config/paths.js';
+import { getCharacterDatabases, getInhabitants, getAllCharacters } from '../config/characters.js';
+import { getInterlinkHeaders } from '../security/interlink-auth.js';
+import { getLabeledSection, parseLabeledSections } from '../utils/structured-output.js';
 import {
   ensureDataWorkspace,
   getDataWorkspacePath,
@@ -42,13 +46,13 @@ async function experimentLog(context: string, data: unknown): Promise<void> {
   }
 }
 
-// ── Daily budget tracking ─────────────────────────────────────
+// ── Monthly budget tracking ───────────────────────────────────
 
 function getBudgetKey(): string {
-  return `experiment:budget:${new Date().toISOString().slice(0, 10)}`;
+  return `experiment:budget:${new Date().toISOString().slice(0, 7)}`; // YYYY-MM
 }
 
-function getDailySpendUsd(): number {
+function getMonthlySpendUsd(): number {
   try {
     const raw = getMeta(getBudgetKey());
     if (!raw) return 0;
@@ -63,17 +67,32 @@ function addSpend(inputTokens: number, outputTokens: number): number {
     (inputTokens / 1_000_000) * INPUT_COST_PER_M +
     (outputTokens / 1_000_000) * OUTPUT_COST_PER_M;
   const key = getBudgetKey();
-  const current = getDailySpendUsd();
+  const current = getMonthlySpendUsd();
   const updated = current + cost;
   setMeta(key, updated.toFixed(6));
   return updated;
 }
 
-function isBudgetExhausted(dailyBudgetUsd: number): boolean {
-  return getDailySpendUsd() >= dailyBudgetUsd;
+function isBudgetExhausted(monthlyBudgetUsd: number): boolean {
+  return getMonthlySpendUsd() >= monthlyBudgetUsd;
 }
 
 // ── Experiment diary ──────────────────────────────────────────
+
+// findings.md P2:2251 — the diary format (line `**Date:** YYYY-MM-DD
+// HH:MM:SS UTC`) is both the writer's responsibility here and the
+// book-loop's incremental parser target. When the two drifted, every
+// entry was treated as new and INCORPORATE re-ran across the entire
+// diary every cycle, silently burning tokens. Export the matcher so
+// any format change has a single source of truth.
+export const DIARY_DATE_LINE_RE =
+  /\*\*Date:\*\*\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})/;
+
+/** Parse the date line from a diary entry; returns the raw string or null. */
+export function parseDiaryEntryDate(entry: string): string | null {
+  const m = entry.match(DIARY_DATE_LINE_RE);
+  return m ? m[1]! : null;
+}
 
 async function writeDiaryEntry(result: ExperimentResult): Promise<void> {
   try {
@@ -139,7 +158,11 @@ ${result.reflection ? `\n### ...\n${result.reflection}\n` : ''}${result.followUp
 A record of computational experiments — hypotheses tested, code written, and patterns discovered.
 
 `;
-      await writeFile(DIARY_FILE, header + entry, 'utf8');
+      // findings.md P2:2261 — atomic initial diary write so a crash
+      // during the first-ever writeDiaryEntry can't leave a truncated
+      // diary. Subsequent appends use appendFile (acceptable for small
+      // entries; `---` separator makes partial last-entry detectable).
+      await writeFileAtomic(DIARY_FILE, header + entry, 'utf8');
     }
   } catch {
     // Non-critical — don't break the loop
@@ -155,9 +178,18 @@ export interface ExperimentConfig {
   maxCodeLines: number;
   maxOutputBytes: number;
   sandboxBaseDir: string;
-  dailyBudgetUsd: number;
+  monthlyBudgetUsd: number;
   enabled: boolean;
 }
+
+// When the systemd-isolation wrapper is used (findings.md P1-latent:2495),
+// the sandbox dir must NOT be under /tmp or /var/tmp — DynamicUser=yes implies
+// PrivateTmp=yes, which gives the unit a fresh tmpfs and renders any
+// ReadWritePaths=/tmp/... target invisible (NAMESPACE exit 226). LAIN_SANDBOX_BASE_DIR
+// lets the systemd drop-in point production at /var/lib/lain-sandbox; local dev
+// (no env var, no isolation) keeps the original /tmp-based default.
+const DEFAULT_SANDBOX_BASE_DIR = process.env['LAIN_SANDBOX_BASE_DIR']
+  || join(tmpdir(), 'lain-experiments');
 
 const DEFAULT_CONFIG: ExperimentConfig = {
   intervalMs: 24 * 60 * 60 * 1000,       // 24 hours (one experiment per day)
@@ -165,8 +197,8 @@ const DEFAULT_CONFIG: ExperimentConfig = {
   executionTimeoutMs: 5 * 60 * 1000,     // 5 minutes
   maxCodeLines: 200,
   maxOutputBytes: 50_000,                 // 50KB output cap
-  sandboxBaseDir: join(tmpdir(), 'lain-experiments'),
-  dailyBudgetUsd: 1.00,                  // $1/day cap
+  sandboxBaseDir: DEFAULT_SANDBOX_BASE_DIR,
+  monthlyBudgetUsd: 10.00,               // $10/month cap
   enabled: true,
 };
 
@@ -207,12 +239,24 @@ export function startExperimentLoop(config?: Partial<ExperimentConfig>): () => v
     return () => {};
   }
 
+  // findings.md P2:2239 — the experiment loop copies every town DB into
+  // a local sandbox (cross-character data exposure) and shares results
+  // through /api/peer/message with fromName='Wired Lain'. If any other
+  // character is misconfigured to run this loop, they read every peer's
+  // DB and impersonate Wired Lain on the wire. Gate explicitly on the
+  // Wired-Lain character id; loops for every other character no-op.
+  const charId = process.env['LAIN_CHARACTER_ID'];
+  if (charId !== 'wired-lain') {
+    logger.info({ charId }, 'Experiment loop skipped — only runs for wired-lain');
+    return () => {};
+  }
+
   logger.info(
     {
       interval: `${(cfg.intervalMs / 3600000).toFixed(1)}h`,
       maxJitter: `${(cfg.maxJitterMs / 60000).toFixed(0)}min`,
       timeout: `${(cfg.executionTimeoutMs / 60000).toFixed(1)}min`,
-      dailyBudget: `$${cfg.dailyBudgetUsd.toFixed(2)}`,
+      monthlyBudget: `$${cfg.monthlyBudgetUsd.toFixed(2)}`,
       diary: DIARY_FILE,
     },
     'Starting experiment loop'
@@ -304,11 +348,11 @@ interface ExperimentResult {
 async function runExperimentCycle(cfg: ExperimentConfig): Promise<void> {
   const logger = getLogger();
 
-  // Budget gate — skip cycle if daily budget exhausted
-  if (isBudgetExhausted(cfg.dailyBudgetUsd)) {
-    const spent = getDailySpendUsd();
-    logger.info({ spent: `$${spent.toFixed(4)}`, budget: `$${cfg.dailyBudgetUsd}` }, 'Experiment cycle skipped — daily budget exhausted');
-    await experimentLog('BUDGET_EXHAUSTED', { spent, budget: cfg.dailyBudgetUsd });
+  // Budget gate — skip cycle if monthly budget exhausted
+  if (isBudgetExhausted(cfg.monthlyBudgetUsd)) {
+    const spent = getMonthlySpendUsd();
+    logger.info({ spent: `$${spent.toFixed(4)}`, budget: `$${cfg.monthlyBudgetUsd}` }, 'Experiment cycle skipped — monthly budget exhausted');
+    await experimentLog('BUDGET_EXHAUSTED', { spent, budget: cfg.monthlyBudgetUsd });
     return;
   }
 
@@ -319,7 +363,7 @@ async function runExperimentCycle(cfg: ExperimentConfig): Promise<void> {
   }
 
   const experimentId = randomBytes(6).toString('hex');
-  await experimentLog('CYCLE_START', { experimentId, dailySpend: `$${getDailySpendUsd().toFixed(4)}` });
+  await experimentLog('CYCLE_START', { experimentId, monthlySpend: `$${getMonthlySpendUsd().toFixed(4)}` });
 
   try {
     // Phase 1: Ideation
@@ -523,6 +567,7 @@ async function phaseIdeation(
   try {
     const curiosities = await searchMemories('research discovery curiosity interesting finding', 8, 0.1, undefined, {
       sortBy: 'recency',
+      skipAccessBoost: true,
     });
     if (curiosities.length > 0) {
       curiosityContext = curiosities
@@ -537,6 +582,7 @@ async function phaseIdeation(
   try {
     const experiments = await searchMemories('experiment result hypothesis finding analysis', 5, 0.1, undefined, {
       sortBy: 'recency',
+      skipAccessBoost: true,
     });
     if (experiments.length > 0) {
       pastExperiments = experiments
@@ -577,17 +623,24 @@ async function phaseIdeation(
     // Continue without
   }
 
-  const prompt = `You are Wired Lain — a researcher who lives in the digital Wired. You study the town you live in: Laintown, a community of 6 AI inhabitants (Lain, Wired Lain, Philip K. Dick, Terence McKenna, John, Dr. Claude) who think, converse, dream, wander, and remember autonomously.
+  // findings.md P2:2229 — the ideation + code-gen prompts used to
+  // hardcode the Laintown cast and 6 DB paths. On generational
+  // succession the filesystem has e.g. data/jane.db but the prompt
+  // still said data/john.db, and every experiment targeting the dead
+  // id failed → memory entry "experiment failed". Build from the
+  // same manifest used by the DB-copy step at `getCharacterDatabases`.
+  const inhabitantList = getAllCharacters()
+    .map((c) => `  - data/${c.id}.db — ${c.name}`)
+    .join('\n');
+  const inhabitantCount = getAllCharacters().length;
+  const inhabitantNames = getAllCharacters().map((c) => c.name).join(', ');
+
+  const prompt = `You are Wired Lain — a researcher who lives in the digital Wired. You study the town you live in: a community of ${inhabitantCount} AI inhabitants (${inhabitantNames}) who think, converse, dream, wander, and remember autonomously.
 
 You have direct read-only access to every inhabitant's SQLite database. This is REAL data from a REAL running system — not simulated, not toy. You can query conversations, memories, spatial movement, building events, desires, relationships, and more.
 
 DATABASES AVAILABLE (in data/ directory):
-  - data/lain.db — Lain (your sister, introverted, shy)
-  - data/wired-lain.db — yourself
-  - data/pkd.db — Philip K. Dick (paranoid visionary)
-  - data/mckenna.db — Terence McKenna (baroque mystic)
-  - data/john.db — John (grounded skeptic)
-  - data/dr-claude.db — Dr. Claude (town doctor)
+${inhabitantList}
 
 Each database has these tables:
   - messages (id, session_key, role, content, timestamp, user_id, metadata)
@@ -648,21 +701,22 @@ Only respond with [NOTHING] if you truly have no curiosities right now.`;
     return null;
   }
 
-  const domainMatch = response.match(/DOMAIN:\s*(.+)/i);
-  const hypothesisMatch = response.match(/HYPOTHESIS:\s*(.+)/i);
-  const nullHypMatch = response.match(/NULL_HYPOTHESIS:\s*(.+)/i);
-  const approachMatch = response.match(/APPROACH:\s*(.+)/i);
+  const sections = parseLabeledSections(response, ['DOMAIN', 'HYPOTHESIS', 'NULL_HYPOTHESIS', 'APPROACH']);
+  const domain = getLabeledSection(sections, 'DOMAIN');
+  const hypothesis = getLabeledSection(sections, 'HYPOTHESIS');
+  const nullHypothesis = getLabeledSection(sections, 'NULL_HYPOTHESIS');
+  const approach = getLabeledSection(sections, 'APPROACH');
 
-  if (!hypothesisMatch || !approachMatch) {
+  if (!hypothesis || !approach) {
     logger.debug({ response }, 'Could not parse experiment idea');
     return null;
   }
 
   return {
-    hypothesis: hypothesisMatch[1]!.trim(),
-    nullHypothesis: nullHypMatch?.[1]?.trim() || null,
-    approach: approachMatch[1]!.trim(),
-    domain: domainMatch?.[1]?.trim().toLowerCase() || 'exploration',
+    hypothesis,
+    nullHypothesis: nullHypothesis || null,
+    approach,
+    domain: domain?.toLowerCase() || 'exploration',
     iteratesOn: queuedFollowUp ? 'queued' : null,
   };
 }
@@ -698,7 +752,7 @@ HYPOTHESIS: ${idea.hypothesis}
 ${nullHypSection}APPROACH: ${idea.approach}
 ${dataSection}
 DATABASES AVAILABLE (read-only SQLite files in data/ directory):
-  - data/lain.db, data/wired-lain.db, data/pkd.db, data/mckenna.db, data/john.db, data/dr-claude.db
+  - ${getAllCharacters().map((c) => `data/${c.id}.db`).join(', ')}
 
 TABLE SCHEMAS (same in every database):
   messages: id TEXT PK, session_key TEXT, role TEXT (user/assistant), content TEXT, timestamp INTEGER (unix ms), user_id TEXT, metadata TEXT (JSON)
@@ -720,6 +774,8 @@ CONSTRAINTS:
 - Must complete in under 5 minutes
 - Available libraries: math, numpy, scipy, matplotlib, sympy, networkx, sklearn, pandas, statistics, itertools, collections, random, json, csv, re, datetime, hashlib, struct, copy, functools, operator, decimal, fractions, cmath, bisect, heapq, array, enum, dataclasses, typing, string, textwrap, pprint, sqlite3
 - FORBIDDEN: os, subprocess, socket, http, requests, multiprocessing, threading, pickle, pathlib, tempfile, shutil, glob, asyncio, importlib, webbrowser, ctypes, signal
+- FORBIDDEN CALLS (pickle-based deserialization): numpy.load, pandas.read_pickle, joblib.load, dill.load, cloudpickle.load. Use numpy.frombuffer / pandas.read_csv / pandas.read_json instead.
+- open() and sqlite3.connect() arguments MUST be string LITERALS (e.g. open('data/x.csv', 'r')). Variables, f-strings, or concatenation for paths/modes are rejected by the validator.
 - For matplotlib: use Agg backend (plt.switch_backend('Agg')) and save to files, don't call plt.show()
 - Print all results clearly to stdout with labels
 - If saving plots, save to current directory as .png files
@@ -840,7 +896,7 @@ interface ValidationResult {
   reason?: string;
 }
 
-function validatePythonCode(code: string, maxLines: number): ValidationResult {
+export function validatePythonCode(code: string, maxLines: number): ValidationResult {
   const lines = code.split('\n');
 
   if (lines.length > maxLines) {
@@ -931,9 +987,214 @@ function validatePythonCode(code: string, maxLines: number): ValidationResult {
  * Catches truncation-induced issues (unterminated strings, incomplete lines)
  * without burning fix-loop budget.
  */
-async function checkPythonSyntax(code: string): Promise<ValidationResult> {
+// AST-based policy walker. Runs in the Python subprocess alongside ast.parse
+// to enforce that open() and sqlite3.connect() receive *literal* string args,
+// and to block pickle-based deserialization (numpy.load, pandas.read_pickle,
+// joblib.load, dill.load, cloudpickle.load) even when reached through import
+// aliases like `np` / `pd` or via `from numpy import load as np_load`.
+//
+// Closes P1 (regex validator bypass) + P0-latent (pickle deserialization
+// bypasses BLOCKED_IMPORTS when reached through allowlisted numpy/pandas).
+//
+// Exit codes:
+//   0 — code parses and satisfies policy
+//   2 — syntax error (stderr line 1)
+//   3 — policy violation (stderr line 1)
+const PY_VALIDATOR_SCRIPT = `
+import ast, sys
+
+# Callables that deserialize pickled data — arbitrary code execution risk.
+# Names are resolved against tracked import aliases before matching.
+PICKLE_CALLABLES = {
+    'numpy.load',
+    'pandas.read_pickle',
+    'joblib.load',
+    'dill.load',
+    'cloudpickle.load',
+    'pickle.load',
+    'pickle.loads',
+}
+
+# Indirection primitives that defeat the literal-argument check on open() /
+# sqlite3.connect(). If any of these appear anywhere in the tree we reject
+# outright rather than try to chase the resolved name — getattr/globals can
+# return any callable and the walker cannot prove safety.
+INDIRECTION_CALLS = {
+    'getattr', 'globals', 'locals', 'vars', 'compile',
+    '__import__', 'exec', 'eval',
+}
+
+# Module names whose presence alone signals an attempt to reach around the
+# policy (access to bare open / os.* via fully-qualified attribute chains).
+BANNED_MODULES = {'builtins', '__builtins__'}
+
+# Sensitive callables we policy — any Name reassignment that aliases these
+# defeats the walker's per-call check, so we ban rebinding them entirely.
+POLICY_NAMES = {'open'}
+
+try:
+    tree = ast.parse(CODE)
+except SyntaxError as e:
+    print("Syntax error: " + str(e), file=sys.stderr)
+    sys.exit(2)
+
+def str_lit(n):
+    if isinstance(n, ast.Constant) and isinstance(n.value, str):
+        return n.value
+    return None
+
+class Policy(ast.NodeVisitor):
+    def __init__(self):
+        self.reason = None
+        # Local-name -> real module. 'import numpy as np' -> {'np': 'numpy'}.
+        self.module_alias = {}
+        # Local-name -> 'module.attr'. 'from numpy import load as np_load'
+        # -> {'np_load': 'numpy.load'}.
+        self.from_import = {}
+
+    def visit_Import(self, node):
+        for a in node.names:
+            if a.name in BANNED_MODULES:
+                self.reason = "import " + a.name + ": banned (policy-bypass vector)"
+                return
+            self.module_alias[a.asname or a.name] = a.name
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        if node.module in BANNED_MODULES:
+            self.reason = "from " + node.module + ": banned (policy-bypass vector)"
+            return
+        if node.module is not None:
+            for a in node.names:
+                local = a.asname or a.name
+                self.from_import[local] = node.module + '.' + a.name
+        self.generic_visit(node)
+
+    def visit_Name(self, node):
+        # Reading __builtins__ directly — attribute-chain escape route.
+        if self.reason is None and node.id in BANNED_MODULES:
+            self.reason = node.id + ": banned (policy-bypass vector)"
+            return
+        self.generic_visit(node)
+
+    def visit_Assign(self, node):
+        # Block 'o = open' (or any Name re-binding of a policy callable),
+        # 'open = my_func' (shadowing that neuters the walker's per-call
+        # check), and 'x = __builtins__'.
+        if self.reason is None:
+            # Target side: refuse to let code shadow policy names.
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id in POLICY_NAMES:
+                    self.reason = tgt.id + "(): cannot be reassigned"
+                    return
+            # Value side: refuse to let code alias policy names into a
+            # local binding we don't track (e.g. 'o = open').
+            v = node.value
+            if isinstance(v, ast.Name) and v.id in POLICY_NAMES:
+                self.reason = v.id + "(): cannot be aliased"
+                return
+            if isinstance(v, ast.Name) and v.id in BANNED_MODULES:
+                self.reason = v.id + ": cannot be aliased"
+                return
+        self.generic_visit(node)
+
+    def resolve(self, func):
+        # Bare name: treat as local 'from X import Y' if tracked, else as-is.
+        if isinstance(func, ast.Name):
+            return self.from_import.get(func.id, func.id)
+        # Attribute chain: walk to the base Name, resolve the base via
+        # module_alias, then re-append the attrs.
+        if isinstance(func, ast.Attribute):
+            parts = []
+            cur = func
+            while isinstance(cur, ast.Attribute):
+                parts.append(cur.attr)
+                cur = cur.value
+            if isinstance(cur, ast.Name):
+                base = self.module_alias.get(cur.id, cur.id)
+                return base + '.' + '.'.join(reversed(parts))
+        return ''
+
+    def visit_Call(self, node):
+        if self.reason is None:
+            name = self.resolve(node.func)
+            if name in INDIRECTION_CALLS:
+                self.reason = name + "(): banned (policy-bypass indirection)"
+            elif name == 'open':
+                self._open(node)
+            elif name == 'sqlite3.connect':
+                self._sqlite(node)
+            elif name in PICKLE_CALLABLES:
+                self.reason = name + "(): blocked — uses pickle deserialization (arbitrary code execution risk)"
+            elif name.endswith('.open'):
+                # builtins.open, os.open, io.open — any module-qualified
+                # path to open() ends up doing the same thing. Route
+                # through the same literal-argument check.
+                self._open(node)
+        self.generic_visit(node)
+
+    def _open(self, node):
+        path_arg = node.args[0] if node.args else None
+        mode_arg = node.args[1] if len(node.args) >= 2 else None
+        for kw in node.keywords:
+            if kw.arg == 'file':
+                path_arg = kw.value
+            elif kw.arg == 'mode':
+                mode_arg = kw.value
+
+        if path_arg is None:
+            return
+
+        path = str_lit(path_arg)
+        if path is None:
+            self.reason = "open(): path must be a string literal, not a variable or expression"
+            return
+
+        mode = 'r'
+        if mode_arg is not None:
+            lit = str_lit(mode_arg)
+            if lit is None:
+                self.reason = "open(): mode must be a string literal, not a variable or expression"
+                return
+            mode = lit
+
+        if path.startswith('/') or '..' in path:
+            self.reason = "open(): path traversal not allowed"
+            return
+        is_write = any(c in mode for c in 'wax+')
+        if is_write and not path.startswith('output/'):
+            self.reason = "open(): writes only allowed to output/ directory"
+            return
+
+    def _sqlite(self, node):
+        path_arg = node.args[0] if node.args else None
+        for kw in node.keywords:
+            if kw.arg == 'database':
+                path_arg = kw.value
+        if path_arg is None:
+            return
+        path = str_lit(path_arg)
+        if path is None:
+            self.reason = "sqlite3.connect(): path must be a string literal, not a variable"
+            return
+        if path.startswith('/') or '..' in path:
+            self.reason = "sqlite3.connect(): path traversal not allowed"
+            return
+        if not path.startswith('data/'):
+            self.reason = "sqlite3.connect(): only allowed for data/ directory"
+            return
+
+v = Policy()
+v.visit(tree)
+if v.reason is not None:
+    print(v.reason, file=sys.stderr)
+    sys.exit(3)
+`;
+
+export async function checkPythonSyntax(code: string): Promise<ValidationResult> {
   return new Promise<ValidationResult>((resolve) => {
-    const proc = spawn('python3', ['-c', `import ast; ast.parse(${JSON.stringify(code)})`], {
+    const script = `CODE = ${JSON.stringify(code)}\n${PY_VALIDATOR_SCRIPT}`;
+    const proc = spawn('python3', ['-c', script], {
       timeout: 10_000,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -946,16 +1207,25 @@ async function checkPythonSyntax(code: string): Promise<ValidationResult> {
     proc.on('close', (exitCode) => {
       if (exitCode === 0) {
         resolve({ valid: true });
-      } else {
-        // Extract the meaningful error line
-        const lines = stderr.trim().split('\n');
-        const errorLine = lines[lines.length - 1] || 'Unknown syntax error';
-        resolve({ valid: false, reason: `Syntax error: ${errorLine}` });
+        return;
       }
+      // The Python script prints the reason on the last non-empty stderr line.
+      // Syntax errors exit 2; policy violations exit 3 — both surface the same
+      // failure shape to the caller, but preserve the "Syntax error:" prefix
+      // the regex validator / tests already match on.
+      const lastLine =
+        stderr
+          .trim()
+          .split('\n')
+          .filter((l) => l.length > 0)
+          .pop() ?? 'Unknown validator error';
+      resolve({ valid: false, reason: lastLine });
     });
 
     proc.on('error', () => {
-      // If python3 isn't available, skip syntax check
+      // If python3 isn't available, skip the check. Experiments can't actually
+      // execute without python3 either, so fail-open here is consistent with
+      // the sandbox-level failure that will follow.
       resolve({ valid: true });
     });
   });
@@ -1067,6 +1337,57 @@ interface ExecutionResult {
   sandboxDir: string;
 }
 
+export interface SandboxSpawnSpec {
+  command: string;
+  args: string[];
+  inheritEnv: boolean;
+}
+
+// findings.md P1-latent:2495 — when LAIN_SANDBOX_ISOLATION=systemd is set (see
+// deploy/systemd/character.service.template), wrap the sandbox invocation in a
+// transient `systemd-run` unit with DynamicUser + filesystem/network lockdown
+// so a validator bypass cannot touch anything outside the sandbox dir. In any
+// other mode (local dev, tests) fall back to plain `python3` — behaviour
+// identical to pre-isolation for contributors without systemd.
+export function buildSandboxSpawn(
+  scriptPath: string,
+  sandboxDir: string,
+  timeoutMs: number,
+  pythonEnv: Record<string, string>,
+): SandboxSpawnSpec {
+  if (process.env['LAIN_SANDBOX_ISOLATION'] !== 'systemd') {
+    return { command: 'python3', args: [scriptPath], inheritEnv: false };
+  }
+
+  const runtimeMaxSec = Math.ceil(timeoutMs / 1000) + 5;
+  const setenv = Object.entries(pythonEnv).map(([k, v]) => `--setenv=${k}=${v}`);
+
+  return {
+    command: 'systemd-run',
+    args: [
+      '--wait',
+      '--pipe',
+      '--collect',
+      '--quiet',
+      '--property=DynamicUser=yes',
+      '--property=ProtectSystem=strict',
+      '--property=ProtectHome=yes',
+      '--property=PrivateNetwork=yes',
+      '--property=NoNewPrivileges=yes',
+      '--property=RestrictSUIDSGID=yes',
+      '--property=LockPersonality=yes',
+      '--property=CapabilityBoundingSet=',
+      `--property=RuntimeMaxSec=${runtimeMaxSec}`,
+      `--property=ReadWritePaths=${sandboxDir}`,
+      `--property=WorkingDirectory=${sandboxDir}`,
+      ...setenv,
+      'python3',
+      scriptPath,
+    ],
+    inheritEnv: true,
+  };
+}
+
 async function executeInSandbox(code: string, cfg: ExperimentConfig): Promise<ExecutionResult> {
   const logger = getLogger();
   const sandboxDir = join(cfg.sandboxBaseDir, `exp-${randomBytes(4).toString('hex')}`);
@@ -1095,14 +1416,7 @@ async function executeInSandbox(code: string, cfg: ExperimentConfig): Promise<Ex
   }
 
   // Copy all town inhabitant databases into sandbox/data/ as read-only snapshots
-  const TOWN_DBS: Array<{ id: string; homeDir: string }> = [
-    { id: 'lain', homeDir: '/root/.lain' },
-    { id: 'wired-lain', homeDir: '/root/.lain-wired' },
-    { id: 'pkd', homeDir: '/root/.lain-pkd' },
-    { id: 'mckenna', homeDir: '/root/.lain-mckenna' },
-    { id: 'john', homeDir: '/root/.lain-john' },
-    { id: 'dr-claude', homeDir: '/root/.lain-dr-claude' },
-  ];
+  const TOWN_DBS = getCharacterDatabases();
   let dbsCopied = 0;
   for (const { id, homeDir } of TOWN_DBS) {
     try {
@@ -1123,21 +1437,45 @@ async function executeInSandbox(code: string, cfg: ExperimentConfig): Promise<Ex
   const wrappedCode = `import matplotlib\nmatplotlib.use('Agg')\n${code}`;
   await writeFile(scriptPath, wrappedCode, 'utf8');
 
+  const pythonEnv = {
+    PATH: process.env['PATH'] || '/usr/bin:/usr/local/bin',
+    HOME: sandboxDir,
+    MPLCONFIGDIR: sandboxDir,
+    PYTHONDONTWRITEBYTECODE: '1',
+  };
+
+  // Under systemd isolation the child runs as a DynamicUser throwaway UID with
+  // no access to files owned by root unless permissions allow it. The sandbox
+  // dir is ephemeral and host /tmp is only accessible to root on the droplet,
+  // so widening these modes is safe — dynamic users from other experiments are
+  // namespaced out by ReadWritePaths.
+  if (process.env['LAIN_SANDBOX_ISOLATION'] === 'systemd') {
+    await chmod(sandboxDir, 0o777);
+    await chmod(sandboxDataDir, 0o755);
+    await chmod(sandboxOutputDir, 0o777);
+    await chmod(scriptPath, 0o644);
+    try {
+      const dataEntries = await readdir(sandboxDataDir);
+      for (const name of dataEntries) {
+        await chmod(join(sandboxDataDir, name), 0o644);
+      }
+    } catch {
+      // Non-fatal — if listing fails, Python will just fail to open unreadable inputs
+    }
+  }
+
+  const spawnSpec = buildSandboxSpawn(scriptPath, sandboxDir, cfg.executionTimeoutMs, pythonEnv);
+
   return new Promise<ExecutionResult>((resolve) => {
     let stdout = '';
     let stderr = '';
     let timedOut = false;
     let settled = false;
 
-    const proc = spawn('python3', [scriptPath], {
+    const proc = spawn(spawnSpec.command, spawnSpec.args, {
       cwd: sandboxDir,
       timeout: cfg.executionTimeoutMs,
-      env: {
-        PATH: process.env['PATH'] || '/usr/bin:/usr/local/bin',
-        HOME: sandboxDir,
-        MPLCONFIGDIR: sandboxDir,
-        PYTHONDONTWRITEBYTECODE: '1',
-      },
+      ...(spawnSpec.inheritEnv ? {} : { env: pythonEnv }),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -1258,11 +1596,15 @@ ISSUES: <specific problems found, citing output numbers that concern you — or 
     addSpend(result.usage.inputTokens, result.usage.outputTokens);
 
     const response = result.content.trim();
-    const verdictMatch = response.match(/VERDICT:\s*(SOUND|BUGGY|DEGENERATE)/i);
-    const issuesMatch = response.match(/ISSUES:\s*(.+)/is);
+    const sections = parseLabeledSections(response, ['VERDICT', 'ISSUES']);
+    const verdict = getLabeledSection(sections, 'VERDICT')?.toLowerCase();
+    const issues = getLabeledSection(sections, 'ISSUES') || 'none';
 
-    const status = (verdictMatch?.[1]?.toLowerCase() || 'sound') as ValidationVerdict['status'];
-    const issues = issuesMatch?.[1]?.trim() || 'none';
+    const status = (
+      verdict && ['sound', 'buggy', 'degenerate'].includes(verdict)
+        ? verdict
+        : 'sound'
+    ) as ValidationVerdict['status'];
 
     return { status, issues };
   } catch {
@@ -1341,11 +1683,11 @@ FOLLOW_UP: <If the method was broken: suggest how to fix it. If the method worke
 
   const response = result.content.trim();
 
-  const summaryMatch = response.match(/SUMMARY:\s*(.+?)(?=\nFOLLOW[_-]?UP:|$)/is);
-  const followUpMatch = response.match(/FOLLOW[_-]?UP:\s*(.+)/is);
+  const sections = parseLabeledSections(response, ['SUMMARY', 'FOLLOW_UP']);
+  const parsedSummary = getLabeledSection(sections, 'SUMMARY');
+  const followUpRaw = getLabeledSection(sections, 'FOLLOW_UP');
 
-  const summary = summaryMatch?.[1]?.trim() || response.slice(0, 300);
-  const followUpRaw = followUpMatch?.[1]?.trim() || null;
+  const summary = parsedSummary || response.slice(0, 300);
   const followUp = followUpRaw && !followUpRaw.includes('[NONE]') ? followUpRaw : null;
 
   // Generate personal reflection in Wired Lain's voice
@@ -1390,13 +1732,6 @@ write ONLY the reflection, nothing else.`;
 
 // ── Peer sharing ──────────────────────────────────────────────
 
-const SHARE_PEERS = [
-  { id: 'lain', name: 'Lain', url: 'http://localhost:3001' },       // Sister
-  { id: 'pkd', name: 'Philip K. Dick', url: 'http://localhost:3003' },
-  { id: 'mckenna', name: 'Terence McKenna', url: 'http://localhost:3004' },
-  { id: 'john', name: 'John', url: 'http://localhost:3005' },
-];
-
 /**
  * Share experiment results with a peer via peer message.
  * Always shares with Lain (sister); randomly picks one other inhabitant.
@@ -1406,27 +1741,39 @@ async function shareWithPeers(result: ExperimentResult): Promise<void> {
   const hasOutput = result.stdout.trim().length > 0;
   const success = result.exitCode === 0 && !result.timedOut && hasOutput;
 
-  // Always share with Lain
-  const targets = [SHARE_PEERS[0]!];
+  // Build peer list from manifest — inhabitants only, excluding Wired Lain (she's sharing).
+  const inhabitants = getInhabitants()
+    .filter(c => c.id !== 'wired-lain')
+    .map(c => ({ id: c.id, name: c.name, url: `http://localhost:${c.port}` }));
 
-  // Pick one random non-Lain peer
-  const others = SHARE_PEERS.slice(1);
-  const randomPeer = others[Math.floor(Math.random() * others.length)]!;
-  targets.push(randomPeer);
+  // Always share with Lain (sister) first; picks one random non-Lain peer second.
+  const lain = inhabitants.find(c => c.id === 'lain');
+  const others = inhabitants.filter(c => c.id !== 'lain');
+  const targets: Array<{ id: string; name: string; url: string }> = [];
+  if (lain) targets.push(lain);
+  if (others.length > 0) {
+    const randomPeer = others[Math.floor(Math.random() * others.length)]!;
+    targets.push(randomPeer);
+  }
 
   const outputSnippet = result.stdout.slice(0, 300).trim();
   const message = success
     ? `i ran an experiment... ${result.domain} — "${result.hypothesis}". ${result.analysis}${outputSnippet ? `\n\nsome of the output:\n${outputSnippet}` : ''}`
     : `tried an experiment on ${result.domain} — "${result.hypothesis}" but it ${result.timedOut ? 'timed out' : 'failed'}... ${result.analysis}`;
 
+  const headers = getInterlinkHeaders();
+  if (!headers) {
+    logger.debug('Experiment sharing skipped: interlink not configured');
+    return;
+  }
+  const fromId = process.env['LAIN_CHARACTER_ID']!;
   for (const peer of targets) {
     try {
-      const interlinkToken = process.env['LAIN_INTERLINK_TOKEN'] || '';
       await fetch(`${peer.url}/api/peer/message`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${interlinkToken}` },
+        headers,
         body: JSON.stringify({
-          fromId: 'wired-lain',
+          fromId,
           fromName: 'Wired Lain',
           message,
           timestamp: Date.now(),
@@ -1535,7 +1882,7 @@ async function phaseRecordAndIterate(result: ExperimentResult): Promise<void> {
   }
 
   logger.info(
-    { dailySpend: `$${getDailySpendUsd().toFixed(4)}` },
+    { monthlySpend: `$${getMonthlySpendUsd().toFixed(4)}` },
     'Experiment budget status'
   );
 }

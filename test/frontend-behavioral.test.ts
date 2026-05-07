@@ -46,13 +46,24 @@ describe('Chat client — API request format', () => {
 });
 
 describe('Chat client — session ID management', () => {
-  it('reads session ID from localStorage on load and initializes to null if absent', () => {
-    expect(appSrc).toContain('localStorage.getItem');
-    expect(appSrc).toMatch(/localStorage\.getItem\([^)]+\)\s*\|\|\s*null/);
+  it('reads session ID from localStorage on load and returns null when absent', () => {
+    // findings.md P2:3206 — sessionId reads go through readSession(),
+    // which reads the structured {id, createdAt, owner} payload from
+    // localStorage and returns null when the key is missing, the TTL
+    // has elapsed, or the owner flag changed.
+    expect(appSrc).toMatch(/function readSession\(key, owner\)/);
+    expect(appSrc).toMatch(/localStorage\.getItem\(key\)/);
+    expect(appSrc).toMatch(/if \(!raw\) return null;/);
+    expect(appSrc).toMatch(/let sessionId = readSession\(sessionStorageKey, IS_OWNER\)/);
   });
 
-  it('persists session ID to localStorage when received from server', () => {
-    expect(appSrc).toContain('localStorage.setItem(sessionStorageKey, sessionId)');
+  it('persists session ID to localStorage via writeSession when received from server', () => {
+    // findings.md P2:3206 — writes go through writeSession(key, id, owner)
+    // which serializes {id, createdAt, owner} so stale/cross-identity
+    // sessions can be dropped client-side.
+    expect(appSrc).toContain('writeSession(sessionStorageKey, sessionId, IS_OWNER)');
+    expect(appSrc).toMatch(/function writeSession\(key, id, owner\)/);
+    expect(appSrc).toMatch(/localStorage\.setItem\(key, JSON\.stringify\(\{ id, createdAt: Date\.now\(\), owner:/);
   });
 
   it('uses separate storage keys for Wired Lain vs Lain', () => {
@@ -264,8 +275,12 @@ describe('Commune map — activity panel', () => {
   });
 
   it('escapes HTML in activity entries', () => {
+    // findings.md P1:2725 — activity entries switched from
+    // innerHTML + escapeHtml to DOM construction (contentDiv.textContent
+    // = fullContent), which is inherently XSS-safe. The escapeHtml
+    // helper still exists for other innerHTML sites.
     expect(communeMapSrc).toContain('function escapeHtml');
-    expect(communeMapSrc).toContain('escapeHtml(fullContent)');
+    expect(communeMapSrc).toContain('contentDiv.textContent = fullContent');
   });
 });
 
@@ -314,7 +329,10 @@ describe('Commune map — chat modal', () => {
   });
 
   it('persists chat session per character in localStorage', () => {
-    expect(communeMapSrc).toContain("localStorage.setItem('stranger-session-'");
+    // findings.md P2:3206 — writes go through writeSession(), not a
+    // raw localStorage.setItem. Keys remain namespaced per character.
+    expect(communeMapSrc).toContain("writeSession('stranger-session-'");
+    expect(communeMapSrc).toContain("readSession('stranger-session-'");
     expect(communeMapSrc).toContain('stranger: true');
   });
 

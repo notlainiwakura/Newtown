@@ -5,7 +5,7 @@
  * Safe to re-run: memories that already have a wing_id are skipped.
  */
 
-import { query, execute } from '../storage/database.js';
+import { query, execute, transaction } from '../storage/database.js';
 import { deserializeEmbedding } from './embeddings.js';
 import {
   assignHall,
@@ -20,6 +20,17 @@ import { getLogger } from '../utils/logger.js';
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
+/**
+ * Per-row failure detail — written to migration-errors-<ts>.json by the runner
+ * scripts when `errors > 0`. findings.md P2:2928: previously the only signal on
+ * partial failure was exit code 1 and a scrape-able log line per row, which
+ * made "which memory IDs failed" an operator guess.
+ */
+export interface MigrationError {
+  id: string;
+  reason: string;
+}
+
 export interface MigrationStats {
   total: number;
   migrated: number;
@@ -28,6 +39,7 @@ export interface MigrationStats {
   wings: number;
   rooms: number;
   vecInserted: number;
+  errorDetails: MigrationError[];
 }
 
 // ─── Internal row shape ────────────────────────────────────────────────────────
@@ -78,6 +90,7 @@ export async function migrateMemoriesToPalace(): Promise<MigrationStats> {
   let skipped = 0;
   let errors = 0;
   let vecInserted = 0;
+  const errorDetails: MigrationError[] = [];
 
   // Determine starting rowid for vec0 inserts.
   const maxRowResult = query<{ max_rowid: number | null }>(
@@ -109,48 +122,71 @@ export async function migrateMemoriesToPalace(): Promise<MigrationStats> {
       // 1. Determine hall.
       const hall = assignHall(memoryType, sessionKey);
 
-      // 2. Resolve wing.
-      const { wingName, wingDescription } = resolveWingForMemory(
-        sessionKey,
-        row.user_id,
-        metadata,
-      );
+      // 2. Resolve wing. (resolveWing/resolveRoom are INSERT OR IGNORE +
+      //    SELECT — safe to run outside the transaction below; they act
+      //    as name-to-id resolution and are idempotent.)
+      const { wingName, wingDescription, roomName, roomDescription } =
+        resolveWingForMemory(sessionKey, row.user_id, metadata);
       const wingId = resolveWing(wingName, wingDescription);
       wingsSeen.add(wingId);
 
-      // 3. Resolve room (using hall name as room name within the wing).
-      const roomId = resolveRoom(wingId, hall, `${hall} room in wing ${wingName}`);
+      // 3. Resolve room (using hall name as room name within the wing,
+      //    unless the wing-resolver supplied an override — see
+      //    findings.md P2:652 for the shared `visitors` wing case).
+      const effectiveRoomName = roomName ?? hall;
+      const effectiveRoomDescription = roomDescription ?? `${hall} room in wing ${wingName}`;
+      const roomId = resolveRoom(wingId, effectiveRoomName, effectiveRoomDescription);
       roomsSeen.add(roomId);
 
-      // 4. UPDATE the memory row.
-      execute(
-        `UPDATE memories SET wing_id = ?, room_id = ?, hall = ? WHERE id = ?`,
-        [wingId, roomId, hall, row.id],
-      );
+      // 4–6. Atomic per-row mutations (findings.md P2:543). Before this
+      // wrap, steps 4/5/6 ran as independent auto-commits; a crash
+      // between them left the wing/room counters out of sync with the
+      // actual rows (incrementWingCount without a corresponding
+      // memories.wing_id UPDATE) or the vec0 index partially populated.
+      // Re-running in that state would double-count on the next row.
+      // With `transaction(() => { ... })` the whole set commits or
+      // none of it does — re-run is cleanly idempotent against
+      // `wing_id IS NOT NULL`.
+      let rowVecInserted = false;
+      let vecError: unknown = null;
+      transaction(() => {
+        // 4. UPDATE the memory row.
+        execute(
+          `UPDATE memories SET wing_id = ?, room_id = ?, hall = ? WHERE id = ?`,
+          [wingId, roomId, hall, row.id],
+        );
 
-      // 5. Increment counts.
-      incrementWingCount(wingId);
-      incrementRoomCount(roomId);
+        // 5. Increment counts.
+        incrementWingCount(wingId);
+        incrementRoomCount(roomId);
 
-      // 6. Insert embedding into vec0 table if present.
-      if (row.embedding !== null) {
-        try {
-          const embedding = deserializeEmbedding(row.embedding);
-          vecRowId++;
-          execute(
-            `INSERT INTO memory_embeddings (rowid, embedding, memory_id) VALUES (?, ?, ?)`,
-            [BigInt(vecRowId), embedding, row.id],
-          );
-          vecInserted++;
-        } catch (vecErr) {
-          logger.warn({ memoryId: row.id, error: vecErr }, 'Failed to insert embedding into vec0 table');
+        // 6. Insert embedding into vec0 table if present. vec0 insert
+        //    failures are not fatal — the memory is still usable via
+        //    sqlite fallback — so we note the error and commit the
+        //    rest of the row. The palace assignment in particular
+        //    (UPDATE + counters) is the load-bearing atomic unit.
+        if (row.embedding !== null) {
+          try {
+            const embedding = deserializeEmbedding(row.embedding);
+            vecRowId++;
+            execute(
+              `INSERT INTO memory_embeddings (rowid, embedding, memory_id) VALUES (?, ?, ?)`,
+              [BigInt(vecRowId), embedding, row.id],
+            );
+            rowVecInserted = true;
+          } catch (vecErr) {
+            vecError = vecErr;
+          }
         }
-      }
+      });
+      if (rowVecInserted) vecInserted++;
+      if (vecError) logger.warn({ memoryId: row.id, error: vecError }, 'Failed to insert embedding into vec0 table');
 
       migrated++;
     } catch (err) {
       logger.error({ memoryId: row.id, error: err }, 'Error migrating memory to palace');
       errors++;
+      errorDetails.push({ id: row.id, reason: err instanceof Error ? err.message : String(err) });
     }
   }
 
@@ -162,6 +198,7 @@ export async function migrateMemoriesToPalace(): Promise<MigrationStats> {
     wings: wingsSeen.size,
     rooms: roomsSeen.size,
     vecInserted,
+    errorDetails,
   };
 
   logger.info(stats, 'Memory palace migration complete');
@@ -200,7 +237,7 @@ const ASSOC_TO_PREDICATE: Record<string, string> = {
  *
  * Safe to re-run: checks for existing triples before inserting.
  */
-export function migrateAssociationsToKG(): { total: number; migrated: number; skipped: number; errors: number } {
+export function migrateAssociationsToKG(): { total: number; migrated: number; skipped: number; errors: number; errorDetails: MigrationError[] } {
   const logger = getLogger();
 
   const rows = query<AssociationMigrationRow>(
@@ -212,6 +249,7 @@ export function migrateAssociationsToKG(): { total: number; migrated: number; sk
   let migrated = 0;
   let skipped = 0;
   let errors = 0;
+  const errorDetails: MigrationError[] = [];
 
   for (const row of rows) {
     try {
@@ -243,11 +281,15 @@ export function migrateAssociationsToKG(): { total: number; migrated: number; sk
     } catch (err) {
       logger.warn({ sourceId: row.source_id, targetId: row.target_id, error: err }, 'Failed to migrate association to KG');
       errors++;
+      errorDetails.push({
+        id: `${row.source_id}→${row.target_id}`,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
-  const stats = { total: rows.length, migrated, skipped, errors };
-  logger.info(stats, 'Association → KG migration complete');
+  const stats = { total: rows.length, migrated, skipped, errors, errorDetails };
+  logger.info({ total: stats.total, migrated, skipped, errors }, 'Association → KG migration complete');
   return stats;
 }
 

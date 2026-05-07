@@ -81,3 +81,20 @@ export class AgentError extends LainError {
     this.name = 'AgentError';
   }
 }
+
+/**
+ * findings.md P2:511 — thrown when the LLM's extraction response
+ * cannot be parsed (no JSON array found, or `JSON.parse` fails).
+ * Callers can distinguish this from "extraction worked and found
+ * nothing interesting" and decide whether to retry.
+ */
+export class ExtractionParseError extends LainError {
+  constructor(
+    message: string,
+    public readonly rawResponse: string,
+    cause?: Error
+  ) {
+    super(message, 'EXTRACTION_PARSE_ERROR', cause);
+    this.name = 'ExtractionParseError';
+  }
+}

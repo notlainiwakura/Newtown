@@ -99,7 +99,17 @@ function rowToEntity(r: EntityRow): KGEntity {
 // ─── Triple CRUD ───────────────────────────────────────────────────────────────
 
 /**
- * Add a triple to the knowledge graph and return its generated ID.
+ * Add a triple to the knowledge graph and return its ID.
+ *
+ * findings.md P2:576 — if an active triple (`ended IS NULL`) with the same
+ * (subject, predicate, object) already exists, the existing row's ID is
+ * returned instead of inserting a duplicate. The earliest `valid_from` is
+ * preserved; new metadata keys are merged into the existing row (old keys
+ * are retained, overlapping keys are updated). Previously, callers that
+ * didn't pre-check via `queryTriples` (notably `maintainKnowledgeGraph`)
+ * produced duplicate rows on every maintenance pass, which in turn made
+ * `detectContradictions` emit phantom (A, A) pairs and `getEntityTimeline`
+ * return repeated events.
  */
 export function addTriple(
   subject: string,
@@ -111,8 +121,36 @@ export function addTriple(
   sourceMemoryId?: string | null,
   metadata?: Record<string, unknown>,
 ): string {
-  const id = nanoid(16);
   const now = Date.now();
+
+  // De-dup against active triples only. A previously-ended triple for the
+  // same (s,p,o) represents a closed temporal window; re-asserting the
+  // fact later is a legitimate new active row, not a duplicate.
+  const existing = queryOne<{ id: string; metadata: string }>(
+    `SELECT id, metadata FROM kg_triples
+     WHERE subject = ? AND predicate = ? AND object = ? AND ended IS NULL
+     ORDER BY valid_from ASC LIMIT 1`,
+    [subject, predicate, object],
+  );
+
+  if (existing) {
+    if (metadata && Object.keys(metadata).length > 0) {
+      let existingMeta: Record<string, unknown> = {};
+      try {
+        existingMeta = JSON.parse(existing.metadata) as Record<string, unknown>;
+      } catch {
+        // Corrupt metadata — overwrite with fresh object rather than crash.
+      }
+      const merged = { ...existingMeta, ...metadata };
+      execute(`UPDATE kg_triples SET metadata = ? WHERE id = ?`, [
+        JSON.stringify(merged),
+        existing.id,
+      ]);
+    }
+    return existing.id;
+  }
+
+  const id = nanoid(16);
   execute(
     `INSERT INTO kg_triples
        (id, subject, predicate, object, strength, valid_from, ended, source_memory_id, metadata)
@@ -202,6 +240,25 @@ export function getEntityTimeline(entityName: string, limit?: number): KGTriple[
 /**
  * Insert or update an entity. If the entity already exists, `last_seen` and
  * `metadata` are updated (upsert semantics).
+ *
+ * findings.md P2:590 — two bugs fixed here:
+ *
+ *   1. Metadata is **merged** (via `json_patch`), not replaced. Previously
+ *      an upsert with `{ topic: 'cats' }` would wipe any prior keys on the
+ *      row, including ones written by earlier callers.
+ *
+ *   2. `last_seen` uses `MAX(existing, incoming)`. Previously, calling
+ *      `addEntity(name, type, olderMemory.created_at)` while re-ingesting
+ *      a resurfaced older memory would **rewind** `last_seen` to that
+ *      older timestamp, breaking "most recently active" ordering in
+ *      `listEntities` and corrupting entity-timeline heuristics.
+ *
+ * `first_seen` is still left alone on conflict — the earliest observation
+ * of the entity is the load-bearing value for that column.
+ *
+ * `entity_type` is **not** upgraded on conflict (keeps first classification).
+ * See findings.md for rationale — a separate `reclassifyEntity` helper is
+ * the right escape hatch when an explicit change is wanted.
  */
 export function addEntity(
   name: string,
@@ -215,8 +272,8 @@ export function addEntity(
     `INSERT INTO kg_entities (name, entity_type, first_seen, last_seen, metadata)
      VALUES (?, ?, ?, ?, ?)
      ON CONFLICT(name) DO UPDATE SET
-       last_seen = excluded.last_seen,
-       metadata  = excluded.metadata`,
+       last_seen = MAX(kg_entities.last_seen, excluded.last_seen),
+       metadata  = json_patch(kg_entities.metadata, excluded.metadata)`,
     [name, entityType, ts, ts, JSON.stringify(metadata ?? {})],
   );
 }
@@ -259,9 +316,19 @@ export function listEntities(entityType?: string, limit?: number): KGEntity[] {
  *
  * Returns one Contradiction per conflicting pair. If a subject+predicate has
  * N conflicting objects, this returns N*(N-1)/2 pairs.
+ *
+ * findings.md P2:600 — "active" here means **currently** active, not just
+ * not-yet-ended. Forward-dated triples (`valid_from > now` with
+ * `ended IS NULL`) are scheduled facts that haven't taken effect yet;
+ * counting them as live contradictions produced phantom conflicts for
+ * callers that seeded future facts. The filter below adds `valid_from <= now`
+ * to both the GROUP BY probe and the detail-fetch.
  */
 export function detectContradictions(): Contradiction[] {
-  // Find subject+predicate combos with multiple active triples having distinct objects
+  const now = Date.now();
+
+  // Find subject+predicate combos with multiple currently-active triples
+  // having distinct objects.
   interface ConflictRow {
     subject: string;
     predicate: string;
@@ -270,17 +337,20 @@ export function detectContradictions(): Contradiction[] {
   const conflicts = query<ConflictRow>(
     `SELECT subject, predicate
      FROM kg_triples
-     WHERE ended IS NULL
+     WHERE ended IS NULL AND valid_from <= ?
      GROUP BY subject, predicate
      HAVING COUNT(DISTINCT object) > 1`,
+    [now],
   );
 
   const contradictions: Contradiction[] = [];
 
   for (const { subject, predicate } of conflicts) {
     const triples = query<TripleRow>(
-      `SELECT * FROM kg_triples WHERE subject = ? AND predicate = ? AND ended IS NULL ORDER BY valid_from ASC`,
-      [subject, predicate],
+      `SELECT * FROM kg_triples
+       WHERE subject = ? AND predicate = ? AND ended IS NULL AND valid_from <= ?
+       ORDER BY valid_from ASC`,
+      [subject, predicate, now],
     );
 
     // Emit every unique pair

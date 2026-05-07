@@ -33,6 +33,11 @@ export interface SlackConfig extends ChannelConfig {
   signingSecret: string;
   allowedUsers?: string[];
   allowedChannels?: string[];
+  /**
+   * Opt-in to public mode: when no allowlists are set, messages are
+   * denied by default unless this is `true`.
+   */
+  public?: boolean;
 }
 
 export class SlackChannel extends BaseChannel {
@@ -57,6 +62,22 @@ export class SlackChannel extends BaseChannel {
 
     logger.info({ channelId: this.id }, 'Connecting Slack bot');
 
+    const emptyAllowlists =
+      !this.config.allowedUsers?.length && !this.config.allowedChannels?.length;
+    if (emptyAllowlists) {
+      if (this.config.public === true) {
+        logger.warn(
+          { channelId: this.id },
+          'Slack channel running in PUBLIC mode — every workspace user can message this bot',
+        );
+      } else {
+        logger.warn(
+          { channelId: this.id },
+          'Slack channel has empty allowlists and public !== true — all incoming messages will be rejected. Set public: true or populate allowedUsers/allowedChannels.',
+        );
+      }
+    }
+
     this.app = new App({
       token: this.config.botToken,
       appToken: this.config.appToken,
@@ -66,23 +87,14 @@ export class SlackChannel extends BaseChannel {
 
     // Handle all messages
     this.app.message(async ({ message }) => {
-      const msg = message as SlackMessageEvent;
-
-      // Ignore bot messages
-      if (msg.bot_id) return;
-
-      const incoming = this.slackToIncoming(msg);
-      if (incoming && this.isAllowed(msg)) {
-        this.emitMessage(incoming);
-      }
+      this.acceptSlackEvent(message as SlackMessageEvent);
     });
 
-    // Handle direct messages
+    // findings.md P2:2586 — app_mention must share the same bot-filter and
+    // isAllowed gate as `message`; another bot @-mentioning us would otherwise
+    // bypass the allowlist entirely.
     this.app.event('app_mention', async ({ event }) => {
-      const incoming = this.slackToIncoming(event as SlackMessageEvent);
-      if (incoming) {
-        this.emitMessage(incoming);
-      }
+      this.acceptSlackEvent(event as SlackMessageEvent);
     });
 
     // Start the app
@@ -159,10 +171,19 @@ export class SlackChannel extends BaseChannel {
     }
   }
 
+  private acceptSlackEvent(msg: SlackMessageEvent): void {
+    if (msg.bot_id) return;
+    const incoming = this.slackToIncoming(msg);
+    if (incoming && this.isAllowed(msg)) {
+      this.emitMessage(incoming);
+    }
+  }
+
   private isAllowed(msg: SlackMessageEvent): boolean {
-    // If no restrictions, allow all
+    // Empty allowlists are fail-closed by default. Only allow all when
+    // the operator has explicitly set `public: true`.
     if (!this.config.allowedUsers?.length && !this.config.allowedChannels?.length) {
-      return true;
+      return this.config.public === true;
     }
 
     // Check user whitelist
@@ -192,35 +213,33 @@ export class SlackChannel extends BaseChannel {
     } else if (msg.files && msg.files.length > 0) {
       const file = msg.files[0]!;
       const mimeType = file.mimetype ?? 'application/octet-stream';
+      const filename = file.name ?? 'file';
 
-      if (mimeType.startsWith('image/')) {
-        const imageContent: IncomingMessage['content'] = {
-          type: 'image',
-          mimeType,
-        };
-        if (file.url_private) {
-          (imageContent as { url?: string }).url = file.url_private;
+      // findings.md P2:199 — Slack gives us url_private (auth-gated) but
+      // not always; downstream consumers need either a URL or base64
+      // bytes. Keep url_private when present; otherwise fall back to a
+      // text placeholder so we never emit a media content with no data
+      // pointer.
+      if (file.url_private) {
+        const url = file.url_private;
+        if (mimeType.startsWith('image/')) {
+          content = { type: 'image', mimeType, url };
+        } else if (mimeType.startsWith('audio/')) {
+          content = { type: 'audio', mimeType, url };
+        } else {
+          content = { type: 'file', mimeType, filename, url };
         }
-        content = imageContent;
-      } else if (mimeType.startsWith('audio/')) {
-        const audioContent: IncomingMessage['content'] = {
-          type: 'audio',
-          mimeType,
-        };
-        if (file.url_private) {
-          (audioContent as { url?: string }).url = file.url_private;
-        }
-        content = audioContent;
       } else {
-        const fileContent: IncomingMessage['content'] = {
-          type: 'file',
-          mimeType,
-          filename: file.name ?? 'file',
-        };
-        if (file.url_private) {
-          (fileContent as { url?: string }).url = file.url_private;
+        if (mimeType.startsWith('image/')) {
+          content = { type: 'text', text: '[image attachment]' } satisfies TextContent;
+        } else if (mimeType.startsWith('audio/')) {
+          content = { type: 'text', text: '[audio attachment]' } satisfies TextContent;
+        } else {
+          content = {
+            type: 'text',
+            text: '[file attachment: ' + filename + ']',
+          } satisfies TextContent;
         }
-        content = fileContent;
       }
     } else {
       return null;

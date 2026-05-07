@@ -3,9 +3,11 @@
  */
 
 import { access, constants } from 'node:fs/promises';
+import { join } from 'node:path';
 import { loadConfig, getPaths } from '../../config/index.js';
 import { getServerPid, isProcessRunning } from '../../gateway/server.js';
 import { getAuthToken } from '../../storage/keychain.js';
+import { getManifestPath, getAllCharacters } from '../../config/characters.js';
 import {
   displaySection,
   displayStatus,
@@ -51,7 +53,17 @@ export async function status(): Promise<void> {
       const config = await loadConfig();
       displayStatus('Version', config.version, true);
       displayStatus('Auth required', config.security.requireAuth ? 'Yes' : 'No', true);
-      displayStatus('Agents', config.agents.length.toString(), true);
+      // findings.md P2:78 / P2:171 — characters.json is now the only source
+      // for agent/character counts; the legacy `lain.json5 agents[]` field
+      // has been removed.
+      const manifestPath = getManifestPath();
+      if (manifestPath) {
+        const characters = getAllCharacters();
+        displayStatus('Characters (manifest)', characters.length.toString(), true);
+        displayStatus('Manifest', manifestPath, true);
+      } else {
+        displayStatus('Characters (manifest)', 'Not found — add characters.json', false);
+      }
     } catch (error) {
       displayStatus('Parse', `Error: ${error}`, false);
     }
@@ -84,25 +96,52 @@ export async function status(): Promise<void> {
   // Workspace status
   displaySection('Workspace');
 
-  let workspaceExists = false;
-  try {
-    await access(paths.workspace, constants.R_OK);
-    workspaceExists = true;
-  } catch {
-    // Workspace doesn't exist
-  }
-
-  displayStatus('Workspace', workspaceExists ? 'Found' : 'Not found', workspaceExists);
-  displayStatus('Path', paths.workspace, true);
-
-  if (workspaceExists) {
+  // findings.md P2:78 — when a characters.json is present, show each
+  // character's `workspace/characters/<id>/` subdir status; the legacy
+  // single-user `~/.lain/workspace/` layout only applies when no manifest
+  // exists.
+  const manifestPathForWorkspace = getManifestPath();
+  if (manifestPathForWorkspace) {
+    const characters = getAllCharacters();
     const files = ['SOUL.md', 'AGENTS.md', 'IDENTITY.md'];
-    for (const file of files) {
-      try {
-        await access(`${paths.workspace}/${file}`, constants.R_OK);
-        displayStatus(`  ${file}`, 'Present', true);
-      } catch {
-        displayStatus(`  ${file}`, 'Missing', false);
+    displayStatus('Layout', 'Multi-char town', true);
+    for (const c of characters) {
+      const base = join(process.cwd(), c.workspace);
+      const missing: string[] = [];
+      for (const f of files) {
+        try {
+          await access(join(base, f), constants.R_OK);
+        } catch {
+          missing.push(f);
+        }
+      }
+      if (missing.length === 0) {
+        displayStatus(`  ${c.id}`, 'OK', true);
+      } else {
+        displayStatus(`  ${c.id}`, `missing ${missing.join(', ')}`, false);
+      }
+    }
+  } else {
+    let workspaceExists = false;
+    try {
+      await access(paths.workspace, constants.R_OK);
+      workspaceExists = true;
+    } catch {
+      // Workspace doesn't exist
+    }
+
+    displayStatus('Workspace', workspaceExists ? 'Found' : 'Not found', workspaceExists);
+    displayStatus('Path', paths.workspace, true);
+
+    if (workspaceExists) {
+      const files = ['SOUL.md', 'AGENTS.md', 'IDENTITY.md'];
+      for (const file of files) {
+        try {
+          await access(`${paths.workspace}/${file}`, constants.R_OK);
+          displayStatus(`  ${file}`, 'Present', true);
+        } catch {
+          displayStatus(`  ${file}`, 'Missing', false);
+        }
       }
     }
   }

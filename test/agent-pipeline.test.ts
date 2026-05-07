@@ -11,13 +11,17 @@ vi.mock('../src/agent/self-concept.js', () => ({ getSelfConcept: vi.fn().mockRet
 vi.mock('../src/agent/internal-state.js', () => ({ getStateSummary: vi.fn().mockReturnValue(null), getPreoccupations: vi.fn().mockReturnValue([]) }));
 vi.mock('../src/commune/location.js', () => ({ getCurrentLocation: vi.fn().mockReturnValue({ building: 'cafe' }) }));
 vi.mock('../src/commune/buildings.js', () => ({ BUILDING_MAP: new Map([['cafe', { name: 'Cyberia Café', description: 'hazy' }]]) }));
-vi.mock('../src/commune/weather.js', () => ({ getCurrentWeather: vi.fn().mockReturnValue(null) }));
+vi.mock('../src/commune/weather.js', () => ({
+  getCurrentWeather: vi.fn().mockReturnValue(null),
+  getTownWeather: vi.fn().mockResolvedValue(null),
+  peekCachedTownWeather: vi.fn().mockReturnValue(null),
+  startTownWeatherRefreshLoop: vi.fn().mockReturnValue(() => {}),
+}));
 vi.mock('../src/agent/awareness.js', () => ({ buildAwarenessContext: vi.fn().mockResolvedValue(null) }));
 vi.mock('../src/agent/objects.js', () => ({ buildObjectContext: vi.fn().mockResolvedValue(null) }));
 vi.mock('../src/commune/building-memory.js', () => ({ buildBuildingResidueContext: vi.fn().mockResolvedValue(null) }));
 vi.mock('../src/events/town-events.js', () => ({ getActiveTownEvents: vi.fn().mockReturnValue([]) }));
 vi.mock('../src/events/bus.js', () => ({ eventBus: { emitActivity: vi.fn() } }));
-vi.mock('../src/agent/skills.js', () => ({ loadCustomTools: vi.fn().mockResolvedValue(0), saveCustomTool: vi.fn().mockResolvedValue(true), listCustomTools: vi.fn().mockResolvedValue([]), deleteCustomTool: vi.fn().mockResolvedValue(true) }));
 vi.mock('../src/agent/letter.js', () => ({ runLetterCycle: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('../src/agent/persona.js', () => ({ loadPersona: vi.fn().mockResolvedValue({ name: 'Lain', soul: 'I am Lain.', agents: '', identity: '' }), buildSystemPrompt: vi.fn().mockReturnValue('You are Lain.'), applyPersonaStyle: vi.fn().mockImplementation((t: string) => t) }));
 vi.mock('../src/providers/index.js', () => ({ createProvider: vi.fn() }));
@@ -33,7 +37,7 @@ import { recordMessage as _recordMessage, buildMemoryContext as _buildMemoryCont
 import { getSelfConcept as _getSelfConcept } from '../src/agent/self-concept.js';
 import { getStateSummary as _getStateSummary, getPreoccupations as _getPreoccupations } from '../src/agent/internal-state.js';
 import { getCurrentLocation as _getCurrentLocation } from '../src/commune/location.js';
-import { getCurrentWeather as _getCurrentWeather } from '../src/commune/weather.js';
+import { getCurrentWeather as _getCurrentWeather, getTownWeather as _getTownWeather } from '../src/commune/weather.js';
 import { buildAwarenessContext as _buildAwarenessContext } from '../src/agent/awareness.js';
 import { applyPersonaStyle as _applyPersonaStyle } from '../src/agent/persona.js';
 
@@ -47,12 +51,14 @@ const mockStateSummary = vi.mocked(_getStateSummary);
 const mockPreoccs = vi.mocked(_getPreoccupations);
 const mockGetLoc = vi.mocked(_getCurrentLocation);
 const mockWeather = vi.mocked(_getCurrentWeather);
+const mockTownWeather = vi.mocked(_getTownWeather);
 const mockAwareness = vi.mocked(_buildAwarenessContext);
 const mockStyle = vi.mocked(_applyPersonaStyle);
 
 function makeProvider(overrides: Partial<Provider> = {}): Provider {
   return {
-    name: 'mock', model: 'mock-model',
+    name: 'mock', model: 'mock-model', supportsStreaming: false,
+    getModelInfo: () => ({ contextWindow: 100000, maxOutputTokens: 4096, supportsVision: false, supportsStreaming: false, supportsTools: true }),
     complete: vi.fn().mockResolvedValue({ content: 'Summary.', finishReason: 'stop', usage: { inputTokens: 3, outputTokens: 3 } }),
     completeWithTools: vi.fn().mockResolvedValue({ content: 'Hello!', finishReason: 'stop', toolCalls: undefined, usage: { inputTokens: 10, outputTokens: 5 } }),
     continueWithToolResults: vi.fn().mockResolvedValue({ content: 'Done!', finishReason: 'stop', toolCalls: undefined, usage: { inputTokens: 5, outputTokens: 3 } }),
@@ -153,7 +159,7 @@ describe('executeTool', () => {
 
   it('executes tool and returns content', async () => { registerTool({ definition: { name: TN, description: 'x', inputSchema: {} }, handler: async () => 'result' }); const r = await executeTool(makeTc(TN)); expect(r.content).toBe('result'); expect(r.isError).toBeUndefined(); });
   it('error for unknown tool', async () => { const r = await executeTool(makeTc('__nope__')); expect(r.isError).toBe(true); expect(r.content).toContain('Unknown tool'); });
-  it('error when handler throws', async () => { registerTool({ definition: { name: TN, description: 'x', inputSchema: {} }, handler: async () => { throw new Error('boom'); } }); const r = await executeTool(makeTc(TN)); expect(r.isError).toBe(true); expect(r.content).toContain('boom'); });
+  it('error when handler throws', async () => { registerTool({ definition: { name: TN, description: 'x', inputSchema: {} }, handler: async () => { throw new Error('boom'); } }); const r = await executeTool(makeTc(TN)); expect(r.isError).toBe(true); expect(r.content).not.toContain('boom'); expect(r.content).toMatch(/incident [0-9a-f]+/); });
   it('toolCallId matches input id', async () => { registerTool({ definition: { name: TN, description: 'x', inputSchema: {} }, handler: async () => 'ok' }); expect((await executeTool({ id: 'my-id', name: TN, input: {} })).toolCallId).toBe('my-id'); });
   it('passes input to handler', async () => { let got: Record<string, unknown> = {}; registerTool({ definition: { name: TN, description: 'x', inputSchema: {} }, handler: async (i) => { got = i; return 'ok'; } }); await executeTool({ id: 'x', name: TN, input: { k: 'v' } }); expect(got['k']).toBe('v'); });
 });
@@ -203,7 +209,20 @@ describe('agent init & state', () => {
   it('getProvider defined after init', async () => { await initAgent(BASE_CFG); expect(getProvider('default', 'personality')).toBeDefined(); });
   it('getProvider falls back for missing tier', async () => { await initAgent(BASE_CFG); expect(getProvider('default', 'light')).not.toBeNull(); });
   it('shutdownAgents clears state', async () => { await initAgent(BASE_CFG); shutdownAgents(); expect(isAgentInitialized('default')).toBe(false); });
-  it('handles provider creation failure gracefully', async () => { mockCP.mockImplementationOnce(() => { throw new Error('no key'); }); await expect(initAgent(BASE_CFG)).resolves.not.toThrow(); });
+  // findings.md P2:1737 — no-silent-echo-mode. Used to swallow provider init
+  // failure and silently boot into echo mode; now crashes loud so systemd
+  // restarts and the failure is visible in unit logs.
+  it('findings.md P2:1737 — initAgent throws when no providers init', async () => { mockCP.mockImplementationOnce(() => { throw new Error('no key'); }); await expect(initAgent(BASE_CFG)).rejects.toThrow(/no providers could be initialized/); });
+  it('findings.md P2:1737 — error message names tier, type, model', async () => { mockCP.mockImplementationOnce(() => { throw new Error('no key'); }); await expect(initAgent(BASE_CFG)).rejects.toThrow(/personality:anthropic\/test/); });
+  // findings.md P2:1727 — single-tenant invariant. A second init in
+  // the same process used to silently add dead state.
+  it('findings.md P2:1727 — initAgent throws on double-init', async () => {
+    mockCP.mockReturnValue(makeProvider());
+    await initAgent(BASE_CFG);
+    await expect(initAgent({ ...BASE_CFG, id: 'other' })).rejects.toThrow(/single-tenant/);
+    shutdownAgents();
+    await expect(initAgent(BASE_CFG)).resolves.not.toThrow();
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════
@@ -217,7 +236,9 @@ describe('processMessage — echo mode', () => {
   it('returns sessionKey', async () => { expect((await processMessage(makeRequest('hello'))).sessionKey).toBe('test-session'); });
   it('returns at least one message', async () => { expect((await processMessage(makeRequest('hi'))).messages.length).toBeGreaterThanOrEqual(1); });
   it('greeting response for hello', async () => { const c = (await processMessage(makeRequest('hello'))).messages[0]?.content; if (c && 'text' in c) expect(c.text).toMatch(/hello/i); });
-  it('self-intro for who-are-you', async () => { const c = (await processMessage(makeRequest('who are you'))).messages[0]?.content; if (c && 'text' in c) expect(c.text).toContain('lain'); });
+  // findings.md P2:1747 — generic echo copy. Used to say "i'm lain...lain iwakura"
+  // which leaked identity on non-Lain characters. Must not claim any identity.
+  it('self-intro for who-are-you is character-agnostic', async () => { const c = (await processMessage(makeRequest('who are you'))).messages[0]?.content; if (c && 'text' in c) { expect(c.text.toLowerCase()).not.toContain('lain'); expect(c.text.toLowerCase()).not.toContain('iwakura'); } });
   it('fallback echo for unknown', async () => { const c = (await processMessage(makeRequest('xyzzy'))).messages[0]?.content; if (c && 'text' in c) expect(c.text).toContain('xyzzy'); });
   it('echo for non-text content', async () => { const req = { ...makeRequest(), message: { ...makeRequest().message, content: { type: 'image' as const, mimeType: 'image/jpeg' } } }; const c = (await processMessage(req)).messages[0]?.content; if (c && 'text' in c) expect(typeof c.text).toBe('string'); });
   it('replyTo matches message id', async () => { expect((await processMessage(makeRequest('hi'))).messages[0]?.replyTo).toBe('msg-1'); });
@@ -232,7 +253,7 @@ describe('processMessage — with provider', () => {
   it('applyPersonaStyle called', async () => { await processMessage(makeRequest('hi')); expect(mockStyle).toHaveBeenCalledWith('Hello!'); });
   it('recordMessage called for user', async () => { await processMessage(makeRequest('hello')); expect(mockRecordMsg).toHaveBeenCalledWith('test-session', 'user', 'hello', expect.any(Object)); });
   it('recordMessage called for assistant', async () => { await processMessage(makeRequest('hi')); expect(mockRecordMsg).toHaveBeenCalledWith('test-session', 'assistant', expect.any(String)); });
-  it('buildMemoryContext called with content', async () => { await processMessage(makeRequest('query')); expect(mockMemCtx).toHaveBeenCalledWith('query', 'test-session'); });
+  it('buildMemoryContext called with content', async () => { mockMemCtx.mockClear(); await processMessage(makeRequest('query')); expect(mockMemCtx).toHaveBeenCalledWith('query', 'test-session', expect.anything()); });
   it('provider called after memory context injected', async () => { mockMemCtx.mockResolvedValueOnce('## Mem'); await processMessage(makeRequest('hi')); expect(getProvider('default', 'personality')!.completeWithTools).toHaveBeenCalled(); });
   it('error returns error message', async () => { mockCP.mockReturnValue(makeProvider({ completeWithTools: vi.fn().mockRejectedValue(new Error('fail')) })); shutdownAgents(); await initAgent(BASE_CFG); const c = (await processMessage(makeRequest('hi'))).messages[0]?.content; if (c && 'text' in c) expect(c.text).toContain('went wrong'); });
   it('error has no tokenUsage', async () => { mockCP.mockReturnValue(makeProvider({ completeWithTools: vi.fn().mockRejectedValue(new Error('fail')) })); shutdownAgents(); await initAgent(BASE_CFG); expect((await processMessage(makeRequest('hi'))).tokenUsage).toBeUndefined(); });
@@ -294,11 +315,13 @@ describe('processMessage — tool loop', () => {
     expect(ctwr).not.toHaveBeenCalled();
   });
 
-  it('length finishReason still returns content', async () => {
-    mockCP.mockReturnValue(makeProvider({ completeWithTools: vi.fn().mockResolvedValue({ content: 'partial...', finishReason: 'length', toolCalls: undefined, usage: { inputTokens: 10, outputTokens: 8192 } }) }));
+  it('length finishReason requests continuation instead of returning only partial content', async () => {
+    const complete = vi.fn().mockResolvedValue({ content: ' finished.', finishReason: 'stop', usage: { inputTokens: 4, outputTokens: 2 } });
+    mockCP.mockReturnValue(makeProvider({ completeWithTools: vi.fn().mockResolvedValue({ content: 'partial...', finishReason: 'length', toolCalls: undefined, usage: { inputTokens: 10, outputTokens: 8192 } }), complete }));
     shutdownAgents(); await initAgent(BASE_CFG);
     const c = (await processMessage(makeRequest('novel'))).messages[0]?.content;
-    if (c && 'text' in c) expect(c.text).toContain('partial');
+    if (c && 'text' in c) expect(c.text).toBe('partial... finished.');
+    expect(complete).toHaveBeenCalled();
   });
 });
 
@@ -319,7 +342,7 @@ describe('processMessageStream — with provider', () => {
   afterEach(() => { shutdownAgents(); clearConversation('test-session'); });
 
   it('onChunk called with content', async () => { const chunks: string[] = []; await processMessageStream(makeRequest('hi'), c => chunks.push(c)); expect(chunks.join('')).toContain('Hello!'); });
-  it('uses completeWithToolsStream when present', async () => { const sf = vi.fn().mockImplementation(async (_: unknown, cb: (c: string) => void) => { cb('stream'); return { content: 'stream', finishReason: 'stop', toolCalls: undefined, usage: { inputTokens: 3, outputTokens: 3 } }; }); mockCP.mockReturnValue(makeProvider({ completeWithToolsStream: sf })); shutdownAgents(); await initAgent(BASE_CFG); const chunks: string[] = []; await processMessageStream(makeRequest('hi'), c => chunks.push(c)); expect(sf).toHaveBeenCalled(); expect(chunks).toContain('stream'); });
+  it('uses completeWithToolsStream when present (findings.md P2:818)', async () => { const sf = vi.fn().mockImplementation(async (_: unknown, cb: (c: string) => void) => { cb('stream'); return { content: 'stream', finishReason: 'stop', toolCalls: undefined, usage: { inputTokens: 3, outputTokens: 3 } }; }); mockCP.mockReturnValue(makeProvider({ supportsStreaming: true, completeWithToolsStream: sf })); shutdownAgents(); await initAgent(BASE_CFG); const chunks: string[] = []; await processMessageStream(makeRequest('hi'), c => chunks.push(c)); expect(sf).toHaveBeenCalled(); expect(chunks).toContain('stream'); });
   it('onChunk called with error on provider failure', async () => { mockCP.mockReturnValue(makeProvider({ completeWithTools: vi.fn().mockRejectedValue(new Error('fail')) })); shutdownAgents(); await initAgent(BASE_CFG); const chunks: string[] = []; await processMessageStream(makeRequest('hi'), c => chunks.push(c)); expect(chunks.join('')).toContain('went wrong'); });
   it('returns full AgentResponse', async () => { const r = await processMessageStream(makeRequest('hi'), () => {}); expect(r.messages).toHaveLength(1); expect(r.sessionKey).toBe('test-session'); });
   it('tokenUsage present on success', async () => { expect((await processMessageStream(makeRequest('hi'), () => {})).tokenUsage?.total).toBe(15); });
@@ -349,8 +372,8 @@ describe('context building', () => {
   it('low-intensity preoccupation not injected', async () => { mockPreoccs.mockReturnValueOnce([{ thread: 'faint whisper', origin: 'x', intensity: 0.3 }]); await processMessage(makeRequest('hi')); expect(getSysPrompt()).not.toContain('faint whisper'); });
   it('getCurrentLocation called', async () => { await processMessage(makeRequest('hi')); expect(mockGetLoc).toHaveBeenCalled(); });
   it('location injected when building found', async () => { mockGetLoc.mockReturnValueOnce({ building: 'cafe' }); await processMessage(makeRequest('hi')); expect(getSysPrompt()).toContain('Cyberia Café'); });
-  it('non-overcast weather injected', async () => { mockWeather.mockReturnValueOnce({ condition: 'rain', description: 'Grey drizzle.' }); await processMessage(makeRequest('hi')); expect(getSysPrompt()).toContain('Grey drizzle.'); });
-  it('overcast weather not injected', async () => { mockWeather.mockReturnValueOnce({ condition: 'overcast', description: 'Overcast skies.' }); await processMessage(makeRequest('hi')); expect(getSysPrompt()).not.toContain('Overcast skies.'); });
+  it('non-overcast weather injected', async () => { mockTownWeather.mockResolvedValueOnce({ condition: 'rain', description: 'Grey drizzle.', intensity: 0.5, computed_at: Date.now() }); await processMessage(makeRequest('hi')); expect(getSysPrompt()).toContain('Grey drizzle.'); void mockWeather; });
+  it('overcast weather not injected', async () => { mockTownWeather.mockResolvedValueOnce({ condition: 'overcast', description: 'Overcast skies.', intensity: 0.5, computed_at: Date.now() }); await processMessage(makeRequest('hi')); expect(getSysPrompt()).not.toContain('Overcast skies.'); });
   it('awareness injected when peer config present', async () => { mockAwareness.mockResolvedValueOnce('\n\n[Nearby: X]'); const orig = process.env['PEER_CONFIG']; process.env['PEER_CONFIG'] = JSON.stringify([{ id: 'wired-lain', url: 'http://localhost:3000' }]); await processMessage(makeRequest('hi')); expect(mockAwareness).toHaveBeenCalled(); process.env['PEER_CONFIG'] = orig; });
   it('buildMemoryContext failure handled gracefully', async () => { mockMemCtx.mockRejectedValueOnce(new Error('db')); await expect(processMessage(makeRequest('hi'))).resolves.toBeDefined(); });
   it('shouldExtractMemories triggers processConversationEnd', async () => { mockShouldExtract.mockReturnValueOnce(true); await processMessage(makeRequest('hi')); await new Promise(r => setTimeout(r, 50)); expect(mockProcEnd).toHaveBeenCalled(); });

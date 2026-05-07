@@ -86,6 +86,7 @@ vi.mock('../src/providers/index.js', () => ({
   createProvider: vi.fn().mockReturnValue({
     name: 'mock',
     model: 'mock-model',
+    supportsStreaming: true,
     complete: vi.fn().mockResolvedValue({
       content: '{"clinicalSummary":"all good","concerns":[],"letterRecommendation":"allow","metrics":{"sessions":1,"memories":5,"dreams":3,"curiosityRuns":1},"emotionalLandscape":"stable"}',
       finishReason: 'stop',
@@ -153,8 +154,8 @@ describe('Doctor Tools — getDoctorToolDefinitions', () => {
     const tools = getDoctorToolDefinitions();
     const names = new Set(tools.map(t => t.name));
     for (const expected of [
-      'run_diagnostic_tests', 'check_service_health', 'get_health_status',
-      'get_telemetry', 'read_file', 'edit_file', 'run_command', 'get_reports',
+      'check_service_health', 'get_health_status',
+      'get_telemetry', 'read_file', 'get_reports',
     ]) {
       expect(names.has(expected)).toBe(true);
     }
@@ -170,14 +171,12 @@ describe('Doctor Tools — getDoctorToolDefinitions', () => {
     }
   });
 
-  it('required parameters are correct for read_file, edit_file, run_command, get_reports', async () => {
+  it('required parameters are correct for read_file, get_reports', async () => {
     const { getDoctorToolDefinitions } = await import('../src/agent/doctor-tools.js');
     const tools = getDoctorToolDefinitions();
     const get = (name: string) => tools.find(t => t.name === name)!.inputSchema as { required?: string[] };
 
     expect(get('read_file').required).toContain('path');
-    expect(get('run_command').required).toContain('command');
-    expect(get('edit_file').required).toEqual(expect.arrayContaining(['path', 'old_text', 'new_text']));
     expect(get('get_reports').required).toContain('action');
   });
 });
@@ -257,26 +256,6 @@ describe('Doctor Tools — executeDoctorTool', () => {
       input: { path: 'src/some-file.exe' },
     });
     expect(result.content).toContain('not allowed');
-  });
-
-  it('run_command blocks dangerous rm -rf /', async () => {
-    const { executeDoctorTool } = await import('../src/agent/doctor-tools.js');
-    const result = await executeDoctorTool({
-      id: 'call_7',
-      name: 'run_command',
-      input: { command: 'rm -rf /' },
-    });
-    expect(result.content).toContain('blocked');
-  });
-
-  it('run_command blocks sudo commands', async () => {
-    const { executeDoctorTool } = await import('../src/agent/doctor-tools.js');
-    const result = await executeDoctorTool({
-      id: 'call_8',
-      name: 'run_command',
-      input: { command: 'sudo reboot' },
-    });
-    expect(result.content).toContain('blocked');
   });
 
   it('executeDoctorTools runs multiple tool calls in parallel', async () => {
@@ -497,7 +476,8 @@ describe('Doctor Server — isOwner / auth logic', () => {
   it('isOwner returns false when LAIN_OWNER_TOKEN is not set', async () => {
     delete process.env['LAIN_OWNER_TOKEN'];
     const { isOwner } = await import('../src/web/owner-auth.js');
-    const mockReq = { headers: { cookie: 'lain_owner=abc' } } as unknown as import('node:http').IncomingMessage;
+    const { makeV2Cookie } = await import('./fixtures/owner-cookie-v2.js');
+    const mockReq = { headers: { cookie: makeV2Cookie('secret') } } as unknown as import('node:http').IncomingMessage;
     expect(isOwner(mockReq)).toBe(false);
   });
 
@@ -508,39 +488,30 @@ describe('Doctor Server — isOwner / auth logic', () => {
     expect(isOwner(mockReq)).toBe(false);
   });
 
-  it('isOwner returns false for wrong cookie value', async () => {
+  it('isOwner returns false for wrong-token signature', async () => {
     process.env['LAIN_OWNER_TOKEN'] = 'secret';
     const { isOwner } = await import('../src/web/owner-auth.js');
+    const { makeV2Cookie } = await import('./fixtures/owner-cookie-v2.js');
     const mockReq = {
-      headers: { cookie: 'lain_owner=wrongvalue' },
+      headers: { cookie: makeV2Cookie('secret', { signWith: 'different' }) },
     } as unknown as import('node:http').IncomingMessage;
     expect(isOwner(mockReq)).toBe(false);
   });
 
-  it('isOwner returns true for correct HMAC cookie', async () => {
+  it('isOwner returns true for correct v2 cookie', async () => {
     process.env['LAIN_OWNER_TOKEN'] = 'test-token-123';
-    const { isOwner, deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    const correctCookie = deriveOwnerCookie('test-token-123');
+    const { isOwner } = await import('../src/web/owner-auth.js');
+    const { makeV2Cookie } = await import('./fixtures/owner-cookie-v2.js');
     const mockReq = {
-      headers: { cookie: `lain_owner=${correctCookie}` },
+      headers: { cookie: makeV2Cookie('test-token-123') },
     } as unknown as import('node:http').IncomingMessage;
     expect(isOwner(mockReq)).toBe(true);
   });
 
-  it('deriveOwnerCookie returns a hex string', async () => {
-    const { deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    const cookie = deriveOwnerCookie('some-token');
-    expect(/^[a-f0-9]+$/.test(cookie)).toBe(true);
-  });
-
-  it('deriveOwnerCookie is deterministic for same token', async () => {
-    const { deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    expect(deriveOwnerCookie('my-token')).toBe(deriveOwnerCookie('my-token'));
-  });
-
-  it('deriveOwnerCookie produces different values for different tokens', async () => {
-    const { deriveOwnerCookie } = await import('../src/web/owner-auth.js');
-    expect(deriveOwnerCookie('token-a')).not.toBe(deriveOwnerCookie('token-b'));
+  it('v2 cookie signature is token-specific (different tokens → different sigs)', async () => {
+    const { makeV2CookieValue } = await import('./fixtures/owner-cookie-v2.js');
+    const fixedOpts = { nonce: 'n', iat: 1 };
+    expect(makeV2CookieValue('token-a', fixedOpts)).not.toBe(makeV2CookieValue('token-b', fixedOpts));
   });
 });
 

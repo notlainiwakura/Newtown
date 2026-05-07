@@ -127,7 +127,7 @@ describe('Config field permutations', () => {
       requireAuth: true, tokenLength: 32, inputSanitization: true, maxMessageLength: 100000,
       keyDerivation: { algorithm: 'argon2id' as const, memoryCost: 65536, timeCost: 3, parallelism: 4 },
     },
-    agents: [{ id: 'default', name: 'Test', enabled: true, workspace: '/tmp', providers: [{ type: 'anthropic' as const, model: 'claude-sonnet-4-6' }] }],
+    // findings.md P2:171 — `agents` removed from LainConfig.
     logging: { level: 'info' as const, prettyPrint: true },
   });
 
@@ -136,7 +136,8 @@ describe('Config field permutations', () => {
     expect(() => validate(baseValidConfig())).not.toThrow();
   });
 
-  describe.each(['version', 'gateway', 'security', 'agents', 'logging'] as const)('missing top-level: %s', (field) => {
+  // findings.md P2:171 — `agents` removed from LainConfig's required fields.
+  describe.each(['version', 'gateway', 'security', 'logging'] as const)('missing top-level: %s', (field) => {
     it('throws ValidationError', async () => {
       const { validate } = await import('../src/config/schema.js');
       const cfg = baseValidConfig() as Record<string, unknown>;
@@ -195,32 +196,10 @@ describe('Config field permutations', () => {
     expect(() => validate({ ...baseValidConfig(), logging: { level: 'verbose' as 'info', prettyPrint: false } })).toThrow();
   });
 
-  describe.each(['anthropic', 'openai', 'google'] as const)('provider type=%s', (type) => {
-    it('is accepted', async () => {
-      const { validate } = await import('../src/config/schema.js');
-      const cfg = baseValidConfig();
-      cfg.agents[0]!.providers[0]!.type = type;
-      expect(() => validate(cfg)).not.toThrow();
-    });
-  });
-
-  describe.each([
-    { id: 'my-agent', valid: true }, { id: 'agent123', valid: true },
-    { id: 'My Agent', valid: false }, { id: 'AGENT', valid: false }, { id: '', valid: false },
-  ])('agent id "$id" valid=$valid', ({ id, valid }) => {
-    it(valid ? 'is accepted' : 'is rejected', async () => {
-      const { validate } = await import('../src/config/schema.js');
-      const cfg = baseValidConfig();
-      cfg.agents[0]!.id = id;
-      if (valid) expect(() => validate(cfg)).not.toThrow();
-      else expect(() => validate(cfg)).toThrow();
-    });
-  });
-
-  it('throws when agents array is empty', async () => {
-    const { validate } = await import('../src/config/schema.js');
-    expect(() => validate({ ...baseValidConfig(), agents: [] })).toThrow();
-  });
+  // findings.md P2:171 — provider-type and agent-id validation moved to
+  // the character manifest. See test/config-system.test.ts for the
+  // equivalent validateManifest-based tests; they are the single source
+  // of truth for that validation and don't need duplication here.
 
   it('throws when keyDerivation.algorithm is not argon2id', async () => {
     const { validate } = await import('../src/config/schema.js');
@@ -572,12 +551,12 @@ describe('Sanitizer config × input permutations', () => {
     });
   });
 
+  // findings.md P2:1222 — structuralFraming is a no-op; both values preserve input.
   describe.each([true, false])('structuralFraming=%s', (structuralFraming) => {
-    it('escapes XML tags when on', async () => {
+    it('preserves input verbatim (no escaping)', async () => {
       const { sanitize } = await import('../src/security/sanitizer.js');
       const r = sanitize('<script>x</script>', { blockPatterns: false, warnPatterns: false, structuralFraming });
-      if (structuralFraming) expect(r.sanitized).toContain('&lt;script&gt;');
-      else expect(r.sanitized).toBe('<script>x</script>');
+      expect(r.sanitized).toBe('<script>x</script>');
     });
   });
 
@@ -618,17 +597,7 @@ describe('Sanitizer config × input permutations', () => {
     });
   });
 
-  it('analyzeRisk returns high for injection input', async () => {
-    const { analyzeRisk } = await import('../src/security/sanitizer.js');
-    const r = analyzeRisk(injectionInput);
-    expect(r.riskLevel).toBe('high');
-    expect(r.indicators.length).toBeGreaterThan(0);
-  });
-
-  it('analyzeRisk returns low for clean input', async () => {
-    const { analyzeRisk } = await import('../src/security/sanitizer.js');
-    expect(analyzeRisk(cleanInput).riskLevel).toBe('low');
-  });
+  // findings.md P2:1250 — analyzeRisk tests removed along with the dead function.
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -710,40 +679,8 @@ describe('SSRF URL scheme × target type permutations', () => {
     });
   });
 
-  describe.each([
-    { url: 'https://example.com/path', ok: true },
-    { url: 'http://example.com/', ok: true },
-    { url: 'ftp://example.com/', ok: false },
-    { url: 'javascript:void(0)', ok: false },
-    { url: 'not a url', ok: false },
-    { url: 'https://user:pass@example.com', ok: true },
-  ])('sanitizeURL("$url") ok=$ok', ({ url, ok }) => {
-    it('returns string or null', async () => {
-      const { sanitizeURL } = await import('../src/security/ssrf.js');
-      const r = sanitizeURL(url);
-      expect(r !== null).toBe(ok);
-    });
-  });
-
-  it('sanitizeURL strips credentials', async () => {
-    const { sanitizeURL } = await import('../src/security/ssrf.js');
-    const r = sanitizeURL('https://user:password@example.com/path');
-    expect(r).not.toContain('user');
-    expect(r).not.toContain('password');
-  });
-
-  describe.each([
-    { url: 'https://example.com/p', domains: ['example.com'], expected: true },
-    { url: 'https://sub.example.com/p', domains: ['example.com'], expected: true },
-    { url: 'https://notexample.com/', domains: ['example.com'], expected: false },
-    { url: 'https://example.com.evil.com/', domains: ['example.com'], expected: false },
-    { url: 'invalid-url', domains: ['example.com'], expected: false },
-  ])('isAllowedDomain $url in $domains = $expected', ({ url, domains, expected }) => {
-    it('correctly checks allowlist', async () => {
-      const { isAllowedDomain } = await import('../src/security/ssrf.js');
-      expect(isAllowedDomain(url, domains)).toBe(expected);
-    });
-  });
+  // findings.md P2:1305 — sanitizeURL/isAllowedDomain matrices removed
+  // alongside the dead exports they exercised.
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

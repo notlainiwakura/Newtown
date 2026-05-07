@@ -1,5 +1,5 @@
 /**
- * NEWTOWN GAME — Boot Scene
+ * LAINTOWN GAME — Boot Scene
  * Generate procedural sprites and tilemap.
  * Isometric: flat tiles 128x64 diamonds, wall/forest blocks 128x96.
  */
@@ -13,7 +13,7 @@ class BootScene extends Phaser.Scene {
     this.authData = data;
   }
 
-  create() {
+  async create() {
     const cx = GAME_CONFIG.WIDTH / 2;
     const cy = GAME_CONFIG.HEIGHT / 2;
 
@@ -22,6 +22,8 @@ class BootScene extends Phaser.Scene {
       fontFamily: 'monospace',
       color: GAME_THEME.uiBorder,
     }).setOrigin(0.5);
+
+    await loadCharacterManifest();
 
     this._generateTileset();
     this._generateCharacterSprites();

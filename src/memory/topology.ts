@@ -16,6 +16,7 @@ import {
   setLifecycleState,
   getMemoriesByLifecycle,
   getAllCoherenceGroups,
+  getCoherenceGroup,
   getGroupMembers,
   createCoherenceGroup,
   addToCoherenceGroup,
@@ -199,10 +200,15 @@ function mergeOverlappingGroups(): number {
         deletedIds.add(b.id);
         mergedCount++;
 
-        // Recompute a's centroid
+        // Recompute a's centroid + refresh the local copy via a point
+        // lookup. findings.md P2:676 — the previous code queried
+        // getAllCoherenceGroups(1) and .find(g => g.id === a.id), but
+        // limit-1 almost never returned group `a` (ordering is by
+        // member_count DESC, not by id), so the .find was ~always
+        // undefined and `a.signature` stayed stale for every
+        // subsequent merge comparison in the same loop.
         recomputeGroupCentroid(a.id);
-        // Update a's signature in our local reference
-        const updated = getAllCoherenceGroups(1).find((g) => g.id === a.id);
+        const updated = getCoherenceGroup(a.id);
         if (updated) {
           a.signature = updated.signature;
           a.memberCount = updated.memberCount;
@@ -215,11 +221,22 @@ function mergeOverlappingGroups(): number {
 }
 
 /**
+ * Grace period for newly-formed coherence groups before they become
+ * eligible for "< 2 members → dissolve" pruning. findings.md P2:694:
+ * formCoherenceGroups seeds new groups with a single memory; without
+ * this window the next pruneIncoherentMembers call would dissolve
+ * every single-member group before it could accrue a second member.
+ */
+const COHERENCE_GROUP_SEED_GRACE_MS = 24 * 60 * 60 * 1000;
+
+/**
  * Remove members with < 0.4 similarity to their group centroid.
- * Dissolve groups with < 2 members.
+ * Dissolve groups with < 2 members — but only once they've had a
+ * grace window to accrue a second member (P2:694).
  */
 function pruneIncoherentMembers(): number {
   const groups = getAllCoherenceGroups(100);
+  const now = Date.now();
   let prunedCount = 0;
 
   for (const group of groups) {
@@ -240,7 +257,12 @@ function pruneIncoherentMembers(): number {
     // Check if group is too small after pruning
     const remainingMembers = getGroupMembers(group.id);
     if (remainingMembers.length < 2) {
-      deleteCoherenceGroup(group.id);
+      const ageMs = now - group.createdAt;
+      if (ageMs >= COHERENCE_GROUP_SEED_GRACE_MS) {
+        deleteCoherenceGroup(group.id);
+      }
+      // else: within grace window, let it keep its single seed and
+      // wait for formCoherenceGroups to match a second memory.
     } else {
       recomputeGroupCentroid(group.id);
     }

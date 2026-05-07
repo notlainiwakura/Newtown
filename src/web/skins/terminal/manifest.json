@@ -4,9 +4,9 @@
   "description": "CRT green-on-black, scanlines, retro terminal",
   "fonts": { "heading": "VT323", "body": "VT323", "mono": "VT323" },
   "buildingIcons": {
-    "pub": "[PUB]", "station": "[STA]", "abandoned-house": "[HSE]", "field": "[FLD]",
-    "windmill": "[WND]", "locksmith": "[LCK]", "mystery-tower": "[TWR]", "theater": "[THR]", "square": "[SQR]"
+    "library": "[LIB]", "bar": "[BAR]", "field": "[FLD]", "windmill": "[WND]",
+    "lighthouse": "[LHT]", "school": "[SCH]", "market": "[MKT]", "locksmith": "[LCK]", "threshold": "[THR]"
   },
   "googleFontsUrl": "https://fonts.googleapis.com/css2?family=VT323&display=swap",
-  "previewColors": ["#00ffaa", "#ffee44", "#66ddff"]
+  "previewColors": ["#00cc44", "#00ff55", "#008833"]
 }

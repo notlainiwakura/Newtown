@@ -176,9 +176,8 @@ async function readNewspaper(newspaper: Newspaper, config: NewspaperConfig): Pro
     content = content.slice(0, 2000) + '\n\n[...truncated]';
   }
 
-  const paperName = config.paperName ?? 'The Laintown Chronicle';
-  const townName = config.townName ?? 'Laintown';
-
+  const paperName = config.paperName ?? 'The Newtown Chronicle';
+  const townName = config.townName ?? 'Newtown';
   const prompt = `You just read today's edition of ${paperName}, edited by ${newspaper.editor_name}.
 
 Here's the newspaper:
@@ -186,7 +185,7 @@ Here's the newspaper:
 ${content}
 ---
 
-Write a brief, natural reaction to what you read. What caught your attention? What do you think about the events described in ${townName}? Did anything surprise you or remind you of something? Keep it to 2-3 sentences — this is your internal thought after reading, not a published response.`;
+Write a brief, natural reaction to what you read about ${townName}. What caught your attention? What do you think about the events described? Did anything surprise you or remind you of something? Keep it to 2-3 sentences — this is your internal thought after reading, not a published response.`;
 
   const result = await provider.complete({
     messages: [{ role: 'user', content: prompt }],

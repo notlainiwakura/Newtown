@@ -30,6 +30,7 @@ const {
   mockGetGenerativeModel,
   mockGetMeta,
   mockSetMeta,
+  mockAtomicMetaIncrementCounter,
   mockLoggerWarn,
   mockLoggerError,
   mockLoggerInfo,
@@ -42,6 +43,7 @@ const {
   const mockGetGenerativeModel = vi.fn().mockReturnValue({ generateContent: mockGenerateContent });
   const mockGetMeta = vi.fn();
   const mockSetMeta = vi.fn();
+  const mockAtomicMetaIncrementCounter = vi.fn();
   const mockLoggerWarn = vi.fn();
   const mockLoggerError = vi.fn();
   const mockLoggerInfo = vi.fn();
@@ -54,6 +56,7 @@ const {
     mockGetGenerativeModel,
     mockGetMeta,
     mockSetMeta,
+    mockAtomicMetaIncrementCounter,
     mockLoggerWarn,
     mockLoggerError,
     mockLoggerInfo,
@@ -61,14 +64,22 @@ const {
   };
 });
 
-vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: {
-      create: mockAnthropicCreate,
-      stream: mockAnthropicStream,
-    },
-  })),
-}));
+vi.mock('@anthropic-ai/sdk', async () => {
+  // Preserve the real error classes (APIError, RateLimitError, etc.) — the
+  // provider uses them for structured retry classification (findings.md
+  // P2:838). Only the default constructor is replaced so we can intercept
+  // .messages.create / .messages.stream calls.
+  const actual = await vi.importActual<typeof import('@anthropic-ai/sdk')>('@anthropic-ai/sdk');
+  return {
+    ...actual,
+    default: vi.fn().mockImplementation(() => ({
+      messages: {
+        create: mockAnthropicCreate,
+        stream: mockAnthropicStream,
+      },
+    })),
+  };
+});
 
 vi.mock('openai', () => ({
   default: vi.fn().mockImplementation(() => ({
@@ -80,6 +91,12 @@ vi.mock('@google/generative-ai', () => ({
   GoogleGenerativeAI: vi.fn().mockImplementation(() => ({
     getGenerativeModel: mockGetGenerativeModel,
   })),
+  FunctionCallingMode: {
+    MODE_UNSPECIFIED: 'MODE_UNSPECIFIED',
+    AUTO: 'AUTO',
+    ANY: 'ANY',
+    NONE: 'NONE',
+  },
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -94,11 +111,13 @@ vi.mock('../src/utils/logger.js', () => ({
 vi.mock('../src/storage/database.js', () => ({
   getMeta: mockGetMeta,
   setMeta: mockSetMeta,
+  atomicMetaIncrementCounter: mockAtomicMetaIncrementCounter,
+  isDatabaseInitialized: () => true,
 }));
 
 // ─── Imports after mocks ─────────────────────────────────────────────────────
 
-import { AnthropicProvider } from '../src/providers/anthropic.js';
+import { AnthropicProvider, IncompleteToolCallError } from '../src/providers/anthropic.js';
 import { OpenAIProvider } from '../src/providers/openai.js';
 import { GoogleProvider } from '../src/providers/google.js';
 import { withRetry } from '../src/providers/retry.js';
@@ -240,6 +259,7 @@ function createMockProvider(name: string, model: string, overrides: Partial<Prov
   return {
     name,
     model,
+    supportsStreaming: false,
     complete: vi.fn().mockResolvedValue({
       content: `response from ${model}`,
       finishReason: 'stop',
@@ -306,6 +326,10 @@ beforeEach(() => {
   mockGenerateContent.mockReset();
   mockGetMeta.mockReset();
   mockSetMeta.mockReset();
+  mockAtomicMetaIncrementCounter.mockReset();
+  mockAtomicMetaIncrementCounter.mockImplementation(
+    (p: { freshJson: string }) => p.freshJson,
+  );
   mockLoggerWarn.mockReset();
   mockLoggerError.mockReset();
   mockLoggerInfo.mockReset();
@@ -435,6 +459,179 @@ describe('Anthropic-specific error handling', () => {
       const provider = createAnthropicProvider();
 
       for (const msg of ['overloaded', 'Overloaded', 'Server is overloaded']) {
+        mockAnthropicCreate.mockReset();
+        mockAnthropicCreate
+          .mockRejectedValueOnce(new Error(msg))
+          .mockResolvedValueOnce(makeAnthropicResponse());
+
+        const result = await withTimers(() => provider.complete({ messages: basicMessages }));
+        expect(result.content).toBe('hello');
+      }
+    });
+
+    it('detects 529 via APIError class without depending on message text (findings.md P2:838)', async () => {
+      // findings.md P2:838 — retry must not depend on the human-readable
+      // message "overloaded"; a future SDK could rename the phrase and we'd
+      // silently stop retrying. Structured status on APIError is the
+      // authoritative signal.
+      const { APIError } = await import('@anthropic-ai/sdk');
+      const provider = createAnthropicProvider();
+      const err = new APIError(529, undefined, 'service busy — not the old phrase', undefined);
+
+      mockAnthropicCreate
+        .mockRejectedValueOnce(err)
+        .mockResolvedValueOnce(makeAnthropicResponse());
+
+      const result = await withTimers(() => provider.complete({ messages: basicMessages }));
+      expect(result.content).toBe('hello');
+      expect(mockAnthropicCreate).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('429 rate limit (findings.md P2:848)', () => {
+    // findings.md P2:848 — Anthropic rate-limits (429) used to propagate
+    // straight to callers because the classifier only matched "overloaded"
+    // and timeouts. A bursty caller hitting the RPM cap saw a hard failure
+    // instead of the transparent retry they get on 529.
+
+    it('retries on 429 status code', async () => {
+      const provider = createAnthropicProvider();
+      const { RateLimitError } = await import('@anthropic-ai/sdk');
+      const err = new RateLimitError(429, undefined, 'rate limit exceeded', undefined);
+
+      mockAnthropicCreate
+        .mockRejectedValueOnce(err)
+        .mockResolvedValueOnce(makeAnthropicResponse());
+
+      const result = await withTimers(() => provider.complete({ messages: basicMessages }));
+      expect(result.content).toBe('hello');
+      expect(mockAnthropicCreate).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries on 429 even when error is a plain Error with .status (non-SDK origin)', async () => {
+      const provider = createAnthropicProvider();
+      const err = makeAnthropicError(429, 'Too many requests');
+
+      mockAnthropicCreate
+        .mockRejectedValueOnce(err)
+        .mockResolvedValueOnce(makeAnthropicResponse());
+
+      const result = await withTimers(() => provider.complete({ messages: basicMessages }));
+      expect(result.content).toBe('hello');
+      expect(mockAnthropicCreate).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('Retry-After header (findings.md P2:858)', () => {
+    // findings.md P2:858 — fixed 1/2/4s backoff used to ignore the server's
+    // Retry-After header. A real rate-limit sends Retry-After: 30; all three
+    // retries fall inside the 30-second window, all three fail, caller sees
+    // the failure anyway. We now take max(retryAfterMs, backoffDelay).
+
+    it('waits for Retry-After seconds instead of the fixed 1s backoff', async () => {
+      const { RateLimitError } = await import('@anthropic-ai/sdk');
+      const provider = createAnthropicProvider();
+      const err = new RateLimitError(
+        429,
+        undefined,
+        'rate limited',
+        { 'retry-after': '30' }
+      );
+
+      mockAnthropicCreate
+        .mockRejectedValueOnce(err)
+        .mockResolvedValueOnce(makeAnthropicResponse());
+
+      const promise = provider.complete({ messages: basicMessages });
+      // Fixed backoff would resolve after 1s. The Retry-After says 30s,
+      // so advancing only 1s must NOT be enough to release the retry.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(mockAnthropicCreate).toHaveBeenCalledTimes(1);
+      // Advance the rest of the 30-second window.
+      await vi.advanceTimersByTimeAsync(29_000);
+      const result = await promise;
+      expect(result.content).toBe('hello');
+      expect(mockAnthropicCreate).toHaveBeenCalledTimes(2);
+    });
+
+    it('falls back to exponential backoff when Retry-After is absent', async () => {
+      const { RateLimitError } = await import('@anthropic-ai/sdk');
+      const provider = createAnthropicProvider();
+      const err = new RateLimitError(429, undefined, 'rate limited', undefined);
+
+      mockAnthropicCreate
+        .mockRejectedValueOnce(err)
+        .mockResolvedValueOnce(makeAnthropicResponse());
+
+      const promise = provider.complete({ messages: basicMessages });
+      await vi.advanceTimersByTimeAsync(1000);
+      const result = await promise;
+      expect(result.content).toBe('hello');
+    });
+
+    it('uses jittered backoff when it exceeds Retry-After (findings.md P2:1050)', async () => {
+      // findings.md P2:1050 — pin Math.random so the sampled jitter equals
+      // the cap (1s). Retry-After: 0 means jittered backoff should win.
+      const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.9999);
+      const { RateLimitError } = await import('@anthropic-ai/sdk');
+      const provider = createAnthropicProvider();
+      const err = new RateLimitError(
+        429,
+        undefined,
+        'rate limited',
+        { 'retry-after': '0' }
+      );
+
+      mockAnthropicCreate
+        .mockRejectedValueOnce(err)
+        .mockResolvedValueOnce(makeAnthropicResponse());
+
+      const promise = provider.complete({ messages: basicMessages });
+      // Less than 1s — jittered backoff (pinned ≈ cap) keeps the call on hold.
+      await vi.advanceTimersByTimeAsync(500);
+      expect(mockAnthropicCreate).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(600);
+      const result = await promise;
+      expect(result.content).toBe('hello');
+      randomSpy.mockRestore();
+    });
+  });
+
+  describe('AbortError handling (findings.md P2:868)', () => {
+    // findings.md P2:868 — a bare AbortError means the caller deliberately
+    // cancelled. Retrying after that keeps the request alive through the
+    // cancel and burns tokens. We only retry errors that actually look like
+    // timeouts ("timed out", ETIMEDOUT, ECONNABORTED).
+
+    it('does not retry a bare AbortError (caller cancellation)', async () => {
+      const provider = createAnthropicProvider();
+      const abortErr = new Error('The operation was aborted.');
+      (abortErr as Error & { name: string }).name = 'AbortError';
+
+      mockAnthropicCreate.mockRejectedValueOnce(abortErr);
+
+      await expect(provider.complete({ messages: basicMessages }))
+        .rejects.toThrow();
+      expect(mockAnthropicCreate).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries an AbortError whose message indicates a real timeout', async () => {
+      const provider = createAnthropicProvider();
+      const timeoutErr = new Error('Request timed out');
+      (timeoutErr as Error & { name: string }).name = 'AbortError';
+
+      mockAnthropicCreate
+        .mockRejectedValueOnce(timeoutErr)
+        .mockResolvedValueOnce(makeAnthropicResponse());
+
+      const result = await withTimers(() => provider.complete({ messages: basicMessages }));
+      expect(result.content).toBe('hello');
+      expect(mockAnthropicCreate).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries ETIMEDOUT / ECONNABORTED socket-level timeouts', async () => {
+      const provider = createAnthropicProvider();
+      for (const msg of ['connect ETIMEDOUT', 'socket hang up ECONNABORTED']) {
         mockAnthropicCreate.mockReset();
         mockAnthropicCreate
           .mockRejectedValueOnce(new Error(msg))
@@ -616,6 +813,190 @@ describe('Anthropic-specific error handling', () => {
       expect(mockLoggerWarn).toHaveBeenCalled();
     });
 
+    describe('stream abort mid tool-call surfaces partial state (findings.md P2:910)', () => {
+      it('wraps abort mid tool-call in IncompleteToolCallError with partial inputJson', async () => {
+        // findings.md P2:910 — if the stream drops while a tool_use block
+        // is in flight, the partial JSON accumulator used to be discarded
+        // silently. Callers saw a generic error (AbortError, network drop)
+        // with no hint that a tool call was being prepared. Now the
+        // accumulator is surfaced via IncompleteToolCallError so callers
+        // can log/retry with context.
+        const provider = createAnthropicProvider();
+        const events = [
+          { type: 'message_start', message: { usage: { input_tokens: 5 } } },
+          {
+            type: 'content_block_start',
+            content_block: { type: 'tool_use', id: 'call_1', name: 'get_weather' },
+          },
+          { type: 'content_block_delta', delta: { partial_json: '{"city":"Tok' } },
+        ];
+        // Abort is NOT a retryable timeout (P2:868), so withRetry won't
+        // mask the failure — the wrapper should surface.
+        const abortErr = new Error('The operation was aborted');
+        abortErr.name = 'AbortError';
+        const errorStream = makeErroringAsyncIterable(events, 3, abortErr);
+        mockAnthropicStream.mockReturnValueOnce(errorStream);
+
+        const err = (await withTimersExpectReject(() =>
+          provider.completeWithToolsStream!(
+            { messages: basicMessages, tools: basicToolDefs },
+            () => {}
+          )
+        )) as IncompleteToolCallError;
+
+        expect(err).toBeInstanceOf(IncompleteToolCallError);
+        expect(err.partialToolCall.id).toBe('call_1');
+        expect(err.partialToolCall.name).toBe('get_weather');
+        expect(err.partialToolCall.inputJson).toBe('{"city":"Tok');
+        expect(err.completedToolCalls).toEqual([]);
+        expect(err.cause).toBe(abortErr);
+      });
+
+      it('includes already-completed tool calls on the error so caller can see them', async () => {
+        const provider = createAnthropicProvider();
+        const events = [
+          { type: 'message_start', message: { usage: { input_tokens: 5 } } },
+          {
+            type: 'content_block_start',
+            content_block: { type: 'tool_use', id: 'call_1', name: 'get_weather' },
+          },
+          { type: 'content_block_delta', delta: { partial_json: '{"city":"Tokyo"}' } },
+          { type: 'content_block_stop' },
+          {
+            type: 'content_block_start',
+            content_block: { type: 'tool_use', id: 'call_2', name: 'get_weather' },
+          },
+          { type: 'content_block_delta', delta: { partial_json: '{"city":"Lon' } },
+        ];
+        const abortErr = new Error('The operation was aborted');
+        abortErr.name = 'AbortError';
+        const errorStream = makeErroringAsyncIterable(events, 6, abortErr);
+        mockAnthropicStream.mockReturnValueOnce(errorStream);
+
+        const err = (await withTimersExpectReject(() =>
+          provider.completeWithToolsStream!(
+            { messages: basicMessages, tools: basicToolDefs },
+            () => {}
+          )
+        )) as IncompleteToolCallError;
+
+        expect(err).toBeInstanceOf(IncompleteToolCallError);
+        expect(err.partialToolCall.id).toBe('call_2');
+        expect(err.partialToolCall.inputJson).toBe('{"city":"Lon');
+        expect(err.completedToolCalls).toHaveLength(1);
+        expect(err.completedToolCalls[0]!.name).toBe('get_weather');
+        expect(err.completedToolCalls[0]!.input).toEqual({ city: 'Tokyo' });
+      });
+
+      it('does NOT wrap when no tool-call accumulator is open', async () => {
+        // Only text deltas streamed so far; no pending tool_use. The
+        // underlying error should propagate unwrapped so withRetry /
+        // callers see the original failure mode.
+        const provider = createAnthropicProvider();
+        const events = [
+          { type: 'message_start', message: { usage: { input_tokens: 5 } } },
+          { type: 'content_block_delta', delta: { text: 'thinking' } },
+        ];
+        const abortErr = new Error('The operation was aborted');
+        abortErr.name = 'AbortError';
+        const errorStream = makeErroringAsyncIterable(events, 2, abortErr);
+        mockAnthropicStream.mockReturnValueOnce(errorStream);
+
+        const err = (await withTimersExpectReject(() =>
+          provider.completeWithToolsStream!(
+            { messages: basicMessages, tools: basicToolDefs },
+            () => {}
+          )
+        )) as Error;
+
+        expect(err).not.toBeInstanceOf(IncompleteToolCallError);
+        expect(err.message).toBe('The operation was aborted');
+      });
+
+      it('does NOT wrap when underlying error is retryable (lets withRetry recover)', async () => {
+        // An overloaded error mid tool-call should still go through the
+        // retry path (clean retry gets fresh state). Wrapping here would
+        // prevent withRetry from recognizing the error and block recovery.
+        const provider = createAnthropicProvider();
+        const failingEvents = [
+          { type: 'message_start', message: { usage: { input_tokens: 5 } } },
+          {
+            type: 'content_block_start',
+            content_block: { type: 'tool_use', id: 'call_1', name: 'get_weather' },
+          },
+          { type: 'content_block_delta', delta: { partial_json: '{"city":"Tok' } },
+        ];
+        const overloadedErr = new Error('overloaded');
+        const recoveryEvents = [
+          { type: 'message_start', message: { usage: { input_tokens: 5 } } },
+          {
+            type: 'content_block_start',
+            content_block: { type: 'tool_use', id: 'call_1', name: 'get_weather' },
+          },
+          { type: 'content_block_delta', delta: { partial_json: '{"city":"Tokyo"}' } },
+          { type: 'content_block_stop' },
+          {
+            type: 'message_delta',
+            delta: { stop_reason: 'tool_use' },
+            usage: { output_tokens: 10 },
+          },
+        ];
+
+        mockAnthropicStream
+          .mockReturnValueOnce(makeErroringAsyncIterable(failingEvents, 3, overloadedErr))
+          .mockReturnValueOnce(makeAsyncIterable(recoveryEvents));
+
+        const result = await withTimers(() =>
+          provider.completeWithToolsStream!(
+            { messages: basicMessages, tools: basicToolDefs },
+            () => {}
+          )
+        );
+
+        // Retry succeeded, final result has the completed tool call.
+        expect(result.toolCalls).toHaveLength(1);
+        expect(result.toolCalls![0]!.input).toEqual({ city: 'Tokyo' });
+        expect(mockAnthropicStream).toHaveBeenCalledTimes(2);
+      });
+
+      it('wraps abort in continueWithToolResultsStream too', async () => {
+        // Same surfacing contract for the tool-loop continue path.
+        const provider = createAnthropicProvider();
+        const events = [
+          { type: 'message_start', message: { usage: { input_tokens: 5 } } },
+          {
+            type: 'content_block_start',
+            content_block: { type: 'tool_use', id: 'call_2', name: 'get_weather' },
+          },
+          { type: 'content_block_delta', delta: { partial_json: '{"ci' } },
+        ];
+        const abortErr = new Error('The operation was aborted');
+        abortErr.name = 'AbortError';
+        const errorStream = makeErroringAsyncIterable(events, 3, abortErr);
+        mockAnthropicStream.mockReturnValueOnce(errorStream);
+
+        const priorToolCalls: ToolCall[] = [
+          { id: 'call_1', name: 'get_weather', input: { city: 'Tokyo' } },
+        ];
+        const priorResults: ToolResult[] = [
+          { toolCallId: 'call_1', content: '72F sunny' },
+        ];
+
+        const err = (await withTimersExpectReject(() =>
+          provider.continueWithToolResultsStream!(
+            { messages: basicMessages, tools: basicToolDefs },
+            priorToolCalls,
+            priorResults,
+            () => {}
+          )
+        )) as IncompleteToolCallError;
+
+        expect(err).toBeInstanceOf(IncompleteToolCallError);
+        expect(err.partialToolCall.id).toBe('call_2');
+        expect(err.partialToolCall.inputJson).toBe('{"ci');
+      });
+    });
+
     it('handles empty content array', async () => {
       const provider = createAnthropicProvider();
       mockAnthropicCreate.mockResolvedValueOnce(makeAnthropicResponse({ content: [] }));
@@ -678,6 +1059,97 @@ describe('Anthropic-specific error handling', () => {
       expect(result.toolCalls).toHaveLength(1);
       expect(result.toolCalls![0]!.input).toEqual({});
     });
+
+    it('defaults enableCaching to true (findings.md P2:900)', async () => {
+      // findings.md P2:900 — default was enableCaching:false, so every
+      // deployment paid 10× the input-token cost on long stable personas
+      // until someone thought to opt in. Flipped the default so the
+      // free performance win is on by default; explicit false still works.
+      const provider = createAnthropicProvider();
+      mockAnthropicCreate.mockResolvedValueOnce(makeAnthropicResponse());
+
+      await provider.complete({
+        messages: [
+          { role: 'system', content: 'persona' },
+          { role: 'user', content: 'hello' },
+        ],
+        // Note: enableCaching is intentionally NOT set — relying on the default.
+      });
+
+      const params = mockAnthropicCreate.mock.calls[0]![0]!;
+      expect(Array.isArray(params.system)).toBe(true);
+      expect(params.system[0]).toMatchObject({
+        type: 'text',
+        cache_control: { type: 'ephemeral' },
+      });
+    });
+
+    it('applies cache_control to system prompt in complete() when enableCaching=true (findings.md P2:890)', async () => {
+      // findings.md P2:890 — completeWithTools honored enableCaching, but
+      // complete() ignored it. A caller running a non-tools completion
+      // (e.g. a long persona chat) with enableCaching:true saw no cache
+      // markers and paid full input-token cost on every turn.
+      const provider = createAnthropicProvider();
+      mockAnthropicCreate.mockResolvedValueOnce(makeAnthropicResponse());
+
+      await provider.complete({
+        messages: [
+          { role: 'system', content: 'a stable persona block' },
+          { role: 'user', content: 'hello' },
+        ],
+        enableCaching: true,
+      });
+
+      const params = mockAnthropicCreate.mock.calls[0]![0]!;
+      // With caching, system is an array of TextBlockParam (not a string),
+      // and the last system block carries cache_control.
+      expect(Array.isArray(params.system)).toBe(true);
+      expect(params.system[params.system.length - 1]).toMatchObject({
+        type: 'text',
+        cache_control: { type: 'ephemeral' },
+      });
+    });
+
+    it('does NOT apply cache_control in complete() when enableCaching is false', async () => {
+      // Sanity guard: without the flag we send plain-string system, no markers.
+      const provider = createAnthropicProvider();
+      mockAnthropicCreate.mockResolvedValueOnce(makeAnthropicResponse());
+
+      await provider.complete({
+        messages: [
+          { role: 'system', content: 'a stable persona block' },
+          { role: 'user', content: 'hello' },
+        ],
+        enableCaching: false,
+      });
+
+      const params = mockAnthropicCreate.mock.calls[0]![0]!;
+      expect(typeof params.system).toBe('string');
+    });
+
+    it('concatenates text that appears after a tool_use block (findings.md P2:880)', async () => {
+      // findings.md P2:880 — Anthropic responses can interleave text/tool_use/text.
+      // Earlier parsing used content.find(type==='text') or only read the first
+      // contiguous run, silently discarding narration emitted after a tool call
+      // ("Let me check... [tool_use] ...here's what I found"). The fix is to
+      // iterate every content block and concatenate every text block in order.
+      const provider = createAnthropicProvider();
+      mockAnthropicCreate.mockResolvedValueOnce(makeAnthropicResponse({
+        content: [
+          { type: 'text', text: 'Let me check the weather. ' },
+          { type: 'tool_use', id: 'call_1', name: 'get_weather', input: { city: 'Tokyo' } },
+          { type: 'text', text: "Here's what I found." },
+        ],
+        stop_reason: 'tool_use',
+      }));
+
+      const result = await provider.completeWithTools({
+        messages: basicMessages,
+        tools: basicToolDefs,
+      });
+      expect(result.content).toBe("Let me check the weather. Here's what I found.");
+      expect(result.toolCalls).toHaveLength(1);
+    });
   });
 
   describe('stop reason mapping', () => {
@@ -729,12 +1201,28 @@ describe('Anthropic-specific error handling', () => {
       expect(result.finishReason).toBe('stop');
     });
 
-    it('maps unknown stop_reason to stop', async () => {
+    it('maps unknown stop_reason to "unknown" (findings.md P2:940)', async () => {
+      // findings.md P2:940 — the prior mapper folded every unrecognized
+      // stop_reason into 'stop', so new Anthropic enum members looked
+      // identical to clean completions. Map them to 'unknown' so
+      // callers can branch/log on genuinely novel signals.
       const provider = createAnthropicProvider();
       mockAnthropicCreate.mockResolvedValueOnce(makeAnthropicResponse({ stop_reason: 'weird_reason' }));
 
       const result = await provider.complete({ messages: basicMessages });
-      expect(result.finishReason).toBe('stop');
+      expect(result.finishReason).toBe('unknown');
+    });
+
+    it('maps refusal to content_filter (findings.md P2:940)', async () => {
+      // findings.md P2:940 — a safety refusal used to collapse to 'stop'
+      // because the mapper only knew end_turn/stop_sequence/max_tokens/
+      // tool_use. The caller saw a clean completion and never surfaced
+      // the refusal signal.
+      const provider = createAnthropicProvider();
+      mockAnthropicCreate.mockResolvedValueOnce(makeAnthropicResponse({ stop_reason: 'refusal' }));
+
+      const result = await provider.complete({ messages: basicMessages });
+      expect(result.finishReason).toBe('content_filter');
     });
   });
 
@@ -882,6 +1370,216 @@ describe('Anthropic-specific error handling', () => {
         )
       ).rejects.toThrow('Unauthorized');
       expect(mockAnthropicCreate).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('continueWithToolResults* preserves assistant text turn (findings.md P2:930)', () => {
+    // findings.md P2:930 — the prior turn's text blocks ("I'll look that
+    // up...") used to be dropped when reconstructing the assistant
+    // message for the continue call. The model then saw a history where
+    // it had called tools without saying anything, silently erasing its
+    // own narration on every tool iteration.
+    it('prepends assistant text as a text block in continueWithToolResults', async () => {
+      const provider = createAnthropicProvider();
+      mockAnthropicCreate.mockResolvedValueOnce(makeAnthropicResponse());
+
+      await provider.continueWithToolResults(
+        { messages: basicMessages, tools: basicToolDefs },
+        [{ id: 'call_1', name: 'get_weather', input: { city: 'Tokyo' } }],
+        [{ toolCallId: 'call_1', content: '72F sunny' }],
+        "I'll look that up for you..."
+      );
+
+      const params = mockAnthropicCreate.mock.calls[0]![0]!;
+      // The assistant message is the penultimate; the final is the user
+      // tool_result message.
+      const assistantMessage = params.messages[params.messages.length - 2];
+      expect(assistantMessage.role).toBe('assistant');
+      expect(assistantMessage.content[0]).toMatchObject({
+        type: 'text',
+        text: "I'll look that up for you...",
+      });
+      expect(assistantMessage.content[1]).toMatchObject({
+        type: 'tool_use',
+        id: 'call_1',
+        name: 'get_weather',
+      });
+    });
+
+    it('omits the text block when assistantText is empty/undefined', async () => {
+      // Anthropic rejects empty text blocks in assistant messages; the
+      // old behavior (tool_use-only assistant message) must still work
+      // when callers don't pass assistantText.
+      const provider = createAnthropicProvider();
+      mockAnthropicCreate.mockResolvedValueOnce(makeAnthropicResponse());
+
+      await provider.continueWithToolResults(
+        { messages: basicMessages, tools: basicToolDefs },
+        [{ id: 'call_1', name: 'get_weather', input: { city: 'Tokyo' } }],
+        [{ toolCallId: 'call_1', content: '72F sunny' }]
+      );
+
+      const params = mockAnthropicCreate.mock.calls[0]![0]!;
+      const assistantMessage = params.messages[params.messages.length - 2];
+      expect(assistantMessage.content).toHaveLength(1);
+      expect(assistantMessage.content[0]).toMatchObject({ type: 'tool_use' });
+    });
+
+    it('omits the text block when assistantText is an empty string', async () => {
+      const provider = createAnthropicProvider();
+      mockAnthropicCreate.mockResolvedValueOnce(makeAnthropicResponse());
+
+      await provider.continueWithToolResults(
+        { messages: basicMessages, tools: basicToolDefs },
+        [{ id: 'call_1', name: 'get_weather', input: { city: 'Tokyo' } }],
+        [{ toolCallId: 'call_1', content: '72F sunny' }],
+        ''
+      );
+
+      const params = mockAnthropicCreate.mock.calls[0]![0]!;
+      const assistantMessage = params.messages[params.messages.length - 2];
+      expect(assistantMessage.content).toHaveLength(1);
+      expect(assistantMessage.content[0]).toMatchObject({ type: 'tool_use' });
+    });
+
+    it('prepends assistant text in continueWithToolResultsStream', async () => {
+      const provider = createAnthropicProvider();
+      const events = [
+        { type: 'message_start', message: { usage: { input_tokens: 5 } } },
+        { type: 'content_block_delta', delta: { text: 'done' } },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 3 } },
+      ];
+      mockAnthropicStream.mockReturnValueOnce(makeAsyncIterable(events));
+
+      await provider.continueWithToolResultsStream!(
+        { messages: basicMessages, tools: basicToolDefs },
+        [{ id: 'call_1', name: 'get_weather', input: { city: 'Tokyo' } }],
+        [{ toolCallId: 'call_1', content: '72F sunny' }],
+        () => {},
+        'Checking weather now...'
+      );
+
+      const params = mockAnthropicStream.mock.calls[0]![0]!;
+      const assistantMessage = params.messages[params.messages.length - 2];
+      expect(assistantMessage.content[0]).toMatchObject({
+        type: 'text',
+        text: 'Checking weather now...',
+      });
+      expect(assistantMessage.content[1]).toMatchObject({
+        type: 'tool_use',
+        id: 'call_1',
+      });
+    });
+  });
+
+  describe('continueWithToolResults* plumbs toolChoice (findings.md P2:920)', () => {
+    // findings.md P2:920 — completeWithTools honored options.toolChoice,
+    // but the continue* paths silently dropped it. An agent loop forcing
+    // a wrap-up turn via toolChoice:'none' could still trigger another
+    // tool call because the wrapper never translated that intent.
+    it('passes toolChoice="auto" through continueWithToolResults', async () => {
+      const provider = createAnthropicProvider();
+      mockAnthropicCreate.mockResolvedValueOnce(makeAnthropicResponse());
+
+      await provider.continueWithToolResults(
+        { messages: basicMessages, tools: basicToolDefs, toolChoice: 'auto' },
+        [{ id: 'call_1', name: 'get_weather', input: { city: 'Tokyo' } }],
+        [{ toolCallId: 'call_1', content: '72F sunny' }]
+      );
+
+      const params = mockAnthropicCreate.mock.calls[0]![0]!;
+      expect(params.tool_choice).toEqual({ type: 'auto' });
+    });
+
+    it('passes named tool choice through continueWithToolResults', async () => {
+      const provider = createAnthropicProvider();
+      mockAnthropicCreate.mockResolvedValueOnce(makeAnthropicResponse());
+
+      await provider.continueWithToolResults(
+        {
+          messages: basicMessages,
+          tools: basicToolDefs,
+          toolChoice: { type: 'tool', name: 'get_weather' },
+        },
+        [{ id: 'call_1', name: 'get_weather', input: { city: 'Tokyo' } }],
+        [{ toolCallId: 'call_1', content: '72F sunny' }]
+      );
+
+      const params = mockAnthropicCreate.mock.calls[0]![0]!;
+      expect(params.tool_choice).toEqual({ type: 'tool', name: 'get_weather' });
+    });
+
+    it('suppresses tools entirely when toolChoice="none" in continueWithToolResults', async () => {
+      // Anthropic has no 'none' in ToolChoice — the only way to force "no
+      // more tools" is to not send any tools at all (same shortcut
+      // completeWithTools uses).
+      const provider = createAnthropicProvider();
+      mockAnthropicCreate.mockResolvedValueOnce(makeAnthropicResponse());
+
+      await provider.continueWithToolResults(
+        { messages: basicMessages, tools: basicToolDefs, toolChoice: 'none' },
+        [{ id: 'call_1', name: 'get_weather', input: { city: 'Tokyo' } }],
+        [{ toolCallId: 'call_1', content: '72F sunny' }]
+      );
+
+      const params = mockAnthropicCreate.mock.calls[0]![0]!;
+      expect(params.tools).toBeUndefined();
+      expect(params.tool_choice).toBeUndefined();
+    });
+
+    it('omits tool_choice when not specified (preserves default Anthropic behavior)', async () => {
+      const provider = createAnthropicProvider();
+      mockAnthropicCreate.mockResolvedValueOnce(makeAnthropicResponse());
+
+      await provider.continueWithToolResults(
+        { messages: basicMessages, tools: basicToolDefs },
+        [{ id: 'call_1', name: 'get_weather', input: { city: 'Tokyo' } }],
+        [{ toolCallId: 'call_1', content: '72F sunny' }]
+      );
+
+      const params = mockAnthropicCreate.mock.calls[0]![0]!;
+      expect(params.tool_choice).toBeUndefined();
+      expect(params.tools).toBeDefined();
+    });
+
+    it('passes toolChoice through continueWithToolResultsStream', async () => {
+      const provider = createAnthropicProvider();
+      const events = [
+        { type: 'message_start', message: { usage: { input_tokens: 5 } } },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 3 } },
+      ];
+      mockAnthropicStream.mockReturnValueOnce(makeAsyncIterable(events));
+
+      await provider.continueWithToolResultsStream!(
+        { messages: basicMessages, tools: basicToolDefs, toolChoice: 'auto' },
+        [{ id: 'call_1', name: 'get_weather', input: { city: 'Tokyo' } }],
+        [{ toolCallId: 'call_1', content: '72F sunny' }],
+        () => {}
+      );
+
+      const params = mockAnthropicStream.mock.calls[0]![0]!;
+      expect(params.tool_choice).toEqual({ type: 'auto' });
+    });
+
+    it('suppresses tools in continueWithToolResultsStream when toolChoice="none"', async () => {
+      const provider = createAnthropicProvider();
+      const events = [
+        { type: 'message_start', message: { usage: { input_tokens: 5 } } },
+        { type: 'content_block_delta', delta: { text: 'done' } },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 3 } },
+      ];
+      mockAnthropicStream.mockReturnValueOnce(makeAsyncIterable(events));
+
+      await provider.continueWithToolResultsStream!(
+        { messages: basicMessages, tools: basicToolDefs, toolChoice: 'none' },
+        [{ id: 'call_1', name: 'get_weather', input: { city: 'Tokyo' } }],
+        [{ toolCallId: 'call_1', content: '72F sunny' }],
+        () => {}
+      );
+
+      const params = mockAnthropicStream.mock.calls[0]![0]!;
+      expect(params.tools).toBeUndefined();
+      expect(params.tool_choice).toBeUndefined();
     });
   });
 });
@@ -1166,7 +1864,11 @@ describe('OpenAI-specific error handling', () => {
       expect(result.finishReason).toBe('stop');
     });
 
-    it('maps unknown finish_reason to stop', async () => {
+    it('maps unknown finish_reason to "unknown" (findings.md P2:940)', async () => {
+      // findings.md P2:940 — same cross-provider pattern as Anthropic.
+      // Novel OpenAI finish_reason values surface as 'unknown' so a
+      // future safety-refusal enum member doesn't silently look like a
+      // clean completion.
       const provider = createOpenAIProvider();
       mockOpenAICreate.mockResolvedValueOnce({
         choices: [{ message: { content: 'hello' }, finish_reason: 'something_new' }],
@@ -1174,7 +1876,7 @@ describe('OpenAI-specific error handling', () => {
       });
 
       const result = await provider.complete({ messages: basicMessages });
-      expect(result.finishReason).toBe('stop');
+      expect(result.finishReason).toBe('unknown');
     });
   });
 
@@ -1253,7 +1955,10 @@ describe('OpenAI-specific error handling', () => {
       expect(result.toolCalls![0]!.input).toEqual({ city: 'London', units: 'celsius' });
     });
 
-    it('throws on malformed tool call JSON', async () => {
+    it('degrades to empty input on malformed tool call JSON (findings.md P2:970)', async () => {
+      // findings.md P2:970 — the prior implementation crashed the whole
+      // completion with a SyntaxError when OpenAI returned malformed JSON
+      // (usually truncation at max_tokens). We now degrade to {} + warn log.
       const provider = createOpenAIProvider();
       mockOpenAICreate.mockResolvedValueOnce({
         choices: [{
@@ -1270,11 +1975,67 @@ describe('OpenAI-specific error handling', () => {
         usage: { prompt_tokens: 10, completion_tokens: 15 },
       });
 
-      // JSON.parse throws on malformed JSON
-      await expect(provider.completeWithTools({
+      const result = await provider.completeWithTools({
         messages: basicMessages,
         tools: basicToolDefs,
-      })).rejects.toThrow();
+      });
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls![0]!.name).toBe('test');
+      expect(result.toolCalls![0]!.input).toEqual({});
+      expect(mockLoggerWarn).toHaveBeenCalledWith(
+        expect.objectContaining({ toolCallId: 'call_1', toolName: 'test' }),
+        expect.stringContaining('malformed JSON'),
+      );
+    });
+
+    it('degrades to empty input when JSON parses to a non-object (findings.md P2:970)', async () => {
+      const provider = createOpenAIProvider();
+      mockOpenAICreate.mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: null,
+            tool_calls: [{
+              id: 'call_1',
+              type: 'function',
+              function: { name: 'test', arguments: '42' },
+            }],
+          },
+          finish_reason: 'tool_calls',
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+
+      const result = await provider.completeWithTools({
+        messages: basicMessages,
+        tools: basicToolDefs,
+      });
+      expect(result.toolCalls![0]!.input).toEqual({});
+    });
+
+    it('degrades to empty input on malformed JSON in continueWithToolResults (findings.md P2:970)', async () => {
+      const provider = createOpenAIProvider();
+      mockOpenAICreate.mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: null,
+            tool_calls: [{
+              id: 'call_2',
+              type: 'function',
+              function: { name: 'followup', arguments: '{"partial":' },
+            }],
+          },
+          finish_reason: 'tool_calls',
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+
+      const result = await provider.continueWithToolResults(
+        { messages: basicMessages, tools: basicToolDefs },
+        [{ id: 'call_1', name: 'test', input: {} }],
+        [{ toolCallId: 'call_1', content: 'ok' }],
+      );
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls![0]!.input).toEqual({});
     });
 
     it('handles multiple tool calls in one response', async () => {
@@ -1441,14 +2202,54 @@ describe('Google-specific error handling', () => {
     });
   });
 
-  describe('RECITATION finish reason', () => {
-    it('maps RECITATION to stop (unknown fallback)', async () => {
+  describe('RECITATION / BLOCKLIST / PROHIBITED_CONTENT finish reasons (findings.md P2:1000)', () => {
+    // findings.md P2:1000 — the Gemini SDK's response.text() throws for any
+    // blocked finish reason. We now iterate parts directly in complete() so
+    // a block becomes empty content + content_filter, not an uncaught throw.
+    it('maps RECITATION to content_filter', async () => {
       const provider = createGoogleProviderInstance();
       mockGenerateContent.mockResolvedValueOnce(makeGoogleResponse('some text', 'RECITATION'));
 
       const result = await provider.complete({ messages: basicMessages });
-      // RECITATION is not explicitly mapped, falls to default 'stop'
-      expect(result.finishReason).toBe('stop');
+      expect(result.finishReason).toBe('content_filter');
+    });
+
+    it('maps BLOCKLIST to content_filter', async () => {
+      const provider = createGoogleProviderInstance();
+      mockGenerateContent.mockResolvedValueOnce(makeGoogleResponse('', 'BLOCKLIST'));
+
+      const result = await provider.complete({ messages: basicMessages });
+      expect(result.finishReason).toBe('content_filter');
+    });
+
+    it('maps PROHIBITED_CONTENT to content_filter', async () => {
+      const provider = createGoogleProviderInstance();
+      mockGenerateContent.mockResolvedValueOnce(makeGoogleResponse('', 'PROHIBITED_CONTENT'));
+
+      const result = await provider.complete({ messages: basicMessages });
+      expect(result.finishReason).toBe('content_filter');
+    });
+
+    it('does not throw when blocked response.text() would throw (findings.md P2:1000)', async () => {
+      const provider = createGoogleProviderInstance();
+      // Simulate the real SDK behaviour: response.text() throws on blocked
+      // responses with a message like "Cannot get text from candidate with
+      // no content." — we should NOT be calling it anymore.
+      mockGenerateContent.mockResolvedValueOnce({
+        response: {
+          text: () => {
+            throw new Error('Cannot get text from candidate with finish reason SAFETY');
+          },
+          candidates: [
+            { finishReason: 'SAFETY', content: { parts: [] } },
+          ],
+          usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 0 },
+        },
+      });
+
+      const result = await provider.complete({ messages: basicMessages });
+      expect(result.content).toBe('');
+      expect(result.finishReason).toBe('content_filter');
     });
   });
 
@@ -1479,12 +2280,15 @@ describe('Google-specific error handling', () => {
       expect(result.finishReason).toBe('stop');
     });
 
-    it('maps unknown finish reason to stop', async () => {
+    it('maps unknown finish reason to "unknown" (findings.md P2:940)', async () => {
+      // findings.md P2:940 — same cross-provider pattern as Anthropic.
+      // New/unrecognized Gemini finishReason values (future safety
+      // categories, etc.) surface as 'unknown' so callers can branch.
       const provider = createGoogleProviderInstance();
       mockGenerateContent.mockResolvedValueOnce(makeGoogleResponse('ok', 'BRAND_NEW_REASON'));
 
       const result = await provider.complete({ messages: basicMessages });
-      expect(result.finishReason).toBe('stop');
+      expect(result.finishReason).toBe('unknown');
     });
   });
 
@@ -1612,7 +2416,9 @@ describe('Google-specific error handling', () => {
       expect(result.toolCalls![0]!.input).toEqual({ city: 'Tokyo' });
     });
 
-    it('generates sequential call IDs for Google tool calls', async () => {
+    it('generates content-hash call IDs for Google tool calls (findings.md P2:1010)', async () => {
+      // findings.md P2:1010 — positional IDs cross-wired persisted tool calls.
+      // Replaced with SHA256(name + args)[:16], stable across sessions.
       const provider = createGoogleProviderInstance();
       mockGenerateContent.mockResolvedValueOnce({
         response: {
@@ -1634,8 +2440,9 @@ describe('Google-specific error handling', () => {
         messages: basicMessages,
         tools: basicToolDefs,
       });
-      expect(result.toolCalls![0]!.id).toBe('call_0');
-      expect(result.toolCalls![1]!.id).toBe('call_1');
+      expect(result.toolCalls![0]!.id).toMatch(/^call_[0-9a-f]{16}$/);
+      expect(result.toolCalls![1]!.id).toMatch(/^call_[0-9a-f]{16}$/);
+      expect(result.toolCalls![0]!.id).not.toBe(result.toolCalls![1]!.id);
     });
 
     it('handles function call with null args', async () => {
@@ -1767,8 +2574,20 @@ describe('Google-specific error handling', () => {
   });
 
   describe('generation config', () => {
-    it('sets thinkingBudget to 0 to disable Gemini thinking', async () => {
+    it('omits thinkingConfig by default (findings.md:1040)', async () => {
+      // Regression: previously hardcoded thinkingBudget: 0 blocked Gemini 2.5 Pro
+      // reasoning on every request. Default must now be "let Gemini decide per model."
       const provider = createGoogleProviderInstance();
+      mockGenerateContent.mockResolvedValueOnce(makeGoogleResponse());
+
+      await provider.complete({ messages: basicMessages });
+
+      const modelConfig = mockGetGenerativeModel.mock.calls[0]![0];
+      expect(modelConfig.generationConfig.thinkingConfig).toBeUndefined();
+    });
+
+    it('emits thinkingConfig when thinkingBudget is explicitly configured', async () => {
+      const provider = new GoogleProvider({ apiKey: 'test-key', model: 'gemini-2.5-flash', thinkingBudget: 0 });
       mockGenerateContent.mockResolvedValueOnce(makeGoogleResponse());
 
       await provider.complete({ messages: basicMessages });
@@ -1833,19 +2652,19 @@ describe('Google-specific error handling', () => {
       expect(contents[2].role).toBe('user');
     });
 
-    it('handles unknown tool call ID in results by using "unknown" name', async () => {
+    it('throws MismatchedToolCallIdError for unknown tool call ID (findings.md P2:1030)', async () => {
+      // findings.md P2:1030 — prior behavior silently mapped the miss to
+      // 'unknown' and sent a functionResponse for a call Gemini never made.
       const provider = createGoogleProviderInstance();
       mockGenerateContent.mockResolvedValueOnce(makeGoogleResponse());
 
-      await provider.continueWithToolResults(
-        { messages: basicMessages, tools: basicToolDefs },
-        [{ id: 'call_0', name: 'get_weather', input: { city: 'Tokyo' } }],
-        [{ toolCallId: 'nonexistent_id', content: 'result' }]
-      );
-
-      const callArgs = mockGenerateContent.mock.calls[0]![0]!;
-      const functionResponseParts = callArgs.contents[2].parts;
-      expect(functionResponseParts[0].functionResponse.name).toBe('unknown');
+      await expect(
+        provider.continueWithToolResults(
+          { messages: basicMessages, tools: basicToolDefs },
+          [{ id: 'call_0', name: 'get_weather', input: { city: 'Tokyo' } }],
+          [{ toolCallId: 'nonexistent_id', content: 'result' }]
+        )
+      ).rejects.toThrow('nonexistent_id');
     });
   });
 
@@ -2453,7 +3272,11 @@ describe('Retry behavior edge cases', () => {
   });
 
   describe('exponential backoff timing', () => {
-    it('delays increase exponentially: 1s, 2s, 4s', async () => {
+    it('delay caps double per attempt: 1s, 2s, 4s (findings.md P2:1050)', async () => {
+      // findings.md P2:1050 — with full jitter the delay is random in
+      // [0, cap]. Pin Math.random at ~1 so the sampled delay equals the
+      // cap and the original exponential-growth assertions still hold.
+      const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.9999);
       const fn = vi.fn()
         .mockRejectedValueOnce(makeOpenAIError(500, 'fail'))
         .mockRejectedValueOnce(makeOpenAIError(500, 'fail'))
@@ -2462,19 +3285,20 @@ describe('Retry behavior edge cases', () => {
 
       const promise = withRetry(fn, 'test');
 
-      // First retry after 1s
+      // First retry near cap of 1s
       await vi.advanceTimersByTimeAsync(1000);
       expect(fn).toHaveBeenCalledTimes(2);
 
-      // Second retry after 2s
+      // Second retry near cap of 2s
       await vi.advanceTimersByTimeAsync(2000);
       expect(fn).toHaveBeenCalledTimes(3);
 
-      // Third retry after 4s
+      // Third retry near cap of 4s
       await vi.advanceTimersByTimeAsync(4000);
       expect(fn).toHaveBeenCalledTimes(4);
 
       await promise;
+      randomSpy.mockRestore();
     });
 
     it('respects custom baseDelayMs', async () => {
@@ -2539,7 +3363,9 @@ describe('Retry behavior edge cases', () => {
       );
     });
 
-    it('logs delay value in warning', async () => {
+    it('logs delay and cap in warning (findings.md P2:1050)', async () => {
+      // findings.md P2:1050 — with jitter, delayMs is random; assert the
+      // cap grows deterministically instead.
       const fn = vi.fn()
         .mockRejectedValueOnce(makeOpenAIError(500, 'fail'))
         .mockResolvedValueOnce('ok');
@@ -2547,7 +3373,7 @@ describe('Retry behavior edge cases', () => {
       await withTimers(() => withRetry(fn, 'test'));
 
       expect(mockLoggerWarn).toHaveBeenCalledWith(
-        expect.objectContaining({ delayMs: 1000 }),
+        expect.objectContaining({ capMs: 1000 }),
         expect.any(String)
       );
     });
@@ -2614,73 +3440,75 @@ describe('Budget enforcement under errors', () => {
   });
 
   describe('recordUsage', () => {
-    it('records token usage to storage', () => {
+    // findings.md P2:1110 — recordUsage delegates to an atomic meta
+    // increment helper. These tests assert the call shape (delta, keys)
+    // and the 80%-warning driven off the helper's returned tokens;
+    // the read-modify-write semantics that used to live in budget.ts
+    // are now SQLite's problem and are covered by an integration test
+    // in storage.test.ts.
+    it('routes tokens through atomic helper with correct delta', () => {
       process.env['LAIN_MONTHLY_TOKEN_CAP'] = '100000';
-      const currentMonth = new Date().toISOString().slice(0, 7);
-      mockGetMeta.mockReturnValue(JSON.stringify({ month: currentMonth, tokens: 0 }));
-
       recordUsage(100, 50);
-
-      expect(mockSetMeta).toHaveBeenCalledWith(
-        'budget:monthly_usage',
-        expect.stringContaining('"tokens":150')
+      expect(mockAtomicMetaIncrementCounter).toHaveBeenCalledWith(
+        expect.objectContaining({
+          key: 'budget:monthly_usage',
+          counterField: 'tokens',
+          delta: 150,
+        }),
       );
     });
 
-    it('accumulates usage across calls', () => {
+    it('passes fresh JSON for current month', () => {
       process.env['LAIN_MONTHLY_TOKEN_CAP'] = '100000';
       const currentMonth = new Date().toISOString().slice(0, 7);
-      mockGetMeta.mockReturnValue(JSON.stringify({ month: currentMonth, tokens: 500 }));
-
       recordUsage(100, 50);
-
-      expect(mockSetMeta).toHaveBeenCalledWith(
-        'budget:monthly_usage',
-        expect.stringContaining('"tokens":650')
+      expect(mockAtomicMetaIncrementCounter).toHaveBeenCalledWith(
+        expect.objectContaining({
+          freshJson: JSON.stringify({ month: currentMonth, tokens: 150 }),
+          periodValue: currentMonth,
+        }),
       );
     });
 
     it('does nothing when cap is disabled', () => {
       process.env['LAIN_MONTHLY_TOKEN_CAP'] = '0';
-
       recordUsage(100, 50);
-
-      expect(mockSetMeta).not.toHaveBeenCalled();
+      expect(mockAtomicMetaIncrementCounter).not.toHaveBeenCalled();
     });
 
-    it('warns at 80% threshold', () => {
+    it('warns at 80% threshold (post-increment value crosses 0.8 * cap)', () => {
       process.env['LAIN_MONTHLY_TOKEN_CAP'] = '1000';
       const currentMonth = new Date().toISOString().slice(0, 7);
-      // At 790 tokens, adding 100+50=150 puts us at 940 which is >80% of 1000
-      // But 790 < 800 (80% threshold) so this triggers the 80% warning
-      mockGetMeta.mockReturnValue(JSON.stringify({ month: currentMonth, tokens: 790 }));
-
+      // Simulate the atomic helper returning tokens=940 after increment.
+      // Pre-increment = 940 - 150 = 790, which is < 800 (80%). Cross once.
+      mockAtomicMetaIncrementCounter.mockReturnValue(
+        JSON.stringify({ month: currentMonth, tokens: 940 }),
+      );
       recordUsage(100, 50);
-
       expect(mockLoggerWarn).toHaveBeenCalledWith(
         expect.objectContaining({ pct: expect.any(Number) }),
-        expect.stringContaining('80%')
+        expect.stringContaining('80%'),
       );
     });
 
     it('does not warn below 80% threshold', () => {
       process.env['LAIN_MONTHLY_TOKEN_CAP'] = '10000';
       const currentMonth = new Date().toISOString().slice(0, 7);
-      mockGetMeta.mockReturnValue(JSON.stringify({ month: currentMonth, tokens: 100 }));
-
+      mockAtomicMetaIncrementCounter.mockReturnValue(
+        JSON.stringify({ month: currentMonth, tokens: 115 }),
+      );
       recordUsage(10, 5);
-
       expect(mockLoggerWarn).not.toHaveBeenCalled();
     });
 
     it('does not warn if already above 80% (only warns on crossing)', () => {
       process.env['LAIN_MONTHLY_TOKEN_CAP'] = '1000';
       const currentMonth = new Date().toISOString().slice(0, 7);
-      // Already at 850 (above 80%), adding 10+5 stays above but doesn't cross
-      mockGetMeta.mockReturnValue(JSON.stringify({ month: currentMonth, tokens: 850 }));
-
+      // Before: 850 (> 800), after: 865. No crossing, no warning.
+      mockAtomicMetaIncrementCounter.mockReturnValue(
+        JSON.stringify({ month: currentMonth, tokens: 865 }),
+      );
       recordUsage(10, 5);
-
       expect(mockLoggerWarn).not.toHaveBeenCalled();
     });
   });
@@ -2787,21 +3615,21 @@ describe('Budget enforcement under errors', () => {
 
       // recordUsage should NOT have been called since we didn't get a response
       // (In the real code, withBudget() does the check + record; here we verify the concept)
-      expect(mockSetMeta).not.toHaveBeenCalled();
+      expect(mockAtomicMetaIncrementCounter).not.toHaveBeenCalled();
     });
 
     it('successful call after failed call properly records only success usage', async () => {
       process.env['LAIN_MONTHLY_TOKEN_CAP'] = '100000';
-      const currentMonth = new Date().toISOString().slice(0, 7);
-      mockGetMeta.mockReturnValue(JSON.stringify({ month: currentMonth, tokens: 0 }));
 
       // Record only the successful call
       recordUsage(10, 5);
 
-      expect(mockSetMeta).toHaveBeenCalledTimes(1);
-      expect(mockSetMeta).toHaveBeenCalledWith(
-        'budget:monthly_usage',
-        expect.stringContaining('"tokens":15')
+      expect(mockAtomicMetaIncrementCounter).toHaveBeenCalledTimes(1);
+      expect(mockAtomicMetaIncrementCounter).toHaveBeenCalledWith(
+        expect.objectContaining({
+          key: 'budget:monthly_usage',
+          delta: 15,
+        }),
       );
     });
   });
@@ -2855,14 +3683,23 @@ describe('Budget enforcement under errors', () => {
 
     it('recordUsage starts from zero in new month', () => {
       process.env['LAIN_MONTHLY_TOKEN_CAP'] = '100000';
-      mockGetMeta.mockReturnValue(JSON.stringify({ month: '2024-01', tokens: 50000 }));
 
       recordUsage(10, 5);
 
-      // Should save with current month and only 15 tokens (reset + new usage)
-      const savedValue = JSON.parse(mockSetMeta.mock.calls[0]![1] as string);
-      expect(savedValue.tokens).toBe(15);
-      expect(savedValue.month).toBe(new Date().toISOString().slice(0, 7));
+      // findings.md P2:1110 — the atomic helper handles month rollover
+      // via json_extract(...month) mismatch → takes the ELSE branch and
+      // writes freshJson as-is. Here we assert recordUsage hands it the
+      // current month and the exact delta, not the accumulated count.
+      const call = mockAtomicMetaIncrementCounter.mock.calls[0]![0] as {
+        periodValue: string;
+        delta: number;
+        freshJson: string;
+      };
+      expect(call.periodValue).toBe(new Date().toISOString().slice(0, 7));
+      expect(call.delta).toBe(15);
+      const parsed = JSON.parse(call.freshJson);
+      expect(parsed.tokens).toBe(15);
+      expect(parsed.month).toBe(new Date().toISOString().slice(0, 7));
     });
   });
 });
@@ -2874,23 +3711,33 @@ describe('Budget enforcement under errors', () => {
 
 describe('Cross-cutting error scenarios', () => {
 
-  describe('Anthropic retry only targets overloaded', () => {
-    it('does not retry 429 rate limit (Anthropic uses its own withRetry for overloaded only)', async () => {
+  describe('Anthropic retry covers overloaded, rate-limit, and timeout', () => {
+    it('does retry 429 rate limit (findings.md P2:848)', async () => {
+      // findings.md P2:848 — 429 was previously not classified as
+      // retryable on Anthropic (only "overloaded" matched). Rate limits
+      // are transparently retryable just like 529 overloads.
       const provider = createAnthropicProvider();
       const err = makeAnthropicError(429, 'Rate limited');
 
-      mockAnthropicCreate.mockRejectedValueOnce(err);
+      mockAnthropicCreate
+        .mockRejectedValueOnce(err)
+        .mockResolvedValueOnce(makeAnthropicResponse());
 
-      // Anthropic's withRetry only checks for "overloaded" string
-      await expect(provider.complete({ messages: basicMessages }))
-        .rejects.toThrow('Rate limited');
-      expect(mockAnthropicCreate).toHaveBeenCalledTimes(1);
+      const result = await withTimers(() => provider.complete({ messages: basicMessages }));
+      expect(result.content).toBe('hello');
+      expect(mockAnthropicCreate).toHaveBeenCalledTimes(2);
     });
   });
 
   describe('OpenAI/Google use shared withRetry for status codes', () => {
-    it('OpenAI uses withRetry that checks status codes [429, 500, 502, 503]', async () => {
-      for (const status of [429, 500, 502, 503]) {
+    // findings.md P2:1070 — retryable defaults expanded to cover 408
+    // (client timeout), 504 (gateway timeout), 520-524 (Cloudflare origin),
+    // and 529 (Anthropic overloaded). Keep this list in sync with
+    // DEFAULT_CONFIG.retryableStatusCodes in src/providers/retry.ts.
+    const RETRYABLE_STATUS_CODES = [408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529];
+
+    it('OpenAI uses withRetry that covers transient upstream status codes', async () => {
+      for (const status of RETRYABLE_STATUS_CODES) {
         mockOpenAICreate.mockReset();
         const provider = createOpenAIProvider();
         mockOpenAICreate
@@ -2902,8 +3749,8 @@ describe('Cross-cutting error scenarios', () => {
       }
     });
 
-    it('Google uses withRetry that checks status codes [429, 500, 502, 503]', async () => {
-      for (const status of [429, 500, 502, 503]) {
+    it('Google uses withRetry that covers transient upstream status codes', async () => {
+      for (const status of RETRYABLE_STATUS_CODES) {
         mockGenerateContent.mockReset();
         mockGetGenerativeModel.mockReset();
         mockGetGenerativeModel.mockReturnValue({ generateContent: mockGenerateContent });

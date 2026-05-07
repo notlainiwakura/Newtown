@@ -32,20 +32,34 @@ describe('Rate Limiter', () => {
     resetRateLimiter();
   });
 
-  describe('canConnect', () => {
-    it('should allow connections within limit', () => {
-      for (let i = 0; i < 5; i++) {
+  // findings.md P2:2616 — canConnect() now enforces a cheap pre-auth
+  // budget (max(1000, connectionsPerMinute*10)) separate from the
+  // authenticated-connection budget in canAuthenticate().
+  describe('canConnect (pre-auth budget)', () => {
+    it('should allow many connections under the pre-auth budget', () => {
+      for (let i = 0; i < 50; i++) {
         const result = canConnect();
         expect(result.allowed).toBe(true);
       }
     });
+  });
 
-    it('should reject connections over limit', () => {
+  describe('canAuthenticate (authenticated budget)', () => {
+    it('should allow authentications within limit', async () => {
+      const { canAuthenticate } = await import('../src/gateway/rate-limiter.js');
       for (let i = 0; i < 5; i++) {
-        canConnect();
+        const result = canAuthenticate();
+        expect(result.allowed).toBe(true);
+      }
+    });
+
+    it('should reject authentications over limit', async () => {
+      const { canAuthenticate } = await import('../src/gateway/rate-limiter.js');
+      for (let i = 0; i < 5; i++) {
+        canAuthenticate();
       }
 
-      const result = canConnect();
+      const result = canAuthenticate();
       expect(result.allowed).toBe(false);
       expect(result.retryAfter).toBeGreaterThan(0);
     });

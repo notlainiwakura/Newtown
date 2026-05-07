@@ -10,6 +10,7 @@ import { ConfigError } from '../utils/errors.js';
 import { getDefaultConfig, generateSampleConfig } from './defaults.js';
 import { getPaths } from './paths.js';
 import { validate } from './schema.js';
+import { getLogger } from '../utils/logger.js';
 
 export { getPaths, getBasePath } from './paths.js';
 export { getDefaultConfig, generateSampleConfig } from './defaults.js';
@@ -73,7 +74,27 @@ export function isConfigLoaded(): boolean {
 }
 
 /**
+ * findings.md P2:267 — detect JSON5 comments in an existing config file.
+ * `JSON5.stringify` strips comments on round-trip, so any caller using
+ * `saveConfig` to rewrite an operator-edited config would silently wipe
+ * their inline documentation. Regex is intentionally crude (a `//` inside
+ * a string literal would count as a comment too) — we'd rather over-warn
+ * than let a real comment slip through.
+ */
+function containsJson5Comments(raw: string): boolean {
+  return /\/\/|\/\*/.test(raw);
+}
+
+/**
  * Save configuration to file
+ *
+ * findings.md P2:267 — `JSON5.stringify` does not preserve comments. To
+ * avoid silently wiping an operator's inline documentation, we peek at the
+ * existing file first: if it contains comment markers we write the
+ * original to `${path}.bak.${timestamp}` and warn with both paths. The
+ * save still succeeds (no behaviour regression), but the commented form
+ * is recoverable from the sidecar and the warning is unmistakable in the
+ * logs.
  */
 export async function saveConfig(config: LainConfig, configPath?: string): Promise<void> {
   const paths = getPaths();
@@ -84,6 +105,23 @@ export async function saveConfig(config: LainConfig, configPath?: string): Promi
 
   try {
     await mkdir(dirname(path), { recursive: true });
+
+    let existing: string | null = null;
+    try {
+      existing = await readFile(path, 'utf-8');
+    } catch {
+      // File doesn't exist yet — no comments to preserve.
+    }
+
+    if (existing !== null && containsJson5Comments(existing)) {
+      const backupPath = `${path}.bak.${Date.now()}`;
+      await writeFile(backupPath, existing);
+      getLogger().warn(
+        { configPath: path, backupPath },
+        'saveConfig overwriting commented config.json5; comments would be stripped by JSON5.stringify. Wrote original to backup sidecar.',
+      );
+    }
+
     await writeFile(path, JSON5.stringify(config, null, 2));
     cachedConfig = config;
   } catch (error) {

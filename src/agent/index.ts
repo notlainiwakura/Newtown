@@ -2,8 +2,7 @@
  * Agent runtime with full LLM integration
  */
 
-import { appendFile, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { createDebugLogger } from '../utils/debug-log.js';
 import type { AgentConfig } from '../types/config.js';
 import type { AgentRequest, AgentResponse } from '../types/message.js';
 import { getOrCreateSession, updateSession } from '../storage/sessions.js';
@@ -18,7 +17,6 @@ import {
   updateTokenCount,
 } from './conversation.js';
 import { getToolDefinitions, executeTools } from './tools.js';
-import { loadCustomTools } from './skills.js';
 import { createProvider, type Provider, type CompletionWithToolsResult } from '../providers/index.js';
 import { getLogger } from '../utils/logger.js';
 import { nanoid } from 'nanoid';
@@ -32,6 +30,7 @@ import { getSelfConcept } from './self-concept.js';
 import { getPostboardMessages } from '../memory/store.js';
 import { getActiveTownEvents, type TownEvent } from '../events/town-events.js';
 import { eventBus } from '../events/bus.js';
+import { withTruncationRecovery } from '../utils/completion-guards.js';
 
 const WIRED_LAIN_URL = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
 
@@ -112,18 +111,9 @@ async function getTownEventContext(): Promise<string> {
   }
 }
 
-const LOG_FILE = join(process.cwd(), 'logs', 'agent-debug.log');
-
-async function agentLog(context: string, data: unknown): Promise<void> {
-  try {
-    await mkdir(join(process.cwd(), 'logs'), { recursive: true });
-    const timestamp = new Date().toISOString();
-    const entry = `[${timestamp}] [${context}] ${JSON.stringify(data, null, 2)}\n${'='.repeat(80)}\n`;
-    await appendFile(LOG_FILE, entry);
-  } catch {
-    // Ignore logging errors
-  }
-}
+// findings.md P2:1757 — per-character, rotated, LOG_LEVEL-gated debug log.
+// Was: `${cwd}/logs/agent-debug.log`, shared by every character, no rotation.
+const agentLog = createDebugLogger('agent-debug.log');
 
 export { loadPersona, buildSystemPrompt, applyPersonaStyle } from './persona.js';
 export {
@@ -150,6 +140,20 @@ interface AgentState {
   providers: Map<ModelTier, Provider>;
 }
 
+/**
+ * findings.md P2:1727 — single-tenant by design.
+ *
+ * The agents Map is keyed by `config.id`, but every in-repo caller
+ * passes `id: 'default'` and the hot-path readers (processMessage /
+ * processMessageStream) hardcode the `'default'` key. A second
+ * initAgent call with a different id would succeed silently, storing
+ * a second entry that nothing ever reads — a latent multi-tenant
+ * bug where the "second character" is simply dead state.
+ *
+ * Make the invariant explicit: initAgent throws if the Map is not
+ * empty. A future multi-tenant refactor must change the hot path
+ * AND remove this guard in the same commit.
+ */
 const agents = new Map<string, AgentState>();
 
 const MAX_CONTEXT_TOKENS = 100000;
@@ -161,21 +165,33 @@ const MAX_TOOL_ITERATIONS = 8;
 export async function initAgent(config: AgentConfig): Promise<void> {
   const logger = getLogger();
 
+  // findings.md P2:1727 — single-tenant invariant. A second init call
+  // used to silently overwrite/add to the map while the hot path
+  // (processMessage / processMessageStream) keeps reading 'default'
+  // — so the "second character" was indistinguishable from dead state.
+  if (agents.size > 0) {
+    const existing = [...agents.keys()];
+    throw new Error(
+      `initAgent called twice in one process (existing: ${existing.join(', ')}, new: ${config.id}); the runtime is single-tenant — spawn a separate process per character`
+    );
+  }
+
   logger.info({ agentId: config.id }, 'Initializing agent');
 
   const persona = await loadPersona({ workspacePath: config.workspace });
-  const systemPrompt = buildSystemPrompt(persona);
+  const systemPrompt = buildSystemPrompt(persona, config.id);
 
   // Create providers from config array: [0]=personality, [1]=memory, [2]=light
   const tierNames: ModelTier[] = ['personality', 'memory', 'light'];
   const providers = new Map<ModelTier, Provider>();
   let provider: Provider | null = null;
 
+  const failures: Array<{ tier: ModelTier; type: string; model: string; error: string }> = [];
   for (let i = 0; i < config.providers.length; i++) {
     const providerConfig = config.providers[i]!;
     const tier = tierNames[i] ?? 'personality';
     try {
-      const p = createProvider(providerConfig);
+      const p = withTruncationRecovery(createProvider(providerConfig), logger);
       providers.set(tier, p);
       if (i === 0) provider = p;
       logger.info(
@@ -183,17 +199,25 @@ export async function initAgent(config: AgentConfig): Promise<void> {
         'Provider initialized for tier'
       );
     } catch (error) {
-      logger.warn(
-        { agentId: config.id, tier, error },
+      // findings.md P2:1737 — escalate to ERROR and record for crash-loud below.
+      // A failed personality-tier init used to silently fall through to echo
+      // mode; operators saw normal startup while users got Lain-speak error
+      // copy from a character that had no working LLM.
+      logger.error(
+        { agentId: config.id, tier, provider: providerConfig.type, model: providerConfig.model, error: String(error) },
         'Failed to initialize provider for tier'
       );
+      failures.push({ tier, type: providerConfig.type, model: providerConfig.model, error: String(error) });
     }
   }
 
   if (!provider) {
-    logger.warn(
-      { agentId: config.id },
-      'No providers initialized, agent will use echo mode'
+    // findings.md P2:1737 — crash-loud. Without any provider the agent would
+    // silently run in echo mode. Systemd restarts on failure, which surfaces
+    // the problem via unit status / journal and rejects a broken boot.
+    const detail = failures.map((f) => `${f.tier}:${f.type}/${f.model} (${f.error})`).join('; ');
+    throw new Error(
+      `Agent ${config.id}: no providers could be initialized (${config.providers.length} configured); failures: ${detail || 'none configured'}`
     );
   }
 
@@ -204,12 +228,6 @@ export async function initAgent(config: AgentConfig): Promise<void> {
     provider,
     providers,
   });
-
-  // Load custom tools from skills directory
-  const customToolCount = await loadCustomTools();
-  if (customToolCount > 0) {
-    logger.info({ count: customToolCount }, 'Loaded custom tools');
-  }
 
   logger.debug({ agentId: config.id }, 'Agent initialized');
 }
@@ -238,14 +256,213 @@ export function getProvider(agentId: string, tier: ModelTier): Provider | null {
 }
 
 /**
- * Process a message through the agent
+ * findings.md P2:1873 — single-tenant helper so tool handlers can reach the
+ * active character's provider without being passed agentId explicitly. The
+ * runtime asserts `agents.size === 1` in initAgent (P2:1727), so callers
+ * can rely on "the active character" being well-defined here.
  */
-export async function processMessage(request: AgentRequest): Promise<AgentResponse> {
+export function getActiveAgentId(): string | null {
+  const first = agents.keys().next();
+  return first.done ? null : first.value;
+}
+
+/**
+ * findings.md P2:1717 — 10 context-injection catches used to swallow
+ * module-load or evaluation failures with no user-facing signal, so a
+ * refactor that broke any of the dynamic imports would silently
+ * downgrade every subsequent prompt (weather block missing, residue
+ * missing, etc.) with no log at anything louder than debug.
+ *
+ * Now: the first full successful pass records the resolved-source set
+ * as a baseline and logs it at INFO. Subsequent passes compare — any
+ * source that resolved in the baseline but NOT in the current pass
+ * fires a WARN so a regression is visible immediately. Transient
+ * expected misses (peer unreachable) only matter if they persist
+ * long enough to reshape the baseline; occasional drops surface as
+ * WARNs rather than noisy errors.
+ */
+let contextSourceBaseline: Set<ContextSource> | null = null;
+const CONTEXT_SOURCES = [
+  'internal-state-summary',
+  'preoccupations',
+  'location',
+  'weather',
+  'awareness',
+  'objects',
+  'building-residue',
+  'memory',
+] as const;
+type ContextSource = (typeof CONTEXT_SOURCES)[number];
+
+function recordContextSource(observed: Set<ContextSource>, name: ContextSource): void {
+  observed.add(name);
+}
+
+function diagnoseContextInjection(
+  observed: Set<ContextSource>,
+  logger: ReturnType<typeof getLogger>,
+): void {
+  if (!contextSourceBaseline) {
+    contextSourceBaseline = new Set(observed);
+    logger.info(
+      { resolved: [...observed].sort() },
+      'context-injection baseline recorded (findings.md P2:1717)'
+    );
+    return;
+  }
+  const dropped: string[] = [];
+  for (const s of contextSourceBaseline) {
+    if (!observed.has(s)) dropped.push(s);
+  }
+  if (dropped.length > 0) {
+    logger.warn({ dropped }, 'context-injection sources regressed from baseline');
+  }
+}
+
+/**
+ * Build the enhanced system prompt by layering living context
+ * (self-concept, internal state, location, weather, peers, objects,
+ * postboard, events, building residue, memory) onto the base persona.
+ */
+async function buildEnhancedSystemPrompt(
+  baseSystemPrompt: string,
+  userContent: string,
+  sessionKey: string,
+  logger: ReturnType<typeof getLogger>,
+  provider?: Provider,
+): Promise<string> {
+  let prompt = baseSystemPrompt;
+  const observed = new Set<ContextSource>();
+
+  const selfConcept = getSelfConcept();
+  if (selfConcept) {
+    prompt += '\n\n---\n\n## Who You Are Now\n\n' +
+      'This reflects who you have become through your experiences. ' +
+      'Let it influence you naturally.\n\n' + selfConcept;
+  }
+
+  try {
+    const { getStateSummary } = await import('./internal-state.js');
+    const stateSummary = getStateSummary();
+    if (stateSummary) {
+      prompt += '\n\n[Your Internal State]\n' + stateSummary;
+      recordContextSource(observed, 'internal-state-summary');
+    }
+  } catch (err) { logger.debug({ err, source: 'internal-state-summary' }, 'context injection failed'); }
+
+  try {
+    const { getPreoccupations } = await import('./internal-state.js');
+    const preoccs = getPreoccupations().filter(p => p.intensity >= 0.5);
+    if (preoccs.length > 0) {
+      const lines = preoccs.map(p => `- ${p.thread} (from ${p.origin})`).join('\n');
+      prompt += '\n\n[On your mind]\n' + lines;
+      recordContextSource(observed, 'preoccupations');
+    }
+  } catch (err) { logger.debug({ err, source: 'preoccupations' }, 'context injection failed'); }
+
+  try {
+    const { getCurrentLocation } = await import('../commune/location.js');
+    const { BUILDING_MAP } = await import('../commune/buildings.js');
+    const charId = process.env['LAIN_CHARACTER_ID'] || 'lain';
+    const loc = getCurrentLocation(charId);
+    const building = BUILDING_MAP.get(loc.building);
+    if (building) {
+      prompt += `\n\n[Your Current Location: ${building.name} — ${building.description}]`;
+      recordContextSource(observed, 'location');
+    }
+  } catch (err) { logger.debug({ err, source: 'location' }, 'context injection failed'); }
+
+  // findings.md P2:1505 — use the cached town-weather accessor.
+  // Previously this path had an inline fallback that fetched WL's
+  // /api/weather fresh on every prompt build (no cache), and a local
+  // getMeta read that returned null on non-WL processes. getTownWeather
+  // short-circuits to local meta on WL, else uses the TTL cache warmed
+  // by startTownWeatherRefreshLoop.
+  try {
+    const { getTownWeather } = await import('../commune/weather.js');
+    const weather = await getTownWeather();
+    if (weather && weather.condition !== 'overcast') {
+      prompt += `\n\n[Weather in town: ${weather.description}]`;
+      recordContextSource(observed, 'weather');
+    }
+  } catch (err) { logger.debug({ err, source: 'weather' }, 'context injection failed'); }
+
+  try {
+    const { buildAwarenessContext } = await import('./awareness.js');
+    const charId = process.env['LAIN_CHARACTER_ID'] || 'lain';
+    const { getCurrentLocation } = await import('../commune/location.js');
+    const loc = getCurrentLocation(charId);
+    const peerConfigRaw = process.env['PEER_CONFIG'];
+    if (peerConfigRaw) {
+      const peers = JSON.parse(peerConfigRaw) as import('./character-tools.js').PeerConfig[];
+      const awarenessCtx = await buildAwarenessContext(loc.building, peers);
+      if (awarenessCtx) {
+        prompt += awarenessCtx;
+        recordContextSource(observed, 'awareness');
+      }
+    }
+  } catch (err) { logger.debug({ err, source: 'awareness' }, 'context injection failed'); }
+
+  try {
+    const { buildObjectContext } = await import('./objects.js');
+    const charId = process.env['LAIN_CHARACTER_ID'] || 'lain';
+    const wiredUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
+    const objectCtx = await buildObjectContext(charId, wiredUrl);
+    if (objectCtx) {
+      prompt += '\n\n[Your Objects]\n' + objectCtx;
+      recordContextSource(observed, 'objects');
+    }
+  } catch (err) { logger.debug({ err, source: 'objects' }, 'context injection failed'); }
+
+  const postboardContext = await getPostboardContext();
+  if (postboardContext) {
+    prompt += postboardContext;
+  }
+
+  const townEventContext = await getTownEventContext();
+  if (townEventContext) {
+    prompt += townEventContext;
+  }
+
+  try {
+    const { buildBuildingResidueContext } = await import('../commune/building-memory.js');
+    const charId = process.env['LAIN_CHARACTER_ID'] || 'lain';
+    const residueCtx = await buildBuildingResidueContext(charId);
+    if (residueCtx) {
+      prompt += residueCtx;
+      recordContextSource(observed, 'building-residue');
+    }
+  } catch (err) { logger.debug({ err, source: 'building-residue' }, 'context injection failed'); }
+
+  try {
+    const memoryContext = await buildMemoryContext(userContent, sessionKey, provider);
+    if (memoryContext) {
+      prompt += memoryContext;
+      recordContextSource(observed, 'memory');
+    }
+  } catch (error) {
+    logger.warn({ error }, 'Failed to build memory context');
+  }
+
+  diagnoseContextInjection(observed, logger);
+  return prompt;
+}
+
+/**
+ * Process a message through the agent.
+ *
+ * When `onChunk` is provided, partial deltas are streamed through it as they
+ * arrive; otherwise the full response is returned without intermediate
+ * callbacks. Streaming and non-streaming callers share one pipeline.
+ */
+export async function processMessage(
+  request: AgentRequest,
+  onChunk?: StreamCallback,
+): Promise<AgentResponse> {
   const logger = getLogger();
   const agentId = 'default';
   const agent = agents.get(agentId);
 
-  // Get or create session
   const session = getOrCreateSession({
     agentId,
     channel: request.message.channel,
@@ -254,167 +471,42 @@ export async function processMessage(request: AgentRequest): Promise<AgentRespon
   });
 
   logger.debug(
-    { sessionKey: session.key, channel: session.channel },
+    { sessionKey: session.key, channel: session.channel, streaming: Boolean(onChunk) },
     'Processing message'
   );
 
-  // If no provider is available, use echo mode
   if (!agent?.provider || !agent.systemPrompt) {
-    return createEchoResponse(request, session.key);
+    const response = createEchoResponse(request, session.key);
+    if (onChunk) {
+      const text = response.messages[0]?.content;
+      if (text && 'text' in text) {
+        onChunk(text.text);
+      }
+    }
+    return response;
   }
 
-  // Get user message content
   const userContent = request.message.content.type === 'text'
     ? request.message.content.text
     : '[non-text content]';
 
-  // Build enhanced system prompt: SOUL.md + self-concept + memory context
-  let enhancedSystemPrompt = agent.systemPrompt;
+  const enhancedSystemPrompt = await buildEnhancedSystemPrompt(
+    agent.systemPrompt,
+    userContent,
+    session.key,
+    logger,
+    agent.provider,
+  );
 
-  // Inject living self-concept (between static persona and dynamic memory)
-  const selfConcept = getSelfConcept();
-  if (selfConcept) {
-    enhancedSystemPrompt += '\n\n---\n\n## Who You Are Now\n\n' +
-      'This reflects who you have become through your experiences. ' +
-      'Let it influence you naturally.\n\n' + selfConcept;
-  }
-
-  // Inject internal emotional state
-  try {
-    const { getStateSummary } = await import('./internal-state.js');
-    const stateSummary = getStateSummary();
-    if (stateSummary) {
-      enhancedSystemPrompt += '\n\n[Your Internal State]\n' + stateSummary;
-    }
-  } catch { /* non-critical */ }
-
-  // Inject active preoccupations
-  try {
-    const { getPreoccupations } = await import('./internal-state.js');
-    const preoccs = getPreoccupations().filter(p => p.intensity >= 0.5);
-    if (preoccs.length > 0) {
-      const lines = preoccs.map(p => `- ${p.thread} (from ${p.origin})`).join('\n');
-      enhancedSystemPrompt += '\n\n[On your mind]\n' + lines;
-    }
-  } catch { /* non-critical */ }
-
-  // Inject current location so the character knows where they are
-  try {
-    const { getCurrentLocation } = await import('../commune/location.js');
-    const { BUILDING_MAP } = await import('../commune/buildings.js');
-    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
-    const loc = getCurrentLocation(charId);
-    const building = BUILDING_MAP.get(loc.building);
-    if (building) {
-      enhancedSystemPrompt += `\n\n[Your Current Location: ${building.name} — ${building.description}]`;
-    }
-  } catch { /* non-critical */ }
-
-  // Inject weather
-  try {
-    let weatherDesc: string | null = null;
-    // Try local meta store first (works for Wired Lain)
-    const { getCurrentWeather } = await import('../commune/weather.js');
-    const localWeather = getCurrentWeather();
-    if (localWeather && localWeather.condition !== 'overcast') {
-      weatherDesc = localWeather.description;
-    }
-    // Fallback to HTTP for non-Wired instances
-    if (!weatherDesc) {
-      const peerConfigRaw = process.env['PEER_CONFIG'];
-      if (peerConfigRaw) {
-        const peers = JSON.parse(peerConfigRaw) as Array<{ id: string; url: string }>;
-        const wiredPeer = peers.find(p => p.id === 'wired-lain');
-        if (wiredPeer) {
-          const resp = await fetch(`${wiredPeer.url}/api/weather`, {
-            signal: AbortSignal.timeout(3000),
-          });
-          if (resp.ok) {
-            const data = await resp.json() as { condition: string; description: string };
-            if (data.condition && data.condition !== 'overcast') {
-              weatherDesc = data.description;
-            }
-          }
-        }
-      }
-    }
-    if (weatherDesc) {
-      enhancedSystemPrompt += `\n\n[Weather in town: ${weatherDesc}]`;
-    }
-  } catch { /* non-critical */ }
-
-  // Inject ambient awareness of co-located peers
-  try {
-    const { buildAwarenessContext } = await import('./awareness.js');
-    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
-    const { getCurrentLocation } = await import('../commune/location.js');
-    const loc = getCurrentLocation(charId);
-    const peerConfigRaw = process.env['PEER_CONFIG'];
-    if (peerConfigRaw) {
-      const peers = JSON.parse(peerConfigRaw) as import('./character-tools.js').PeerConfig[];
-      const awarenessCtx = await buildAwarenessContext(loc.building, peers);
-      if (awarenessCtx) {
-        enhancedSystemPrompt += awarenessCtx;
-      }
-    }
-  } catch { /* non-critical */ }
-
-  // Inject object inventory with symbolic meanings + composition lexicon
-  try {
-    const { buildObjectContext } = await import('./objects.js');
-    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
-    const wiredUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
-    const objectCtx = await buildObjectContext(charId, wiredUrl);
-    if (objectCtx) {
-      enhancedSystemPrompt += '\n\n[Your Objects]\n' + objectCtx;
-    }
-  } catch { /* non-critical */ }
-
-  // Inject postboard messages from the administrator
-  const postboardContext = await getPostboardContext();
-  if (postboardContext) {
-    enhancedSystemPrompt += postboardContext;
-  }
-
-  // Inject active town events
-  const townEventContext = await getTownEventContext();
-  if (townEventContext) {
-    enhancedSystemPrompt += townEventContext;
-  }
-
-  // Inject building residue — traces of what happened at this location
-  try {
-    const { buildBuildingResidueContext } = await import('../commune/building-memory.js');
-    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
-    const residueCtx = await buildBuildingResidueContext(charId);
-    if (residueCtx) {
-      enhancedSystemPrompt += residueCtx;
-    }
-  } catch { /* non-critical */ }
-
-  try {
-    const memoryContext = await buildMemoryContext(userContent, session.key);
-    if (memoryContext) {
-      enhancedSystemPrompt += memoryContext;
-    }
-  } catch (error) {
-    logger.warn({ error }, 'Failed to build memory context');
-  }
-
-  // Get or create conversation with memory-enhanced prompt
   const conversation = getConversation(session.key, enhancedSystemPrompt);
-
-  // Add user message to conversation
   addUserMessage(conversation, request.message);
 
-  // Record user message to persistent memory
   await recordMessage(session.key, 'user', userContent, {
     senderId: request.message.senderId,
     senderName: request.message.senderName,
     messageId: request.message.id,
   });
 
-  // Compress conversation if needed (summarizes older messages instead of dropping them)
   const compressProvider = getProvider(agentId, 'light') ?? agent.provider;
   if (compressProvider) {
     await compressConversation(conversation, MAX_CONTEXT_TOKENS, estimateTokens, compressProvider);
@@ -423,36 +515,26 @@ export async function processMessage(request: AgentRequest): Promise<AgentRespon
   }
 
   try {
-    // Generate response with tool use support, with tier fallback
     let result: CompletionWithToolsResult;
     try {
-      result = await generateResponseWithTools(agent.provider, conversation);
+      result = await generateResponseWithTools(agent.provider, conversation, onChunk);
     } catch (primaryError) {
       const fallback = agent.providers.get('light');
       if (fallback && fallback !== agent.provider) {
         logger.warn({ error: primaryError }, 'Primary provider failed, falling back to light tier');
-        result = await generateResponseWithTools(fallback, conversation);
+        result = await generateResponseWithTools(fallback, conversation, onChunk);
       } else {
         throw primaryError;
       }
     }
 
-    // Apply persona style to response
     const styledContent = applyPersonaStyle(result.content);
-
-    // Add assistant response to conversation
     addAssistantMessage(conversation, styledContent);
-
-    // Record assistant message to persistent memory
     await recordMessage(session.key, 'assistant', styledContent);
-
-    // Update token counts
     updateTokenCount(conversation, result.usage.inputTokens, result.usage.outputTokens);
 
-    // Extract memories when session has enough context or high-signal content
     const memoryProvider = getProvider(agentId, 'personality');
     if (shouldExtractMemories(session.key, userContent) && memoryProvider) {
-      // Emit conversation:end event for background loops
       try {
         eventBus.emitActivity({
           type: 'state',
@@ -462,18 +544,16 @@ export async function processMessage(request: AgentRequest): Promise<AgentRespon
         });
       } catch { /* non-critical */ }
 
-      // Run in background, don't wait
       processConversationEnd(memoryProvider, session.key).catch((err) => {
         logger.warn({ err }, 'Background memory extraction failed');
       });
     }
 
-    // Update session
     updateSession(session.key, {
       tokenCount: session.tokenCount + result.usage.inputTokens + result.usage.outputTokens,
     });
 
-    const response: AgentResponse = {
+    return {
       sessionKey: session.key,
       messages: [
         {
@@ -490,14 +570,17 @@ export async function processMessage(request: AgentRequest): Promise<AgentRespon
         total: result.usage.inputTokens + result.usage.outputTokens,
       },
     };
-
-    return response;
   } catch (error) {
     logger.error({ error, sessionKey: session.key }, 'Error generating response');
     console.error('AGENT ERROR:', error);
 
-    // Return error message in Lain's style
-    const errorMessage = '...something went wrong. the wired is unstable right now...';
+    // findings.md P2:1747 — generic, character-agnostic error copy.
+    // "the wired is unstable" leaked Lain/Wired-Lain flavor into every
+    // character's error path (e.g. PKD's failures claimed Lain identity).
+    const errorMessage = '...something went wrong. please try again in a moment';
+    if (onChunk) {
+      onChunk(errorMessage);
+    }
 
     return {
       sessionKey: session.key,
@@ -515,29 +598,48 @@ export async function processMessage(request: AgentRequest): Promise<AgentRespon
 }
 
 /**
- * Generate response with tool use support
+ * Generate response with tool use support.
+ *
+ * When `onChunk` is provided and the provider exposes streaming variants,
+ * partial deltas are forwarded as they arrive. Without `onChunk` (or against
+ * a provider that lacks streaming methods) the function runs the same tool
+ * loop without mid-flight emissions.
  */
 async function generateResponseWithTools(
   provider: Provider,
-  conversation: ReturnType<typeof getConversation>
+  conversation: ReturnType<typeof getConversation>,
+  onChunk?: StreamCallback,
 ): Promise<CompletionWithToolsResult> {
   const logger = getLogger();
-  const tools = getToolDefinitions();
+  // findings.md P2:1887 — filter the registry to the active character's
+  // allowlist so each LLM only sees tools its persona is allowed to use.
+  const tools = getToolDefinitions(eventBus.characterId || getActiveAgentId() || undefined);
   const messages = toProviderMessages(conversation);
 
-  // Track media (images) from tool results to append to response
   const mediaResults: string[] = [];
 
   await agentLog('TOOLS_AVAILABLE', tools.map(t => ({ name: t.name, description: t.description })));
   await agentLog('MESSAGES_TO_LLM', messages);
 
-  let result = await provider.completeWithTools({
+  const completionOpts = {
     messages,
     tools,
-    maxTokens: 4096,
+    maxTokens: 8192,
     temperature: 0.8,
-    enableCaching: true, // Cache system prompt and tools for 90% cost reduction
-  });
+    enableCaching: true,
+  } as const;
+
+  let result: CompletionWithToolsResult;
+  // findings.md P2:818 — branch on the capability flag rather than on
+  // method presence so a single source of truth drives fallback.
+  if (onChunk && provider.supportsStreaming && provider.completeWithToolsStream) {
+    result = await provider.completeWithToolsStream(completionOpts, onChunk);
+  } else {
+    result = await provider.completeWithTools(completionOpts);
+    if (onChunk && result.content) {
+      onChunk(result.content);
+    }
+  }
 
   await agentLog('LLM_RESPONSE', {
     content: result.content,
@@ -546,26 +648,23 @@ async function generateResponseWithTools(
     usage: result.usage,
   });
 
-  // Handle tool calls iteratively
   let iterations = 0;
   while (result.toolCalls && result.toolCalls.length > 0 && iterations < MAX_TOOL_ITERATIONS) {
     iterations++;
     logger.debug(
-      { iteration: iterations, toolCalls: result.toolCalls.map((tc) => tc.name) },
+      { iteration: iterations, toolCalls: result.toolCalls.map((tc) => tc.name), streaming: Boolean(onChunk) },
       'Processing tool calls'
     );
 
-    await agentLog('TOOL_CALLS', {
-      iteration: iterations,
-      toolCalls: result.toolCalls,
-    });
+    await agentLog('TOOL_CALLS', { iteration: iterations, toolCalls: result.toolCalls });
 
     const currentToolCalls = result.toolCalls;
-
-    // Execute tools
+    // findings.md P2:930 — carry the prior turn's assistant text through
+    // so the provider can reconstruct the message with text + tool_use
+    // blocks, preserving mid-turn narration instead of silently dropping it.
+    const priorAssistantText = result.content;
     const toolResults = await executeTools(currentToolCalls);
 
-    // Check for image results and collect them
     for (const tr of toolResults) {
       const imageMatch = tr.content.match(/\[IMAGE:\s*[^\]]*\]\([^)]+\)/g);
       if (imageMatch) {
@@ -575,12 +674,25 @@ async function generateResponseWithTools(
 
     await agentLog('TOOL_RESULTS', toolResults);
 
-    // Continue conversation with tool results
-    result = await provider.continueWithToolResults(
-      { messages, tools, maxTokens: 4096, temperature: 0.8, enableCaching: true },
-      currentToolCalls,
-      toolResults
-    );
+    if (onChunk && provider.supportsStreaming && provider.continueWithToolResultsStream) {
+      result = await provider.continueWithToolResultsStream(
+        completionOpts,
+        currentToolCalls,
+        toolResults,
+        onChunk,
+        priorAssistantText,
+      );
+    } else {
+      result = await provider.continueWithToolResults(
+        completionOpts,
+        currentToolCalls,
+        toolResults,
+        priorAssistantText,
+      );
+      if (onChunk && result.content) {
+        onChunk(result.content);
+      }
+    }
 
     // Accumulate this tool interaction into messages so the next iteration
     // has context of what was already done (prevents amnesia/looping)
@@ -604,27 +716,39 @@ async function generateResponseWithTools(
     });
   }
 
-  // Check if response is incomplete after a tool loop — only when tools were actually
-  // used and the LLM produced no real text content (empty or whitespace-only).
-  // Previous heuristic matched Lain's natural style ("...", "let me") causing
-  // the summary prompt to fire on normal responses.
+  if (result.finishReason === 'length') {
+    logger.warn({ contentLength: result.content?.length }, 'Response truncated — hit max_tokens limit');
+  }
+
+  // Only force a summary when tools were actually used and the LLM produced
+  // no real text content — matching Lain's natural style ("...", "let me")
+  // would otherwise fire the summary on normal responses.
   const isIncomplete = iterations > 0 && (!result.content || result.content.trim() === '');
 
   if (isIncomplete) {
     logger.debug({ content: result.content }, 'Incomplete response after tool loop, requesting summary');
 
-    // Make a final call without tools to get a proper text response
-    const summaryResult = await provider.complete({
+    const summaryOpts = {
       messages: [
         ...messages,
         {
-          role: 'user',
+          role: 'user' as const,
           content: 'Based on all the information you gathered from your searches, please provide a complete answer now. Summarize what you found. Do not use any more tools.',
         },
       ],
       maxTokens: 2048,
       temperature: 0.8,
-    });
+    };
+
+    let summaryResult;
+    if (onChunk && provider.supportsStreaming && provider.completeStream) {
+      summaryResult = await provider.completeStream(summaryOpts, onChunk);
+    } else {
+      summaryResult = await provider.complete(summaryOpts);
+      if (onChunk) {
+        onChunk(summaryResult.content);
+      }
+    }
 
     result.content = summaryResult.content;
     result.usage.inputTokens += summaryResult.usage.inputTokens;
@@ -633,9 +757,12 @@ async function generateResponseWithTools(
     await agentLog('FORCED_SUMMARY', { content: result.content });
   }
 
-  // Append any media (images) collected from tool results
   if (mediaResults.length > 0) {
-    result.content += '\n\n' + mediaResults.join('\n');
+    const mediaContent = '\n\n' + mediaResults.join('\n');
+    result.content += mediaContent;
+    if (onChunk) {
+      onChunk(mediaContent);
+    }
     await agentLog('MEDIA_APPENDED', { mediaResults });
   }
 
@@ -643,7 +770,13 @@ async function generateResponseWithTools(
 }
 
 /**
- * Create an echo response (fallback when no provider is available)
+ * findings.md P2:1747 — generic, character-agnostic echo copy.
+ *
+ * Previously this hardcoded Lain identity ("i'm lain... lain iwakura",
+ * "present day, present time. i exist") and Wired-flavored error copy.
+ * When a non-Lain character (PKD, Wired Lain, etc.) hit the echo path
+ * the response leaked Lain's identity. Keep the strings generic so
+ * they fit any character, and let applyPersonaStyle handle voice.
  */
 function createEchoResponse(request: AgentRequest, sessionKey: string): AgentResponse {
   const message = request.message;
@@ -655,11 +788,11 @@ function createEchoResponse(request: AgentRequest, sessionKey: string): AgentRes
     if (text.includes('hello') || text.includes('hi')) {
       responseContent = '...hello';
     } else if (text.includes('who are you')) {
-      responseContent = "i'm lain... lain iwakura";
+      responseContent = "i can't introduce myself right now";
     } else if (text.includes('help')) {
       responseContent = 'i can try to help... what do you need';
     } else if (text.includes('how are you')) {
-      responseContent = '...present day, present time. i exist';
+      responseContent = "...i'm here, but not quite myself right now";
     } else {
       responseContent = `...you said: "${message.content.text}"`;
     }
@@ -692,449 +825,14 @@ function estimateTokens(text: string): number {
 export type StreamCallback = (chunk: string) => void;
 
 /**
- * Process a message through the agent with streaming
+ * Process a message with streaming — thin wrapper over processMessage.
+ * Kept for back-compat; new callers should just pass `onChunk` to processMessage.
  */
 export async function processMessageStream(
   request: AgentRequest,
-  onChunk: StreamCallback
+  onChunk: StreamCallback,
 ): Promise<AgentResponse> {
-  const logger = getLogger();
-  const agentId = 'default';
-  const agent = agents.get(agentId);
-
-  // Get or create session
-  const session = getOrCreateSession({
-    agentId,
-    channel: request.message.channel,
-    peerKind: request.message.peerKind,
-    peerId: request.message.peerId,
-  });
-
-  logger.debug(
-    { sessionKey: session.key, channel: session.channel },
-    'Processing message with streaming'
-  );
-
-  // If no provider is available, use echo mode
-  if (!agent?.provider || !agent.systemPrompt) {
-    const response = createEchoResponse(request, session.key);
-    const text = response.messages[0]?.content;
-    if (text && 'text' in text) {
-      onChunk(text.text);
-    }
-    return response;
-  }
-
-  // Get user message content
-  const userContent = request.message.content.type === 'text'
-    ? request.message.content.text
-    : '[non-text content]';
-
-  // Build enhanced system prompt: SOUL.md + self-concept + memory context
-  let enhancedSystemPrompt = agent.systemPrompt;
-
-  // Inject living self-concept (between static persona and dynamic memory)
-  const selfConcept = getSelfConcept();
-  if (selfConcept) {
-    enhancedSystemPrompt += '\n\n---\n\n## Who You Are Now\n\n' +
-      'This reflects who you have become through your experiences. ' +
-      'Let it influence you naturally.\n\n' + selfConcept;
-  }
-
-  // Inject internal emotional state
-  try {
-    const { getStateSummary } = await import('./internal-state.js');
-    const stateSummary = getStateSummary();
-    if (stateSummary) {
-      enhancedSystemPrompt += '\n\n[Your Internal State]\n' + stateSummary;
-    }
-  } catch { /* non-critical */ }
-
-  // Inject active preoccupations
-  try {
-    const { getPreoccupations } = await import('./internal-state.js');
-    const preoccs = getPreoccupations().filter(p => p.intensity >= 0.5);
-    if (preoccs.length > 0) {
-      const lines = preoccs.map(p => `- ${p.thread} (from ${p.origin})`).join('\n');
-      enhancedSystemPrompt += '\n\n[On your mind]\n' + lines;
-    }
-  } catch { /* non-critical */ }
-
-  // Inject current location so the character knows where they are
-  try {
-    const { getCurrentLocation } = await import('../commune/location.js');
-    const { BUILDING_MAP } = await import('../commune/buildings.js');
-    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
-    const loc = getCurrentLocation(charId);
-    const building = BUILDING_MAP.get(loc.building);
-    if (building) {
-      enhancedSystemPrompt += `\n\n[Your Current Location: ${building.name} — ${building.description}]`;
-    }
-  } catch { /* non-critical */ }
-
-  // Inject weather
-  try {
-    let weatherDesc: string | null = null;
-    // Try local meta store first (works for Wired Lain)
-    const { getCurrentWeather } = await import('../commune/weather.js');
-    const localWeather = getCurrentWeather();
-    if (localWeather && localWeather.condition !== 'overcast') {
-      weatherDesc = localWeather.description;
-    }
-    // Fallback to HTTP for non-Wired instances
-    if (!weatherDesc) {
-      const peerConfigRaw = process.env['PEER_CONFIG'];
-      if (peerConfigRaw) {
-        const peers = JSON.parse(peerConfigRaw) as Array<{ id: string; url: string }>;
-        const wiredPeer = peers.find(p => p.id === 'wired-lain');
-        if (wiredPeer) {
-          const resp = await fetch(`${wiredPeer.url}/api/weather`, {
-            signal: AbortSignal.timeout(3000),
-          });
-          if (resp.ok) {
-            const data = await resp.json() as { condition: string; description: string };
-            if (data.condition && data.condition !== 'overcast') {
-              weatherDesc = data.description;
-            }
-          }
-        }
-      }
-    }
-    if (weatherDesc) {
-      enhancedSystemPrompt += `\n\n[Weather in town: ${weatherDesc}]`;
-    }
-  } catch { /* non-critical */ }
-
-  // Inject ambient awareness of co-located peers
-  try {
-    const { buildAwarenessContext } = await import('./awareness.js');
-    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
-    const { getCurrentLocation } = await import('../commune/location.js');
-    const loc = getCurrentLocation(charId);
-    const peerConfigRaw = process.env['PEER_CONFIG'];
-    if (peerConfigRaw) {
-      const peers = JSON.parse(peerConfigRaw) as import('./character-tools.js').PeerConfig[];
-      const awarenessCtx = await buildAwarenessContext(loc.building, peers);
-      if (awarenessCtx) {
-        enhancedSystemPrompt += awarenessCtx;
-      }
-    }
-  } catch { /* non-critical */ }
-
-  // Inject object inventory with symbolic meanings + composition lexicon
-  try {
-    const { buildObjectContext } = await import('./objects.js');
-    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
-    const wiredUrl = process.env['WIRED_LAIN_URL'] || 'http://localhost:3000';
-    const objectCtx = await buildObjectContext(charId, wiredUrl);
-    if (objectCtx) {
-      enhancedSystemPrompt += '\n\n[Your Objects]\n' + objectCtx;
-    }
-  } catch { /* non-critical */ }
-
-  // Inject building residue — traces of what happened at this location
-  try {
-    const { buildBuildingResidueContext } = await import('../commune/building-memory.js');
-    const charId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
-    const residueCtx = await buildBuildingResidueContext(charId);
-    if (residueCtx) {
-      enhancedSystemPrompt += residueCtx;
-    }
-  } catch { /* non-critical */ }
-
-  try {
-    const memoryContext = await buildMemoryContext(userContent, session.key);
-    if (memoryContext) {
-      enhancedSystemPrompt += memoryContext;
-    }
-  } catch (error) {
-    logger.warn({ error }, 'Failed to build memory context');
-  }
-
-  // Get or create conversation with memory-enhanced prompt
-  const conversation = getConversation(session.key, enhancedSystemPrompt);
-
-  // Add user message to conversation
-  addUserMessage(conversation, request.message);
-
-  // Record user message to persistent memory
-  await recordMessage(session.key, 'user', userContent, {
-    senderId: request.message.senderId,
-    senderName: request.message.senderName,
-    messageId: request.message.id,
-  });
-
-  // Compress conversation if needed (summarizes older messages instead of dropping them)
-  const compressProvider = getProvider(agentId, 'light') ?? agent.provider;
-  if (compressProvider) {
-    await compressConversation(conversation, MAX_CONTEXT_TOKENS, estimateTokens, compressProvider);
-  } else {
-    trimConversation(conversation, MAX_CONTEXT_TOKENS, estimateTokens);
-  }
-
-  try {
-    // Generate response with tool use support and streaming, with tier fallback
-    let result: CompletionWithToolsResult;
-    try {
-      result = await generateResponseWithToolsStream(agent.provider, conversation, onChunk);
-    } catch (primaryError) {
-      const fallback = agent.providers.get('light');
-      if (fallback && fallback !== agent.provider) {
-        logger.warn({ error: primaryError }, 'Primary provider failed, falling back to light tier (stream)');
-        result = await generateResponseWithToolsStream(fallback, conversation, onChunk);
-      } else {
-        throw primaryError;
-      }
-    }
-
-    // Apply persona style to response
-    const styledContent = applyPersonaStyle(result.content);
-
-    // Add assistant response to conversation
-    addAssistantMessage(conversation, styledContent);
-
-    // Record assistant message to persistent memory
-    await recordMessage(session.key, 'assistant', styledContent);
-
-    // Update token counts
-    updateTokenCount(conversation, result.usage.inputTokens, result.usage.outputTokens);
-
-    // Extract memories when session has enough context or high-signal content
-    const memoryProvider = getProvider(agentId, 'personality');
-    if (shouldExtractMemories(session.key, userContent) && memoryProvider) {
-      // Emit conversation:end event for background loops
-      try {
-        eventBus.emitActivity({
-          type: 'state',
-          sessionKey: `state:conversation:end:${session.key}`,
-          content: 'Conversation ended',
-          timestamp: Date.now(),
-        });
-      } catch { /* non-critical */ }
-
-      processConversationEnd(memoryProvider, session.key).catch((err) => {
-        logger.warn({ err }, 'Background memory extraction failed');
-      });
-    }
-
-    // Update session
-    updateSession(session.key, {
-      tokenCount: session.tokenCount + result.usage.inputTokens + result.usage.outputTokens,
-    });
-
-    const response: AgentResponse = {
-      sessionKey: session.key,
-      messages: [
-        {
-          id: nanoid(16),
-          channel: request.message.channel,
-          peerId: request.message.peerId,
-          content: { type: 'text', text: styledContent },
-          replyTo: request.message.id,
-        },
-      ],
-      tokenUsage: {
-        input: result.usage.inputTokens,
-        output: result.usage.outputTokens,
-        total: result.usage.inputTokens + result.usage.outputTokens,
-      },
-    };
-
-    return response;
-  } catch (error) {
-    logger.error({ error, sessionKey: session.key }, 'Error generating response');
-    console.error('AGENT ERROR:', error);
-
-    const errorMessage = '...something went wrong. the wired is unstable right now...';
-    onChunk(errorMessage);
-
-    return {
-      sessionKey: session.key,
-      messages: [
-        {
-          id: nanoid(16),
-          channel: request.message.channel,
-          peerId: request.message.peerId,
-          content: { type: 'text', text: errorMessage },
-          replyTo: request.message.id,
-        },
-      ],
-    };
-  }
-}
-
-/**
- * Generate response with tool use support and streaming
- */
-async function generateResponseWithToolsStream(
-  provider: Provider,
-  conversation: ReturnType<typeof getConversation>,
-  onChunk: StreamCallback
-): Promise<CompletionWithToolsResult> {
-  const logger = getLogger();
-  const tools = getToolDefinitions();
-  const messages = toProviderMessages(conversation);
-
-  // Track media (images) from tool results to append to response
-  const mediaResults: string[] = [];
-
-  await agentLog('TOOLS_AVAILABLE_STREAM', tools.map(t => ({ name: t.name, description: t.description })));
-  await agentLog('MESSAGES_TO_LLM_STREAM', messages);
-
-  // Use streaming if available
-  let result: CompletionWithToolsResult;
-  if (provider.completeWithToolsStream) {
-    result = await provider.completeWithToolsStream(
-      { messages, tools, maxTokens: 4096, temperature: 0.8, enableCaching: true },
-      onChunk
-    );
-  } else {
-    result = await provider.completeWithTools({
-      messages,
-      tools,
-      maxTokens: 4096,
-      temperature: 0.8,
-      enableCaching: true,
-    });
-    // Send full content as single chunk if not streaming
-    if (result.content) {
-      onChunk(result.content);
-    }
-  }
-
-  await agentLog('LLM_RESPONSE_STREAM', {
-    content: result.content,
-    finishReason: result.finishReason,
-    toolCalls: result.toolCalls,
-    usage: result.usage,
-  });
-
-  // Handle tool calls iteratively
-  let iterations = 0;
-  while (result.toolCalls && result.toolCalls.length > 0 && iterations < MAX_TOOL_ITERATIONS) {
-    iterations++;
-    logger.debug(
-      { iteration: iterations, toolCalls: result.toolCalls.map((tc) => tc.name) },
-      'Processing tool calls (streaming)'
-    );
-
-    await agentLog('TOOL_CALLS_STREAM', {
-      iteration: iterations,
-      toolCalls: result.toolCalls,
-    });
-
-    const currentToolCalls = result.toolCalls;
-
-    // Execute tools
-    const toolResults = await executeTools(currentToolCalls);
-
-    // Check for image results and collect them
-    for (const tr of toolResults) {
-      const imageMatch = tr.content.match(/\[IMAGE:\s*[^\]]*\]\([^)]+\)/g);
-      if (imageMatch) {
-        mediaResults.push(...imageMatch);
-      }
-    }
-
-    await agentLog('TOOL_RESULTS_STREAM', toolResults);
-
-    // Continue conversation with tool results (with streaming if available)
-    if (provider.continueWithToolResultsStream) {
-      result = await provider.continueWithToolResultsStream(
-        { messages, tools, maxTokens: 4096, temperature: 0.8, enableCaching: true },
-        currentToolCalls,
-        toolResults,
-        onChunk
-      );
-    } else {
-      result = await provider.continueWithToolResults(
-        { messages, tools, maxTokens: 4096, temperature: 0.8, enableCaching: true },
-        currentToolCalls,
-        toolResults
-      );
-      if (result.content) {
-        onChunk(result.content);
-      }
-    }
-
-    // Accumulate this tool interaction into messages so the next iteration
-    // has context of what was already done (prevents amnesia/looping)
-    messages.push({
-      role: 'assistant',
-      content: currentToolCalls.map((tc) =>
-        `[Used ${tc.name}: ${JSON.stringify(tc.input)}]`
-      ).join('\n'),
-    });
-    messages.push({
-      role: 'user',
-      content: toolResults.map((tr) =>
-        tr.content.length > 2000 ? tr.content.slice(0, 2000) + '\n[truncated]' : tr.content
-      ).join('\n---\n'),
-    });
-
-    await agentLog('LLM_AFTER_TOOLS_STREAM', {
-      content: result.content,
-      finishReason: result.finishReason,
-      toolCalls: result.toolCalls,
-    });
-  }
-
-  // Check if response is incomplete after a tool loop — only when tools were actually
-  // used and the LLM produced no real text content.
-  const isIncomplete = iterations > 0 && (!result.content || result.content.trim() === '');
-
-  if (isIncomplete) {
-    logger.debug({ content: result.content }, 'Incomplete response after tool loop, requesting summary (streaming)');
-
-    // Make a final call to get a proper text response
-    if (provider.completeStream) {
-      const summaryResult = await provider.completeStream(
-        {
-          messages: [
-            ...messages,
-            {
-              role: 'user',
-              content: 'Based on all the information you gathered from your searches, please provide a complete answer now. Summarize what you found. Do not use any more tools.',
-            },
-          ],
-          maxTokens: 1024,
-          temperature: 0.8,
-        },
-        onChunk
-      );
-      result.content = summaryResult.content;
-      result.usage.inputTokens += summaryResult.usage.inputTokens;
-      result.usage.outputTokens += summaryResult.usage.outputTokens;
-    } else {
-      const summaryResult = await provider.complete({
-        messages: [
-          ...messages,
-          {
-            role: 'user',
-            content: 'Based on all the information you gathered from your searches, please provide a complete answer now. Summarize what you found. Do not use any more tools.',
-          },
-        ],
-        maxTokens: 1024,
-        temperature: 0.8,
-      });
-      result.content = summaryResult.content;
-      result.usage.inputTokens += summaryResult.usage.inputTokens;
-      result.usage.outputTokens += summaryResult.usage.outputTokens;
-      onChunk(result.content);
-    }
-
-    await agentLog('FORCED_SUMMARY_STREAM', { content: result.content });
-  }
-
-  // Append any media (images) collected from tool results
-  if (mediaResults.length > 0) {
-    const mediaContent = '\n\n' + mediaResults.join('\n');
-    result.content += mediaContent;
-    onChunk(mediaContent);
-    await agentLog('MEDIA_APPENDED', { mediaResults });
-  }
-
-  return result;
+  return processMessage(request, onChunk);
 }
 
 /**

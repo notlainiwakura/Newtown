@@ -88,13 +88,14 @@ describe('Config loading behavioral', () => {
   // --- Default config completeness ---
 
   it('default config has all required top-level keys', async () => {
+    // findings.md P2:171 — `agents` removed from LainConfig.
     const { getDefaultConfig } = await import('../src/config/index.js');
     const cfg = getDefaultConfig();
     expect(cfg).toHaveProperty('version');
     expect(cfg).toHaveProperty('gateway');
     expect(cfg).toHaveProperty('security');
-    expect(cfg).toHaveProperty('agents');
     expect(cfg).toHaveProperty('logging');
+    expect(cfg).not.toHaveProperty('agents');
   });
 
   it('default gateway has all required sub-fields', async () => {
@@ -123,26 +124,18 @@ describe('Config loading behavioral', () => {
     expect(sec.keyDerivation).toHaveProperty('parallelism');
   });
 
-  it('default agent config has all required fields', async () => {
-    const { getDefaultConfig } = await import('../src/config/index.js');
-    const agent = getDefaultConfig().agents[0]!;
-    expect(agent).toHaveProperty('id');
-    expect(agent).toHaveProperty('name');
-    expect(agent).toHaveProperty('enabled');
-    expect(agent).toHaveProperty('workspace');
-    expect(agent).toHaveProperty('providers');
-  });
-
-  it('default config providers reference ANTHROPIC_API_KEY env var', async () => {
-    const { getDefaultConfig } = await import('../src/config/index.js');
-    const providers = getDefaultConfig().agents[0]!.providers;
-    const hasAnthropicKey = providers.some(p => p.apiKeyEnv === 'ANTHROPIC_API_KEY');
+  // findings.md P2:171 — `agents` moved out of LainConfig. Below three
+  // tests now target DEFAULT_PROVIDERS (the fallback chain inherited by
+  // a character manifest entry with no `providers`).
+  it('DEFAULT_PROVIDERS references ANTHROPIC_API_KEY env var', async () => {
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    const hasAnthropicKey = DEFAULT_PROVIDERS.some(p => p.apiKeyEnv === 'ANTHROPIC_API_KEY');
     expect(hasAnthropicKey).toBe(true);
   });
 
-  it('default providers include fallback models', async () => {
-    const { getDefaultConfig } = await import('../src/config/index.js');
-    const provider = getDefaultConfig().agents[0]!.providers[0]!;
+  it('DEFAULT_PROVIDERS primary tier includes fallback models', async () => {
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    const provider = DEFAULT_PROVIDERS[0]!;
     expect(provider.fallbackModels).toBeDefined();
     expect(Array.isArray(provider.fallbackModels)).toBe(true);
     expect(provider.fallbackModels!.length).toBeGreaterThan(0);
@@ -223,22 +216,19 @@ describe('Config loading behavioral', () => {
     expect(cfg.security.inputSanitization).toBe(true);
   });
 
-  it('agents array override replaces default agents entirely', async () => {
+  it('lain.json5 with legacy `agents` override is now rejected (P2:171)', async () => {
+    // findings.md P2:171 — `agents` was removed from LainConfig and the
+    // schema sets additionalProperties:false. Any lingering lain.json5
+    // that still ships an `agents` array must now fail load.
     const { loadConfig } = await import('../src/config/index.js');
-    const customAgents = [{
-      id: 'custom-agent',
-      name: 'Custom',
-      enabled: true,
-      workspace: '/tmp/custom',
-      providers: [{ type: 'openai' as const, model: 'gpt-4' }],
-    }];
     await writeFile(join(testDir, 'lain.json5'), JSON.stringify({
       version: '1',
-      agents: customAgents,
+      agents: [{
+        id: 'custom-agent', name: 'Custom', enabled: true, workspace: '/tmp/custom',
+        providers: [{ type: 'openai', model: 'gpt-4' }],
+      }],
     }));
-    const cfg = await loadConfig();
-    expect(cfg.agents).toHaveLength(1);
-    expect(cfg.agents[0]!.id).toBe('custom-agent');
+    await expect(loadConfig()).rejects.toThrow();
   });
 
   it('config with all optional fields respects all of them', async () => {
@@ -433,13 +423,65 @@ describe('Config loading behavioral', () => {
     expect(content).toContain('//'); // JSON5 comments
   });
 
+  // findings.md P2:267 — saveConfig would silently strip comments.
+  // Detection preserves the commented form as a .bak.<ts> sidecar and
+  // warns with both paths so an operator overwriting an annotated
+  // config.json5 has a recoverable copy.
+  it('saveConfig preserves commented config as .bak sidecar before overwriting', async () => {
+    const { writeFile: writeSync } = await import('node:fs/promises');
+    const { saveConfig, getDefaultConfig } = await import('../src/config/index.js');
+    const path = join(testDir, 'commented.json5');
+    await writeSync(path, '// operator note\n{ "version": "1" }\n');
+    await saveConfig(getDefaultConfig(), path);
+
+    const { readdirSync } = await import('node:fs');
+    const siblings = readdirSync(testDir);
+    const backup = siblings.find(f => f.startsWith('commented.json5.bak.'));
+    expect(backup).toBeDefined();
+    const restored = readFileSync(join(testDir, backup!), 'utf-8');
+    expect(restored).toContain('// operator note');
+    const written = readFileSync(path, 'utf-8');
+    expect(written).not.toContain('// operator note');
+  });
+
+  it('saveConfig does not create a sidecar when no prior file exists', async () => {
+    const { saveConfig, getDefaultConfig } = await import('../src/config/index.js');
+    const path = join(testDir, 'first-save.json5');
+    await saveConfig(getDefaultConfig(), path);
+
+    const { readdirSync } = await import('node:fs');
+    const siblings = readdirSync(testDir);
+    const backup = siblings.find(f => f.startsWith('first-save.json5.bak.'));
+    expect(backup).toBeUndefined();
+  });
+
+  it('saveConfig does not create a sidecar when prior file has no comments', async () => {
+    const { writeFile: writeSync } = await import('node:fs/promises');
+    const { saveConfig, getDefaultConfig } = await import('../src/config/index.js');
+    const path = join(testDir, 'plain.json5');
+    await writeSync(path, '{"version":"1"}\n');
+    await saveConfig(getDefaultConfig(), path);
+
+    const { readdirSync } = await import('node:fs');
+    const siblings = readdirSync(testDir);
+    const backup = siblings.find(f => f.startsWith('plain.json5.bak.'));
+    expect(backup).toBeUndefined();
+  });
+
   // --- Schema ---
 
-  it('validate rejects agent ID with uppercase letters', async () => {
-    const { getDefaultConfig, validate } = await import('../src/config/index.js');
-    const cfg = getDefaultConfig();
-    cfg.agents[0]!.id = 'BadId';
-    expect(() => validate(cfg)).toThrow();
+  it('manifest rejects character ID with uppercase letters', async () => {
+    // findings.md P2:171 — agent-id pattern enforcement moved to the
+    // character manifest. Same rule; different schema.
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    const manifest = {
+      town: { name: 'T', description: 't' },
+      characters: [{
+        id: 'BadId', name: 'X', port: 3000, server: 'character',
+        defaultLocation: 'bar', workspace: 'workspace/characters/x',
+      }],
+    };
+    expect(() => validateManifest(manifest, 'test')).toThrow();
   });
 
   it('validate accepts each valid logging level', async () => {
@@ -452,24 +494,33 @@ describe('Config loading behavioral', () => {
     }
   });
 
-  it('validate accepts each valid provider type', async () => {
-    const { getDefaultConfig, validate } = await import('../src/config/index.js');
+  it('manifest accepts each valid provider type', async () => {
+    // findings.md P2:171 — provider-type enum enforcement moved to the
+    // character manifest.
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
     const types = ['anthropic', 'openai', 'google'] as const;
     for (const type of types) {
-      const cfg = getDefaultConfig();
-      cfg.agents[0]!.providers = [{ type, model: 'test-model' }];
-      expect(() => validate(cfg)).not.toThrow();
+      const manifest = {
+        town: { name: 'T', description: 't' },
+        characters: [{
+          id: 'x', name: 'X', port: 3000, server: 'character',
+          defaultLocation: 'bar', workspace: 'workspace/characters/x',
+          providers: [{ type, model: 'test-model' }],
+        }],
+      };
+      expect(() => validateManifest(manifest, 'test')).not.toThrow();
     }
   });
 
   it('getSchema returns schema with all top-level required fields', async () => {
+    // findings.md P2:171 — `agents` is no longer in LainConfig.
     const { getSchema } = await import('../src/config/index.js');
     const schema = getSchema();
     expect(schema.required).toContain('version');
     expect(schema.required).toContain('gateway');
     expect(schema.required).toContain('security');
-    expect(schema.required).toContain('agents');
     expect(schema.required).toContain('logging');
+    expect(schema.required).not.toContain('agents');
   });
 
   it('getSchema disallows additionalProperties at top level', async () => {
@@ -478,26 +529,22 @@ describe('Config loading behavioral', () => {
     expect(schema.additionalProperties).toBe(false);
   });
 
-  it('validate enforces minimum 1 agent', async () => {
-    const { getDefaultConfig, validate } = await import('../src/config/index.js');
-    const cfg = getDefaultConfig();
-    cfg.agents = [];
-    expect(() => validate(cfg)).toThrow();
-  });
-
-  it('validate enforces agent id pattern (lowercase + hyphen + digits only)', async () => {
-    const { getDefaultConfig, validate } = await import('../src/config/index.js');
-    const validIds = ['default', 'my-agent', 'agent-01', 'a'];
-    for (const id of validIds) {
-      const cfg = getDefaultConfig();
-      cfg.agents[0]!.id = id;
-      expect(() => validate(cfg), `expected '${id}' to be valid`).not.toThrow();
+  it('manifest enforces agent id pattern (lowercase + hyphen + digits only)', async () => {
+    // findings.md P2:171 — agent-id pattern enforcement moved to the
+    // character manifest; see test/config-system.test.ts for more cases.
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    const mkManifest = (id: string) => ({
+      town: { name: 'T', description: 't' },
+      characters: [{
+        id, name: 'X', port: 3000, server: 'character',
+        defaultLocation: 'bar', workspace: 'workspace/characters/x',
+      }],
+    });
+    for (const id of ['default', 'my-agent', 'agent-01', 'a']) {
+      expect(() => validateManifest(mkManifest(id), 'test'), `expected '${id}' to be valid`).not.toThrow();
     }
-    const invalidIds = ['Agent', 'my agent', 'agent@1', 'agent.test', ''];
-    for (const id of invalidIds) {
-      const cfg = getDefaultConfig();
-      cfg.agents[0]!.id = id;
-      expect(() => validate(cfg), `expected '${id}' to be invalid`).toThrow();
+    for (const id of ['Agent', 'my agent', 'agent@1', 'agent.test', '']) {
+      expect(() => validateManifest(mkManifest(id), 'test'), `expected '${id}' to be invalid`).toThrow();
     }
   });
 
@@ -1150,7 +1197,8 @@ describe('Deploy script behavioral', () => {
     });
 
     it('generates per-character .env file with PEER_CONFIG', () => {
-      expect(script).toMatch(/echo.*PEER_CONFIG=.*>.*\.env/);
+      expect(script).toContain('echo "PEER_CONFIG=${PEERS}"');
+      expect(script).toContain('> "$ENV_DIR/${SERVICE_NAME}.env"');
     });
 
     it('sets LAIN_HOME to /root/.lain-<id> pattern', () => {

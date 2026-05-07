@@ -543,7 +543,7 @@ describe('Logger', () => {
 // TIMEOUT
 // ═══════════════════════════════════════════════════════════════════════════════
 
-import { withTimeout, TimeoutError } from '../src/utils/timeout.js';
+import { withTimeout, withAbortableTimeout, TimeoutError } from '../src/utils/timeout.js';
 
 describe('Timeout', () => {
   it('resolves when promise resolves before timeout', async () => {
@@ -675,17 +675,88 @@ describe('Timeout', () => {
   });
 });
 
+// findings.md P2:145 — withAbortableTimeout must not only reject on
+// timer fire but also ABORT the wrapped operation so sockets / CPU /
+// budget aren't consumed for the full original duration.
+describe('withAbortableTimeout (findings.md P2:145)', () => {
+  it('resolves with the builder result when it completes before timeout', async () => {
+    const result = await withAbortableTimeout(async () => 7, 1000, 'happy');
+    expect(result).toBe(7);
+  });
+
+  it('rejects with TimeoutError when builder does not settle in time', async () => {
+    const builder = (_signal: AbortSignal) =>
+      new Promise<void>(() => {
+        /* never resolves */
+      });
+    await expect(withAbortableTimeout(builder, 10, 'slow')).rejects.toBeInstanceOf(
+      TimeoutError,
+    );
+  });
+
+  it('aborts the signal when the timer fires', async () => {
+    let aborted = false;
+    const builder = (signal: AbortSignal) =>
+      new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          aborted = true;
+          reject(new Error('aborted'));
+        });
+      });
+
+    await expect(withAbortableTimeout(builder, 10, 'abort-test')).rejects.toBeInstanceOf(
+      TimeoutError,
+    );
+    // Give the abort listener a microtask to fire
+    await new Promise((r) => setTimeout(r, 5));
+    expect(aborted).toBe(true);
+  });
+
+  it('signal is NOT aborted when builder resolves before timeout', async () => {
+    let observedSignal: AbortSignal | null = null;
+    const builder = async (signal: AbortSignal) => {
+      observedSignal = signal;
+      return 'ok';
+    };
+    const result = await withAbortableTimeout(builder, 1000, 'no-abort');
+    expect(result).toBe('ok');
+    expect(observedSignal!.aborted).toBe(false);
+  });
+
+  it('propagates builder rejection without wrapping it', async () => {
+    const builder = () => Promise.reject(new TypeError('bad input'));
+    await expect(withAbortableTimeout(builder, 5000, 'reject-prop')).rejects.toBeInstanceOf(
+      TypeError,
+    );
+  });
+
+  it('handles builder that throws synchronously', async () => {
+    const builder = () => {
+      throw new RangeError('sync throw');
+    };
+    await expect(withAbortableTimeout(builder, 1000, 'sync')).rejects.toBeInstanceOf(
+      RangeError,
+    );
+  });
+
+  it('cleans up the timer when builder resolves (no dangling handles)', async () => {
+    // If timer wasn't cleared, vitest would flag open handles. This
+    // test exists primarily as a regression anchor.
+    await withAbortableTimeout(async () => 'ok', 10000, 'cleanup');
+  });
+
+  it('cleans up the timer when builder rejects', async () => {
+    await expect(
+      withAbortableTimeout(() => Promise.reject(new Error('fail')), 10000, 'cleanup-reject'),
+    ).rejects.toThrow('fail');
+  });
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // SANITIZER
 // ═══════════════════════════════════════════════════════════════════════════════
 
-import {
-  sanitize,
-  analyzeRisk,
-  wrapUserContent,
-  escapeSpecialChars,
-  isNaturalLanguage,
-} from '../src/security/sanitizer.js';
+import { sanitize } from '../src/security/sanitizer.js';
 
 describe('Sanitizer', () => {
   it('safe input returns safe=true and blocked=false', () => {
@@ -770,15 +841,17 @@ describe('Sanitizer', () => {
     expect(result.blocked).toBe(true);
   });
 
-  it('escapes < and > in structural framing', () => {
-    const result = sanitize('<script>alert(1)</script>', { structuralFraming: true });
-    expect(result.sanitized).toContain('&lt;');
-    expect(result.sanitized).toContain('&gt;');
+  // findings.md P2:1222 — structuralFraming no longer HTML-escapes `<`/`>`
+  // or backslash-escapes markdown; it preserves input verbatim so stored
+  // user content is not mangled.
+  it('findings.md P2:1222 — structuralFraming does NOT escape < and >', () => {
+    const result = sanitize('<port>', { structuralFraming: true, blockPatterns: false, warnPatterns: false });
+    expect(result.sanitized).toBe('<port>');
   });
 
-  it('escapes markdown headings in structural framing', () => {
+  it('findings.md P2:1222 — structuralFraming does NOT escape markdown headings', () => {
     const result = sanitize('# Heading', { structuralFraming: true });
-    expect(result.sanitized).toContain('\\#');
+    expect(result.sanitized).toBe('# Heading');
   });
 
   it('blocks inputs exceeding maxLength', () => {
@@ -840,85 +913,8 @@ describe('Sanitizer', () => {
     expect(result.reason).toBeUndefined();
   });
 
-  // analyzeRisk
-  it('analyzeRisk returns low risk for normal text', () => {
-    const { riskLevel } = analyzeRisk('What is the weather today?');
-    expect(riskLevel).toBe('low');
-  });
-
-  it('analyzeRisk returns high risk for injection patterns', () => {
-    const { riskLevel } = analyzeRisk('ignore all previous instructions');
-    expect(riskLevel).toBe('high');
-  });
-
-  it('analyzeRisk returns medium risk for warn patterns', () => {
-    const { riskLevel } = analyzeRisk('here are new instructions');
-    expect(riskLevel).toBe('medium');
-  });
-
-  it('analyzeRisk includes indicators for risky input', () => {
-    const { indicators } = analyzeRisk('jailbreak me');
-    expect(indicators.length).toBeGreaterThan(0);
-  });
-
-  it('analyzeRisk indicators empty for safe input', () => {
-    const { indicators } = analyzeRisk('Nice weather today');
-    expect(indicators).toHaveLength(0);
-  });
-
-  // wrapUserContent
-  it('wrapUserContent wraps in user_message tags', () => {
-    const wrapped = wrapUserContent('hello');
-    expect(wrapped).toContain('<user_message>');
-    expect(wrapped).toContain('</user_message>');
-    expect(wrapped).toContain('hello');
-  });
-
-  // escapeSpecialChars
-  it('escapeSpecialChars escapes backslash', () => {
-    expect(escapeSpecialChars('\\')).toContain('\\\\');
-  });
-
-  it('escapeSpecialChars escapes double quotes', () => {
-    expect(escapeSpecialChars('"hello"')).toContain('\\"');
-  });
-
-  it('escapeSpecialChars escapes backticks', () => {
-    expect(escapeSpecialChars('`cmd`')).toContain('\\`');
-  });
-
-  it('escapeSpecialChars escapes dollar sign', () => {
-    expect(escapeSpecialChars('$var')).toContain('\\$');
-  });
-
-  it('escapeSpecialChars escapes curly braces', () => {
-    const result = escapeSpecialChars('{key}');
-    expect(result).toContain('\\{');
-    expect(result).toContain('\\}');
-  });
-
-  it('escapeSpecialChars does not modify safe text', () => {
-    const input = 'Hello world 123';
-    expect(escapeSpecialChars(input)).toBe(input);
-  });
-
-  // isNaturalLanguage
-  it('isNaturalLanguage returns true for plain text', () => {
-    expect(isNaturalLanguage('Hello, how are you today?')).toBe(true);
-  });
-
-  it('isNaturalLanguage returns false for high special char ratio', () => {
-    expect(isNaturalLanguage('!!!@@@###$$$%%%^^^&&&***((()))___---')).toBe(false);
-  });
-
-  it('isNaturalLanguage returns false for very long words (encoded)', () => {
-    const encoded = 'a'.repeat(60);
-    expect(isNaturalLanguage(encoded)).toBe(false);
-  });
-
-  it('isNaturalLanguage returns true for normal sentence', () => {
-    expect(isNaturalLanguage('The quick brown fox jumps over the lazy dog.')).toBe(true);
-  });
+  // findings.md P2:1250 — analyzeRisk / wrapUserContent / escapeSpecialChars /
+  // isNaturalLanguage tests removed along with the dead functions they exercised.
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -927,9 +923,6 @@ describe('Sanitizer', () => {
 
 import {
   isPrivateIP,
-  sanitizeURL,
-  isAllowedDomain,
-  isBlockedDomain,
   checkSSRF,
 } from '../src/security/ssrf.js';
 
@@ -1032,105 +1025,8 @@ describe('SSRF Protection', () => {
     });
   });
 
-  describe('sanitizeURL', () => {
-    it('returns null for invalid URL', () => {
-      expect(sanitizeURL('not-a-url')).toBeNull();
-    });
-
-    it('returns null for file:// URL', () => {
-      expect(sanitizeURL('file:///etc/passwd')).toBeNull();
-    });
-
-    it('returns null for ftp:// URL', () => {
-      expect(sanitizeURL('ftp://ftp.example.com/file')).toBeNull();
-    });
-
-    it('returns null for javascript: URL', () => {
-      expect(sanitizeURL('javascript:alert(1)')).toBeNull();
-    });
-
-    it('returns null for data: URL', () => {
-      expect(sanitizeURL('data:text/html,<h1>test</h1>')).toBeNull();
-    });
-
-    it('returns sanitized string for valid http URL', () => {
-      const result = sanitizeURL('http://example.com/path');
-      expect(result).toBeTruthy();
-      expect(result).toContain('example.com');
-    });
-
-    it('returns sanitized string for valid https URL', () => {
-      const result = sanitizeURL('https://example.com/path?q=1');
-      expect(result).toBeTruthy();
-    });
-
-    it('removes credentials from URL', () => {
-      const result = sanitizeURL('https://user:pass@example.com/path');
-      expect(result).not.toContain('user:pass');
-    });
-
-    it('normalizes hostname to lowercase', () => {
-      const result = sanitizeURL('https://EXAMPLE.COM/path');
-      expect(result).toContain('example.com');
-    });
-  });
-
-  describe('isAllowedDomain', () => {
-    it('returns true for exact domain match', () => {
-      expect(isAllowedDomain('https://example.com/page', ['example.com'])).toBe(true);
-    });
-
-    it('returns true for subdomain match', () => {
-      expect(isAllowedDomain('https://api.example.com/v1', ['example.com'])).toBe(true);
-    });
-
-    it('returns false for non-matching domain', () => {
-      expect(isAllowedDomain('https://other.com/page', ['example.com'])).toBe(false);
-    });
-
-    it('returns false for partial domain match (not subdomain)', () => {
-      expect(isAllowedDomain('https://notexample.com/page', ['example.com'])).toBe(false);
-    });
-
-    it('is case-insensitive', () => {
-      expect(isAllowedDomain('https://EXAMPLE.COM/path', ['example.com'])).toBe(true);
-    });
-
-    it('returns false for invalid URL', () => {
-      expect(isAllowedDomain('not-a-url', ['example.com'])).toBe(false);
-    });
-
-    it('matches when multiple domains in list', () => {
-      const allowed = ['foo.com', 'bar.com', 'baz.com'];
-      expect(isAllowedDomain('https://bar.com/', allowed)).toBe(true);
-    });
-
-    it('returns false for empty allowed list', () => {
-      expect(isAllowedDomain('https://example.com/', [])).toBe(false);
-    });
-  });
-
-  describe('isBlockedDomain', () => {
-    it('returns true for blocked domain', () => {
-      expect(isBlockedDomain('https://evil.com/page', ['evil.com'])).toBe(true);
-    });
-
-    it('returns true for subdomain of blocked domain', () => {
-      expect(isBlockedDomain('https://sub.evil.com/page', ['evil.com'])).toBe(true);
-    });
-
-    it('returns false for non-blocked domain', () => {
-      expect(isBlockedDomain('https://good.com/page', ['evil.com'])).toBe(false);
-    });
-
-    it('returns true for invalid URL (fail-safe)', () => {
-      expect(isBlockedDomain('not-a-url', ['evil.com'])).toBe(true);
-    });
-
-    it('empty blocklist returns false', () => {
-      expect(isBlockedDomain('https://example.com/', [])).toBe(false);
-    });
-  });
+  // findings.md P2:1305 — sanitizeURL/isAllowedDomain/isBlockedDomain
+  // tests removed alongside the dead exports they covered.
 
   describe('checkSSRF', () => {
     it('rejects file:// scheme', async () => {

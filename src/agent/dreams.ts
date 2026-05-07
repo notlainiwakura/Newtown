@@ -12,6 +12,7 @@ import { getLogger } from '../utils/logger.js';
 import { spawnDesireFromDream } from './desires.js';
 import { getMeta, setMeta, execute, query } from '../storage/database.js';
 import { eventBus } from '../events/bus.js';
+import { requireCharacterName } from '../config/characters.js';
 import { getCurrentState } from './internal-state.js';
 import { getCurrentLocation, setCurrentLocation } from '../commune/location.js';
 import { isValidBuilding } from '../commune/buildings.js';
@@ -164,8 +165,8 @@ export function startDreamLoop(config?: Partial<DreamConfig>): () => void {
         logger.info('Dream cycle firing now');
         try {
           await runDreamCycle(cfg);
-          // Post-dream drift: 25% chance to wander to the Mystery Tower on waking
-          driftToMysteryTower(logger);
+          // Post-dream drift: 25% chance to wander to The Threshold on waking
+          driftToThreshold(logger);
           try {
             const { updateState } = await import('./internal-state.js');
             await updateState({ type: 'dream:complete', summary: 'Completed a dream cycle' });
@@ -211,16 +212,19 @@ export function startDreamLoop(config?: Partial<DreamConfig>): () => void {
     scheduleNext(jitter);
   }
 
-  eventBus.on('activity', (event: import('../events/bus.js').SystemEvent) => {
+  // findings.md P2:2209 — store handler ref so restart doesn't leak listeners.
+  const activityHandler = (event: import('../events/bus.js').SystemEvent): void => {
     if (stopped || isRunning) return;
     if (event.sessionKey?.startsWith('state:conversation:end')) {
       maybeRunEarly('conversation ended');
     }
-  });
+  };
+  eventBus.on('activity', activityHandler);
 
   return () => {
     stopped = true;
     if (timer) clearTimeout(timer);
+    eventBus.off('activity', activityHandler);
     logger.info('Dream loop stopped');
   };
 }
@@ -548,7 +552,8 @@ async function generateDreamFragment(
     return `[${i}] ${content}`;
   });
 
-  const characterName = process.env['LAIN_CHARACTER_NAME'] || 'Newtown';
+  // findings.md P2:2271 — fail-closed; see requireCharacterName.
+  const characterName = requireCharacterName();
 
   let preoccContext = '';
   try {
@@ -749,21 +754,21 @@ One sentence only. No explanation.`,
   }
 }
 
-// --- Post-dream drift to the Mystery Tower ---
+// --- Post-dream drift to The Threshold ---
 
-const POST_DREAM_DRIFT_PROBABILITY = 0.25;
+const THRESHOLD_DRIFT_PROBABILITY = 0.25;
 
-function driftToMysteryTower(logger: ReturnType<typeof getLogger>): void {
-  if (Math.random() > POST_DREAM_DRIFT_PROBABILITY) return;
+function driftToThreshold(logger: ReturnType<typeof getLogger>): void {
+  if (Math.random() > THRESHOLD_DRIFT_PROBABILITY) return;
 
   try {
     const loc = getCurrentLocation();
-    if (loc.building === 'mystery-tower') return; // already there
+    if (loc.building === 'threshold') return; // already there
 
-    if (!isValidBuilding('mystery-tower')) return;
+    if (!isValidBuilding('threshold')) return;
 
-    setCurrentLocation('mystery-tower', 'woke from a dream half-remembering something');
-    logger.info('Post-dream drift: moved to the Mystery Tower');
+    setCurrentLocation('threshold', 'woke from a dream half-remembering something');
+    logger.info('Post-dream drift: moved to The Threshold');
   } catch (err) {
     logger.debug({ error: String(err) }, 'Post-dream drift failed');
   }

@@ -525,6 +525,158 @@ describe('Memory Store — CRUD', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 2b. VEC0 / MEMORIES INVARIANTS (findings.md P2:381)
+// ─────────────────────────────────────────────────────────────────────────────
+// Prior to the fix, saveMemory wrapped the vec0 INSERT in a silent try/catch
+// (so failures left memories with no KNN row), and deleteMemory never removed
+// the vec0 row (so KNN returned ghost IDs that getMemory() couldn't resolve).
+// These tests pin the current invariants.
+describe('Memory Store — vec0 invariants (findings.md P2:381)', () => {
+  let cleanup: () => Promise<void>;
+
+  beforeEach(async () => {
+    const setup = await setupTestDb('vec0-inv');
+    cleanup = setup.cleanup;
+  });
+
+  afterEach(async () => { await cleanup(); });
+
+  it('saveMemory inserts a corresponding memory_embeddings row', async () => {
+    const { saveMemory } = await import('../src/memory/store.js');
+    const { queryOne } = await import('../src/storage/database.js');
+    const id = await saveMemory({
+      sessionKey: 'vec:1', userId: null, content: 'vec0 paired insert',
+      memoryType: 'fact', importance: 0.5, emotionalWeight: 0,
+      relatedTo: null, sourceMessageId: null, metadata: {},
+    });
+    const row = queryOne<{ cnt: number }>(
+      'SELECT COUNT(*) as cnt FROM memory_embeddings WHERE memory_id = ?',
+      [id],
+    );
+    expect(row?.cnt).toBe(1);
+  });
+
+  it('deleteMemory removes the corresponding memory_embeddings row', async () => {
+    const { saveMemory, deleteMemory } = await import('../src/memory/store.js');
+    const { queryOne } = await import('../src/storage/database.js');
+    const id = await saveMemory({
+      sessionKey: 'vec:2', userId: null, content: 'to be deleted',
+      memoryType: 'fact', importance: 0.5, emotionalWeight: 0,
+      relatedTo: null, sourceMessageId: null, metadata: {},
+    });
+    const before = queryOne<{ cnt: number }>(
+      'SELECT COUNT(*) as cnt FROM memory_embeddings WHERE memory_id = ?',
+      [id],
+    );
+    expect(before?.cnt).toBe(1);
+    deleteMemory(id);
+    const after = queryOne<{ cnt: number }>(
+      'SELECT COUNT(*) as cnt FROM memory_embeddings WHERE memory_id = ?',
+      [id],
+    );
+    expect(after?.cnt).toBe(0);
+  });
+
+  it('total memory_embeddings count matches memories with embeddings', async () => {
+    const { saveMemory, deleteMemory } = await import('../src/memory/store.js');
+    const { queryOne } = await import('../src/storage/database.js');
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      ids.push(await saveMemory({
+        sessionKey: `vec:loop:${i}`, userId: null, content: `item ${i}`,
+        memoryType: 'fact', importance: 0.5, emotionalWeight: 0,
+        relatedTo: null, sourceMessageId: null, metadata: {},
+      }));
+    }
+    deleteMemory(ids[0]!);
+    deleteMemory(ids[2]!);
+    const vecCount = queryOne<{ cnt: number }>('SELECT COUNT(*) as cnt FROM memory_embeddings')?.cnt ?? 0;
+    const memCount = queryOne<{ cnt: number }>('SELECT COUNT(*) as cnt FROM memories WHERE embedding IS NOT NULL')?.cnt ?? 0;
+    expect(vecCount).toBe(memCount);
+    expect(vecCount).toBe(3);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2c. ASSOCIATIONS CASCADE ON DELETE (findings.md P2:445)
+// ─────────────────────────────────────────────────────────────────────────────
+// Prior to the fix, deleteMemory removed the memory row but left any
+// memory_associations edges pointing at it (source_id OR target_id). Ghost
+// rows accumulated; getAssociatedMemories silently skipped them.
+describe('Memory Store — memory_associations cascade on delete (findings.md P2:445)', () => {
+  let cleanup: () => Promise<void>;
+
+  beforeEach(async () => {
+    const setup = await setupTestDb('assoc-cascade');
+    cleanup = setup.cleanup;
+  });
+
+  afterEach(async () => { await cleanup(); });
+
+  it('deleteMemory removes associations where deleted id is the source', async () => {
+    const { saveMemory, addAssociation, deleteMemory } = await import('../src/memory/store.js');
+    const { queryOne } = await import('../src/storage/database.js');
+    const a = await saveMemory({ sessionKey: 's:a', userId: null, content: 'A', memoryType: 'fact', importance: 0.5, emotionalWeight: 0, relatedTo: null, sourceMessageId: null, metadata: {} });
+    const b = await saveMemory({ sessionKey: 's:b', userId: null, content: 'B', memoryType: 'fact', importance: 0.5, emotionalWeight: 0, relatedTo: null, sourceMessageId: null, metadata: {} });
+    addAssociation(a, b, 'similar', 0.8);
+    const before = queryOne<{ cnt: number }>('SELECT COUNT(*) as cnt FROM memory_associations WHERE source_id = ? OR target_id = ?', [a, a]);
+    expect(before?.cnt).toBe(1);
+    deleteMemory(a);
+    const after = queryOne<{ cnt: number }>('SELECT COUNT(*) as cnt FROM memory_associations WHERE source_id = ? OR target_id = ?', [a, a]);
+    expect(after?.cnt).toBe(0);
+  });
+
+  it('deleteMemory removes associations where deleted id is the target', async () => {
+    const { saveMemory, addAssociation, deleteMemory } = await import('../src/memory/store.js');
+    const { queryOne } = await import('../src/storage/database.js');
+    const a = await saveMemory({ sessionKey: 's:a', userId: null, content: 'A', memoryType: 'fact', importance: 0.5, emotionalWeight: 0, relatedTo: null, sourceMessageId: null, metadata: {} });
+    const b = await saveMemory({ sessionKey: 's:b', userId: null, content: 'B', memoryType: 'fact', importance: 0.5, emotionalWeight: 0, relatedTo: null, sourceMessageId: null, metadata: {} });
+    addAssociation(a, b, 'similar', 0.8);
+    const before = queryOne<{ cnt: number }>('SELECT COUNT(*) as cnt FROM memory_associations WHERE source_id = ? OR target_id = ?', [b, b]);
+    expect(before?.cnt).toBe(1);
+    deleteMemory(b);
+    const after = queryOne<{ cnt: number }>('SELECT COUNT(*) as cnt FROM memory_associations WHERE source_id = ? OR target_id = ?', [b, b]);
+    expect(after?.cnt).toBe(0);
+  });
+
+  it('deleteMemory removes associations on BOTH sides at once', async () => {
+    const { saveMemory, addAssociation, deleteMemory } = await import('../src/memory/store.js');
+    const { queryOne } = await import('../src/storage/database.js');
+    const hub = await saveMemory({ sessionKey: 's:hub', userId: null, content: 'hub', memoryType: 'fact', importance: 0.5, emotionalWeight: 0, relatedTo: null, sourceMessageId: null, metadata: {} });
+    const x = await saveMemory({ sessionKey: 's:x', userId: null, content: 'X', memoryType: 'fact', importance: 0.5, emotionalWeight: 0, relatedTo: null, sourceMessageId: null, metadata: {} });
+    const y = await saveMemory({ sessionKey: 's:y', userId: null, content: 'Y', memoryType: 'fact', importance: 0.5, emotionalWeight: 0, relatedTo: null, sourceMessageId: null, metadata: {} });
+    addAssociation(hub, x, 'similar', 0.8); // hub as source
+    addAssociation(y, hub, 'similar', 0.8); // hub as target
+    const before = queryOne<{ cnt: number }>('SELECT COUNT(*) as cnt FROM memory_associations WHERE source_id = ? OR target_id = ?', [hub, hub]);
+    expect(before?.cnt).toBe(2);
+    deleteMemory(hub);
+    const after = queryOne<{ cnt: number }>('SELECT COUNT(*) as cnt FROM memory_associations WHERE source_id = ? OR target_id = ?', [hub, hub]);
+    expect(after?.cnt).toBe(0);
+    // Unrelated edges unaffected.
+    const survivors = queryOne<{ cnt: number }>('SELECT COUNT(*) as cnt FROM memory_associations');
+    expect(survivors?.cnt).toBe(0);
+    // Peer rows survive (only their edges were removed).
+    const xRow = queryOne<{ cnt: number }>('SELECT COUNT(*) as cnt FROM memories WHERE id = ?', [x]);
+    const yRow = queryOne<{ cnt: number }>('SELECT COUNT(*) as cnt FROM memories WHERE id = ?', [y]);
+    expect(xRow?.cnt).toBe(1);
+    expect(yRow?.cnt).toBe(1);
+  });
+
+  it('getAssociatedMemories no longer surfaces ghost edges after delete', async () => {
+    const { saveMemory, addAssociation, deleteMemory, getAssociatedMemories } = await import('../src/memory/store.js');
+    const a = await saveMemory({ sessionKey: 's:a', userId: null, content: 'A', memoryType: 'fact', importance: 0.5, emotionalWeight: 0, relatedTo: null, sourceMessageId: null, metadata: {} });
+    const b = await saveMemory({ sessionKey: 's:b', userId: null, content: 'B', memoryType: 'fact', importance: 0.5, emotionalWeight: 0, relatedTo: null, sourceMessageId: null, metadata: {} });
+    addAssociation(a, b, 'similar', 0.9);
+    const before = getAssociatedMemories([a], 5);
+    expect(before.map((m) => m.id)).toContain(b);
+    deleteMemory(b);
+    const after = getAssociatedMemories([a], 5);
+    expect(after.map((m) => m.id)).not.toContain(b);
+    expect(after.length).toBe(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 3. ASSOCIATIONS
 // ─────────────────────────────────────────────────────────────────────────────
 describe('Memory Store — Associations', () => {
@@ -778,6 +930,45 @@ describe('Memory Store — Messages', () => {
     saveMessage({ sessionKey: 'commune:gathering', userId: null, role: 'user', content: 'commune msg', timestamp: Date.now(), metadata: {} });
     const msgs = getRecentVisitorMessages();
     expect(msgs.some(m => m.sessionKey === 'commune:gathering')).toBe(false);
+  });
+
+  // findings.md P2:393 — getRecentVisitorMessages used to inline an
+  // 8-prefix exclude list that disagreed with the 22-prefix
+  // BACKGROUND_PREFIXES used by getActivity. Diary / dream / curiosity
+  // / self-concept / narrative / bibliomancy / therapy / movement /
+  // note / document / gift / research / townlife / object sessions
+  // silently surfaced as "visitor" traffic.
+  it('getRecentVisitorMessages excludes every background-loop prefix', async () => {
+    const { saveMessage, getRecentVisitorMessages } = await import('../src/memory/store.js');
+    const bgPrefixes = [
+      'diary', 'dream', 'curiosity', 'self-concept', 'selfconcept',
+      'narrative', 'bibliomancy', 'alien', 'therapy', 'movement',
+      'move', 'note', 'document', 'gift', 'research', 'townlife',
+      'object', 'letter', 'wired', 'proactive', 'doctor', 'peer',
+      'commune',
+    ];
+    for (const p of bgPrefixes) {
+      saveMessage({
+        sessionKey: `${p}:session`,
+        userId: null,
+        role: 'user',
+        content: `${p} message`,
+        timestamp: Date.now(),
+        metadata: {},
+      });
+    }
+    saveMessage({
+      sessionKey: 'web:user-x',
+      userId: 'user-x',
+      role: 'user',
+      content: 'real visitor',
+      timestamp: Date.now(),
+      metadata: {},
+    });
+
+    const msgs = getRecentVisitorMessages(100);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]!.sessionKey).toBe('web:user-x');
   });
 
   it('getLastUserMessageTimestamp returns null when no messages', async () => {
@@ -1367,10 +1558,11 @@ describe('Palace — resolveWingForMemory', () => {
     expect(wingName).toBe('town');
   });
 
-  it('visitor with userId → visitor-{userId} wing', async () => {
+  it('visitor with userId → shared visitors wing + per-user room (findings.md P2:652)', async () => {
     const { resolveWingForMemory } = await import('../src/memory/palace.js');
-    const { wingName } = resolveWingForMemory('web:abc', 'user-42', {});
-    expect(wingName).toBe('visitor-user-42');
+    const { wingName, roomName } = resolveWingForMemory('web:abc', 'user-42', {});
+    expect(wingName).toBe('visitors');
+    expect(roomName).toBe('visitor-user-42');
   });
 
   it('unknown session key without userId → encounters fallback', async () => {
@@ -1796,6 +1988,177 @@ describe('Memory Store — getUnassignedMemories', () => {
     const unassigned = getUnassignedMemories(['mature']);
     expect(unassigned.some(m => m.id === id)).toBe(false);
   });
+
+  // findings.md P2:660 — sampling strategies
+  it("'newest' strategy returns exactly the N newest by created_at", async () => {
+    const { saveMemory, getUnassignedMemories } = await import('../src/memory/store.js');
+    const { execute } = await import('../src/storage/database.js');
+    // Create 10 memories and backdate them with increasing gaps to get a
+    // stable created_at ordering.
+    const ids: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      const id = await saveMemory({
+        sessionKey: `s:sort:${i}`,
+        userId: null,
+        content: `content ${i}`,
+        memoryType: 'fact',
+        importance: 0.5,
+        emotionalWeight: 0,
+        relatedTo: null,
+        sourceMessageId: null,
+        metadata: {},
+        lifecycleState: 'mature',
+      });
+      execute('UPDATE memories SET created_at = ? WHERE id = ?', [1000000 + i * 1000, id]);
+      ids.push(id);
+    }
+    const result = getUnassignedMemories(['mature'], 3, 'newest');
+    expect(result).toHaveLength(3);
+    // Newest 3 by created_at are the last 3 we inserted (indices 7, 8, 9).
+    const expectedIds = ids.slice(7).reverse();
+    expect(result.map((m) => m.id)).toEqual(expectedIds);
+  });
+
+  it("'random' strategy can surface memories beyond the newest-N cap", async () => {
+    const { saveMemory, getUnassignedMemories } = await import('../src/memory/store.js');
+    const { execute } = await import('../src/storage/database.js');
+    // Create 40 memories; backdate so we have a clear "old" cohort.
+    const oldIds = new Set<string>();
+    for (let i = 0; i < 20; i++) {
+      const id = await saveMemory({
+        sessionKey: `s:old:${i}`,
+        userId: null,
+        content: `old ${i}`,
+        memoryType: 'fact',
+        importance: 0.5,
+        emotionalWeight: 0,
+        relatedTo: null,
+        sourceMessageId: null,
+        metadata: {},
+        lifecycleState: 'mature',
+      });
+      execute('UPDATE memories SET created_at = ? WHERE id = ?', [1000000 + i, id]);
+      oldIds.add(id);
+    }
+    for (let i = 0; i < 20; i++) {
+      const id = await saveMemory({
+        sessionKey: `s:new:${i}`,
+        userId: null,
+        content: `new ${i}`,
+        memoryType: 'fact',
+        importance: 0.5,
+        emotionalWeight: 0,
+        relatedTo: null,
+        sourceMessageId: null,
+        metadata: {},
+        lifecycleState: 'mature',
+      });
+      execute('UPDATE memories SET created_at = ? WHERE id = ?', [2000000 + i, id]);
+    }
+    // Sample 5 times; random should surface at least one old across the calls.
+    let sawOld = false;
+    for (let attempt = 0; attempt < 20 && !sawOld; attempt++) {
+      const result = getUnassignedMemories(['mature'], 5, 'random');
+      if (result.some((m) => oldIds.has(m.id))) sawOld = true;
+    }
+    expect(sawOld).toBe(true);
+  });
+
+  it("default 'mixed' strategy combines newest + random (union includes both ends)", async () => {
+    const { saveMemory, getUnassignedMemories } = await import('../src/memory/store.js');
+    const { execute } = await import('../src/storage/database.js');
+    const oldIds = new Set<string>();
+    const newIds = new Set<string>();
+    for (let i = 0; i < 10; i++) {
+      const id = await saveMemory({
+        sessionKey: `s:m-old:${i}`,
+        userId: null,
+        content: `m-old ${i}`,
+        memoryType: 'fact',
+        importance: 0.5,
+        emotionalWeight: 0,
+        relatedTo: null,
+        sourceMessageId: null,
+        metadata: {},
+        lifecycleState: 'mature',
+      });
+      execute('UPDATE memories SET created_at = ? WHERE id = ?', [1000000 + i, id]);
+      oldIds.add(id);
+    }
+    for (let i = 0; i < 10; i++) {
+      const id = await saveMemory({
+        sessionKey: `s:m-new:${i}`,
+        userId: null,
+        content: `m-new ${i}`,
+        memoryType: 'fact',
+        importance: 0.5,
+        emotionalWeight: 0,
+        relatedTo: null,
+        sourceMessageId: null,
+        metadata: {},
+        lifecycleState: 'mature',
+      });
+      execute('UPDATE memories SET created_at = ? WHERE id = ?', [2000000 + i, id]);
+      newIds.add(id);
+    }
+    // With limit 10, newest half = 5 (all from newIds), random half = 5
+    // drawn from the full pool of 20. Across several calls the union
+    // should include at least one old id — deterministic in ~all cases
+    // because random draws 5 from 20 with no newest-bias.
+    let sawOld = false;
+    let sawNew = false;
+    for (let attempt = 0; attempt < 20 && !(sawOld && sawNew); attempt++) {
+      const result = getUnassignedMemories(['mature'], 10, 'mixed');
+      if (result.some((m) => oldIds.has(m.id))) sawOld = true;
+      if (result.some((m) => newIds.has(m.id))) sawNew = true;
+    }
+    expect(sawOld).toBe(true);
+    expect(sawNew).toBe(true);
+  });
+
+  it("default strategy is 'mixed' (backwards-compat when no arg passed)", async () => {
+    // Not a pure-newest call: verify that when strategy is omitted, the
+    // result isn't deterministically the newest 10 only.
+    const { saveMemory, getUnassignedMemories } = await import('../src/memory/store.js');
+    const { execute } = await import('../src/storage/database.js');
+    const oldIds = new Set<string>();
+    for (let i = 0; i < 15; i++) {
+      const id = await saveMemory({
+        sessionKey: `s:default-old:${i}`,
+        userId: null,
+        content: `default-old ${i}`,
+        memoryType: 'fact',
+        importance: 0.5,
+        emotionalWeight: 0,
+        relatedTo: null,
+        sourceMessageId: null,
+        metadata: {},
+        lifecycleState: 'mature',
+      });
+      execute('UPDATE memories SET created_at = ? WHERE id = ?', [1000000 + i, id]);
+      oldIds.add(id);
+    }
+    for (let i = 0; i < 15; i++) {
+      await saveMemory({
+        sessionKey: `s:default-new:${i}`,
+        userId: null,
+        content: `default-new ${i}`,
+        memoryType: 'fact',
+        importance: 0.5,
+        emotionalWeight: 0,
+        relatedTo: null,
+        sourceMessageId: null,
+        metadata: {},
+        lifecycleState: 'mature',
+      });
+    }
+    let sawOld = false;
+    for (let attempt = 0; attempt < 20 && !sawOld; attempt++) {
+      const result = getUnassignedMemories(['mature'], 10);
+      if (result.some((m) => oldIds.has(m.id))) sawOld = true;
+    }
+    expect(sawOld).toBe(true);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1869,6 +2232,511 @@ describe('Memory Store — getActivity', () => {
     const result = getActivity(now - 5000, now + 5000);
     for (let i = 1; i < result.length; i++) {
       expect(result[i - 1]!.timestamp).toBeGreaterThanOrEqual(result[i]!.timestamp);
+    }
+  });
+
+  // findings.md P2:457 — getActivity's `WHERE created_at BETWEEN ? AND ?
+  // ... ORDER BY created_at DESC LIMIT ?` used to run full table scans
+  // because `memories` had no index on created_at. Migration v14 adds
+  // `idx_memories_created_at`.
+  it('findings.md P2:457 — idx_memories_created_at exists after migration', async () => {
+    const { query } = await import('../src/storage/database.js');
+    const rows = query<{ name: string; tbl_name: string; sql: string | null }>(
+      `SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_memories_created_at'`
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.tbl_name).toBe('memories');
+    // DESC ordering preserved.
+    expect(rows[0]?.sql ?? '').toMatch(/created_at\s+DESC/i);
+  });
+
+  it('findings.md P2:457 — getActivity query plan uses idx_memories_created_at', async () => {
+    const { query } = await import('../src/storage/database.js');
+    // Mirror the exact predicate shape used by getActivity so the
+    // planner has the same choice it has in production.
+    const plan = query<{ detail: string }>(
+      `EXPLAIN QUERY PLAN
+         SELECT * FROM memories
+         WHERE created_at BETWEEN ? AND ?
+           AND (session_key LIKE ? OR session_key LIKE ? OR session_key LIKE ?)
+         ORDER BY created_at DESC LIMIT ?`,
+      [0, Date.now(), 'diary:%', 'dream:%', 'curiosity:%', 500]
+    );
+    const joined = plan.map((r) => r.detail).join(' | ');
+    // Must use *some* index, not a SCAN without an index. We accept any
+    // index whose name references `memories` — if the planner swaps to
+    // a composite index we add later, the test still passes. The key
+    // regression guard is: not a full SCAN.
+    expect(joined).toMatch(/USING INDEX/i);
+    expect(joined).not.toMatch(/SCAN memories\b(?!.*USING)/i);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P2:517 — Embedding model versioning
+// ─────────────────────────────────────────────────────────────────────────────
+describe('Memory Store — embedding model versioning (findings.md P2:517)', () => {
+  let testCtx: Awaited<ReturnType<typeof setupTestDb>>;
+
+  beforeEach(async () => {
+    testCtx = await setupTestDb('emb-model-v');
+  });
+  afterEach(async () => {
+    await testCtx.cleanup();
+  });
+
+  it('migration adds embedding_model column to memories', async () => {
+    const { query } = await import('../src/storage/database.js');
+    const cols = query<{ name: string }>("PRAGMA table_info(memories)");
+    const names = cols.map((c) => c.name);
+    expect(names).toContain('embedding_model');
+  });
+
+  it('saveMemory stamps embedding_model with CURRENT_EMBEDDING_MODEL', async () => {
+    const { saveMemory } = await import('../src/memory/store.js');
+    const { CURRENT_EMBEDDING_MODEL } = await import('../src/memory/embeddings.js');
+    const { queryOne } = await import('../src/storage/database.js');
+
+    const id = await saveMemory({
+      sessionKey: 'test:1',
+      userId: null,
+      content: 'stamp me',
+      memoryType: 'fact',
+      importance: 0.5,
+      emotionalWeight: 0,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {},
+    });
+
+    const row = queryOne<{ embedding_model: string | null }>(
+      'SELECT embedding_model FROM memories WHERE id = ?',
+      [id]
+    );
+    expect(row?.embedding_model).toBe(CURRENT_EMBEDDING_MODEL);
+    expect(CURRENT_EMBEDDING_MODEL).toBeTruthy();
+  });
+
+  it('searchMemories excludes rows stamped with a non-current model', async () => {
+    const { saveMemory, searchMemories } = await import('../src/memory/store.js');
+    const { execute } = await import('../src/storage/database.js');
+
+    const currentId = await saveMemory({
+      sessionKey: 'test:current',
+      userId: null,
+      content: 'alpha beta gamma delta',
+      memoryType: 'fact',
+      importance: 0.5,
+      emotionalWeight: 0,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {},
+    });
+    const staleId = await saveMemory({
+      sessionKey: 'test:stale',
+      userId: null,
+      content: 'alpha beta gamma delta',
+      memoryType: 'fact',
+      importance: 0.5,
+      emotionalWeight: 0,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {},
+    });
+    // Simulate a stale-model row (what production would look like after a
+    // model swap before any backfill has run).
+    execute('UPDATE memories SET embedding_model = ? WHERE id = ?', [
+      'Xenova/some-other-model',
+      staleId,
+    ]);
+
+    const results = await searchMemories('alpha beta gamma delta', 10, 0.0);
+    const ids = results.map((r) => r.memory.id);
+    expect(ids).toContain(currentId);
+    expect(ids).not.toContain(staleId);
+  });
+
+  it('searchMemories includes legacy NULL-stamped rows (grandfather clause)', async () => {
+    const { saveMemory, searchMemories } = await import('../src/memory/store.js');
+    const { execute } = await import('../src/storage/database.js');
+
+    const legacyId = await saveMemory({
+      sessionKey: 'test:legacy',
+      userId: null,
+      content: 'omega psi chi phi',
+      memoryType: 'fact',
+      importance: 0.5,
+      emotionalWeight: 0,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {},
+    });
+    // Simulate a row written before the P2:517 migration landed.
+    execute('UPDATE memories SET embedding_model = NULL WHERE id = ?', [legacyId]);
+
+    const results = await searchMemories('omega psi chi phi', 10, 0.0);
+    const ids = results.map((r) => r.memory.id);
+    expect(ids).toContain(legacyId);
+  });
+});
+
+describe('Coherence groups — seed grace window (findings.md P2:694)', () => {
+  let testCtx: Awaited<ReturnType<typeof setupTestDb>>;
+
+  beforeEach(async () => {
+    testCtx = await setupTestDb('coh-grace');
+  });
+  afterEach(async () => {
+    await testCtx.cleanup();
+  });
+
+  it('newly-created single-seed groups survive pruneIncoherentMembers within 24h', async () => {
+    const { createCoherenceGroup, addToCoherenceGroup, getCoherenceGroup, saveMemory } =
+      await import('../src/memory/store.js');
+    const { runTopologyMaintenance } = await import('../src/memory/topology.js');
+
+    const memId = await saveMemory({
+      sessionKey: 'test:seed',
+      userId: null,
+      content: 'seed content',
+      memoryType: 'episode',
+      importance: 0.5,
+      emotionalWeight: 0,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {},
+    });
+    // Build a realistic signature so pruneIncoherentMembers sees an embedding.
+    const signature = new Float32Array(384);
+    signature.fill(0.1);
+    const groupId = createCoherenceGroup('test-seed-group', signature);
+    addToCoherenceGroup(memId, groupId);
+
+    await runTopologyMaintenance();
+
+    expect(getCoherenceGroup(groupId)).toBeDefined();
+  });
+
+  it('mergeOverlappingGroups refreshes centroid via point lookup, not limit-1 scan (findings.md P2:676)', async () => {
+    // Source-regression lock: the old code queried `getAllCoherenceGroups(1)`
+    // and hunted for `a.id` with `.find`, but limit-1 almost never returned
+    // group `a`. The fix uses a direct point lookup (`getCoherenceGroup(a.id)`),
+    // so every subsequent merge comparison in the same cycle sees `a`'s
+    // updated signature, not the stale pre-merge one.
+    const { readFileSync } = await import('node:fs');
+    const src = readFileSync('src/memory/topology.ts', 'utf8');
+    expect(src).not.toMatch(/getAllCoherenceGroups\(1\)\.find\(/);
+    expect(src).toMatch(/const updated = getCoherenceGroup\(a\.id\);/);
+  });
+
+  it('groups older than 24h with < 2 members ARE dissolved', async () => {
+    const { createCoherenceGroup, addToCoherenceGroup, getCoherenceGroup, saveMemory } =
+      await import('../src/memory/store.js');
+    const { execute } = await import('../src/storage/database.js');
+    const { runTopologyMaintenance } = await import('../src/memory/topology.js');
+
+    const memId = await saveMemory({
+      sessionKey: 'test:stale-seed',
+      userId: null,
+      content: 'stale seed content',
+      memoryType: 'episode',
+      importance: 0.5,
+      emotionalWeight: 0,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {},
+    });
+    const signature = new Float32Array(384);
+    signature.fill(0.1);
+    const groupId = createCoherenceGroup('stale-group', signature);
+    addToCoherenceGroup(memId, groupId);
+
+    // Backdate created_at beyond the 24h grace window.
+    const twoDaysAgo = Date.now() - 2 * 24 * 60 * 60 * 1000;
+    execute('UPDATE coherence_groups SET created_at = ? WHERE id = ?', [twoDaysAgo, groupId]);
+
+    await runTopologyMaintenance();
+
+    expect(getCoherenceGroup(groupId)).toBeUndefined();
+  });
+});
+
+describe('runMemoryMaintenance — per-phase error isolation (findings.md P2:704)', () => {
+  let testCtx: Awaited<ReturnType<typeof setupTestDb>>;
+
+  beforeEach(async () => {
+    testCtx = await setupTestDb('maint-isolation');
+  });
+  afterEach(async () => {
+    await testCtx.cleanup();
+  });
+
+  it('returns per-phase results with 10 named phases in fixed order', async () => {
+    const { runMemoryMaintenance } = await import('../src/memory/organic.js');
+    const results = await runMemoryMaintenance();
+
+    const expected = [
+      'gracefulForgetting',
+      'detectCrossConversationPatterns',
+      'evolveImportance',
+      'decayAssociationStrength',
+      'distillMemoryClusters',
+      'protectLandmarkMemories',
+      'generateEraSummaries',
+      'enforceMemoryCap',
+      'runTopologyMaintenance',
+      'maintainKnowledgeGraph',
+    ];
+    expect(results.map((r) => r.phase)).toEqual(expected);
+    for (const r of results) {
+      expect(typeof r.ok).toBe('boolean');
+      expect(typeof r.durationMs).toBe('number');
+      expect(r.durationMs).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it('a failing phase does not skip subsequent phases', async () => {
+    // Mock one phase to throw via module-level monkey-patch.
+    const organic = await import('../src/memory/organic.js');
+    // Use vitest's spyOn to inject a throw into a dependency-free helper.
+    // `enforceMemoryCap` is synchronous and a good candidate; we swap the
+    // knowledge-graph phase to throw, then verify topology / KG phases
+    // AFTER it still ran. Since the phase functions are module-private,
+    // we exercise the isolation via runMemoryMaintenance itself: we mutate
+    // the DB to force one phase into an error path.
+    //
+    // Easiest reliable trigger: drop a table the phase depends on, then
+    // restore after. We pick `kg_triples` (used by
+    // maintainKnowledgeGraph) — runTopologyMaintenance runs BEFORE it, so
+    // if isolation works we'll see all 10 phases, with maintainKnowledgeGraph
+    // ok=false and every earlier phase ok=true.
+    const { execute } = await import('../src/storage/database.js');
+    execute('DROP TABLE IF EXISTS kg_triples_backup');
+    execute('ALTER TABLE kg_triples RENAME TO kg_triples_backup');
+    try {
+      const results = await organic.runMemoryMaintenance();
+      expect(results).toHaveLength(10);
+      const kgResult = results.find((r) => r.phase === 'maintainKnowledgeGraph');
+      expect(kgResult).toBeDefined();
+      expect(kgResult!.ok).toBe(false);
+      expect(kgResult!.error).toBeTruthy();
+      // Every OTHER phase should have succeeded — the whole point of
+      // isolation is that a late-phase failure doesn't poison earlier
+      // phases (and that earlier-phase results don't drop off the array).
+      const nonKg = results.filter((r) => r.phase !== 'maintainKnowledgeGraph');
+      for (const r of nonKg) {
+        expect(r.ok).toBe(true);
+      }
+    } finally {
+      execute('ALTER TABLE kg_triples_backup RENAME TO kg_triples');
+    }
+  });
+
+  it('runMemoryMaintenance resolves (does not throw) even when a phase throws', async () => {
+    const { runMemoryMaintenance } = await import('../src/memory/organic.js');
+    const { execute } = await import('../src/storage/database.js');
+    execute('DROP TABLE IF EXISTS kg_triples_backup');
+    execute('ALTER TABLE kg_triples RENAME TO kg_triples_backup');
+    try {
+      await expect(runMemoryMaintenance()).resolves.toBeDefined();
+    } finally {
+      execute('ALTER TABLE kg_triples_backup RENAME TO kg_triples');
+    }
+  });
+});
+
+describe('Memory Store — archived lifecycle excluded from search (findings.md P2:755 / P2:738)', () => {
+  let testCtx: Awaited<ReturnType<typeof setupTestDb>>;
+
+  beforeEach(async () => {
+    testCtx = await setupTestDb('archived-search');
+  });
+  afterEach(async () => {
+    await testCtx.cleanup();
+  });
+
+  it("LifecycleState union includes 'archived' (setLifecycleState accepts it without cast)", async () => {
+    const { saveMemory, setLifecycleState, getMemory } = await import('../src/memory/store.js');
+    const id = await saveMemory({
+      sessionKey: 'test:archive',
+      userId: null,
+      content: 'era-summary source',
+      memoryType: 'episode',
+      importance: 0.5,
+      emotionalWeight: 0,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {},
+    });
+    setLifecycleState(id, 'archived');
+    const memory = getMemory(id);
+    expect(memory?.lifecycleState).toBe('archived');
+  });
+
+  it('searchMemories excludes archived memories', async () => {
+    const { saveMemory, searchMemories, setLifecycleState } = await import('../src/memory/store.js');
+
+    const liveId = await saveMemory({
+      sessionKey: 'test:live',
+      userId: null,
+      content: 'ancient runes on the obelisk',
+      memoryType: 'fact',
+      importance: 0.5,
+      emotionalWeight: 0,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {},
+    });
+    const archivedId = await saveMemory({
+      sessionKey: 'test:archived',
+      userId: null,
+      content: 'ancient runes on the obelisk',
+      memoryType: 'fact',
+      importance: 0.5,
+      emotionalWeight: 0,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {},
+    });
+    setLifecycleState(archivedId, 'archived');
+
+    const results = await searchMemories('ancient runes on the obelisk', 10, 0.0);
+    const ids = results.map((r) => r.memory.id);
+    expect(ids).toContain(liveId);
+    expect(ids).not.toContain(archivedId);
+  });
+
+  it('searchMemories still excludes composting memories (regression lock)', async () => {
+    const { saveMemory, searchMemories, setLifecycleState } = await import('../src/memory/store.js');
+
+    const compostingId = await saveMemory({
+      sessionKey: 'test:composting',
+      userId: null,
+      content: 'singular lexical phrase alpha-bravo',
+      memoryType: 'fact',
+      importance: 0.5,
+      emotionalWeight: 0,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {},
+    });
+    setLifecycleState(compostingId, 'composting');
+
+    const results = await searchMemories('singular lexical phrase alpha-bravo', 10, 0.0);
+    expect(results.map((r) => r.memory.id)).not.toContain(compostingId);
+  });
+
+  it('generateEraSummaries archives source memories via setLifecycleState (not dead cast)', async () => {
+    // Regression lock for P2:738: archival shouldn't rely on a cast-bypass
+    // followed by a direct SQL UPDATE. setLifecycleState alone must persist
+    // the 'archived' state.
+    const { saveMemory, setLifecycleState, getMemory } = await import('../src/memory/store.js');
+    const id = await saveMemory({
+      sessionKey: 'test:era',
+      userId: null,
+      content: 'era source',
+      memoryType: 'episode',
+      importance: 0.4,
+      emotionalWeight: 0,
+      relatedTo: null,
+      sourceMessageId: null,
+      metadata: {},
+    });
+    setLifecycleState(id, 'archived');
+    expect(getMemory(id)?.lifecycleState).toBe('archived');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// extractUserId — allow-list user-session prefixes (findings.md P2:787)
+// ─────────────────────────────────────────────────────────────────────────────
+describe('extractUserId — allow-list for user-session prefixes (findings.md P2:787)', () => {
+  it('returns null for diary:<date> background-loop sessions', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    expect(extractUserId('diary:2026-04-19')).toBeNull();
+  });
+
+  it('returns null for commune:<char> peer sessions', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    expect(extractUserId('commune:pkd')).toBeNull();
+  });
+
+  it('returns null for letter:<char> background sessions', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    expect(extractUserId('letter:alice')).toBeNull();
+  });
+
+  it('returns null for peer:<char> sessions', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    expect(extractUserId('peer:lain')).toBeNull();
+  });
+
+  it('returns null for char-namespaced letter keys like lain:letter:sent', async () => {
+    // Regression: char-namespaced session keys should not fabricate
+    // "letter" as a userId just because it is parts[1].
+    const { extractUserId } = await import('../src/memory/index.js');
+    expect(extractUserId('lain:letter:sent')).toBeNull();
+  });
+
+  it('returns null for bare background prefixes with no second segment', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    expect(extractUserId('dream')).toBeNull();
+    expect(extractUserId('curiosity')).toBeNull();
+  });
+
+  it('returns null for empty session key', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    expect(extractUserId('')).toBeNull();
+  });
+
+  it('returns userId for web:<id> user sessions', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    expect(extractUserId('web:abc123')).toBe('abc123');
+  });
+
+  it('returns userId for telegram:<id> user sessions', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    expect(extractUserId('telegram:456789')).toBe('456789');
+  });
+
+  it('returns userId for user:<id>, chat:<id>, owner:<id> sessions', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    expect(extractUserId('user:alice')).toBe('alice');
+    expect(extractUserId('chat:bob')).toBe('bob');
+    expect(extractUserId('owner:admin')).toBe('admin');
+  });
+
+  it('returns null when user-session prefix has empty id segment', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    expect(extractUserId('web:')).toBeNull();
+  });
+
+  it('metadata.userId wins over sessionKey (even for background loop)', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    expect(extractUserId('diary:2026-04-19', { userId: 'override' })).toBe('override');
+  });
+
+  it('metadata.senderId wins over sessionKey', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    expect(extractUserId('commune:pkd', { senderId: 'telegram-sender' })).toBe('telegram-sender');
+  });
+
+  it('metadata.userId takes precedence over metadata.senderId', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    expect(extractUserId('web:abc', { userId: 'u1', senderId: 's1' })).toBe('u1');
+  });
+
+  it('non-string metadata fields fall back to sessionKey parsing', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    // Numeric or object userId is rejected → falls through to sessionKey.
+    expect(extractUserId('web:fallback', { userId: 123 as unknown as string })).toBe('fallback');
+  });
+
+  it('every BACKGROUND_PREFIX yields null', async () => {
+    const { extractUserId } = await import('../src/memory/index.js');
+    const { BACKGROUND_PREFIXES } = await import('../src/memory/store.js');
+    for (const prefix of BACKGROUND_PREFIXES) {
+      expect(extractUserId(`${prefix}:something`), `prefix=${prefix}`).toBeNull();
     }
   });
 });

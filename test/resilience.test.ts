@@ -23,6 +23,7 @@ const {
   mockLoggerInfo,
   mockGetMeta,
   mockSetMeta,
+  mockAtomicMetaIncrementCounter,
   mockExecute,
   mockQuery,
   mockQueryOne,
@@ -33,6 +34,7 @@ const {
   const mockLoggerInfo = vi.fn();
   const mockGetMeta = vi.fn();
   const mockSetMeta = vi.fn();
+  const mockAtomicMetaIncrementCounter = vi.fn();
   const mockExecute = vi.fn();
   const mockQuery = vi.fn();
   const mockQueryOne = vi.fn();
@@ -43,6 +45,7 @@ const {
     mockLoggerInfo,
     mockGetMeta,
     mockSetMeta,
+    mockAtomicMetaIncrementCounter,
     mockExecute,
     mockQuery,
     mockQueryOne,
@@ -62,6 +65,7 @@ vi.mock('../src/utils/logger.js', () => ({
 vi.mock('../src/storage/database.js', () => ({
   getMeta: mockGetMeta,
   setMeta: mockSetMeta,
+  atomicMetaIncrementCounter: mockAtomicMetaIncrementCounter,
   execute: mockExecute,
   query: mockQuery,
   queryOne: mockQueryOne,
@@ -77,6 +81,7 @@ vi.mock('../src/memory/embeddings.js', () => ({
   serializeEmbedding: vi.fn((e: Float32Array) => Buffer.from(e.buffer)),
   deserializeEmbedding: vi.fn((b: Buffer) => new Float32Array(b.buffer)),
   cosineSimilarity: vi.fn(() => 0.8),
+  CURRENT_EMBEDDING_MODEL: 'Xenova/all-MiniLM-L6-v2',
 }));
 
 // palace.js — needed by saveMemory
@@ -233,13 +238,18 @@ describe('Retry logic — withRetry()', () => {
     expect(await promise).toBe('ok');
   });
 
-  it('uses exponential backoff: delay doubles per attempt', async () => {
+  it('uses exponential backoff with full jitter: delay bounded by 2^attempt cap (findings.md P2:1050)', async () => {
+    // findings.md P2:1050 — full jitter picks delay uniformly in
+    // [0, baseDelay * 2^attempt]. The exponential shape lives in the cap,
+    // not the sampled delay. Pin Math.random so we can assert the cap
+    // growth deterministically.
     const delays: number[] = [];
     const originalSetTimeout = global.setTimeout;
     const setTimeoutSpy = vi.spyOn(global, 'setTimeout').mockImplementation((fn, ms, ...args) => {
-      if (typeof ms === 'number' && ms > 0) delays.push(ms);
+      if (typeof ms === 'number') delays.push(ms);
       return originalSetTimeout(fn as () => void, 0, ...args);
     });
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.9999);
 
     const err = Object.assign(new Error('rate limit'), { status: 429 });
     const fn = vi.fn()
@@ -252,9 +262,42 @@ describe('Retry logic — withRetry()', () => {
     await promise;
 
     setTimeoutSpy.mockRestore();
-    // First delay: 100ms, second delay: 200ms (exponential)
+    randomSpy.mockRestore();
+    // With random ≈ 1: delay ≈ cap. First cap is 100, second is 200.
     expect(delays.length).toBeGreaterThanOrEqual(2);
-    expect(delays[1]).toBeGreaterThan(delays[0]!);
+    expect(delays[0]).toBeGreaterThanOrEqual(99);
+    expect(delays[0]).toBeLessThanOrEqual(100);
+    expect(delays[1]).toBeGreaterThanOrEqual(199);
+    expect(delays[1]).toBeLessThanOrEqual(200);
+  });
+
+  it('full jitter produces different delays for two concurrent retriers (findings.md P2:1050)', async () => {
+    // findings.md P2:1050 — the whole point of jitter is that two callers
+    // failing at the same instant don't retry in lockstep. Fix two
+    // different Math.random samples and assert the two computed delays
+    // differ.
+    const capturedDelays: number[] = [];
+    const originalSetTimeout = global.setTimeout;
+    const setTimeoutSpy = vi.spyOn(global, 'setTimeout').mockImplementation((fn, ms, ...args) => {
+      if (typeof ms === 'number') capturedDelays.push(ms);
+      return originalSetTimeout(fn as () => void, 0, ...args);
+    });
+    const randomSpy = vi.spyOn(Math, 'random')
+      .mockReturnValueOnce(0.1) // caller A's first delay
+      .mockReturnValueOnce(0.9); // caller B's first delay
+
+    const err = Object.assign(new Error('rate limit'), { status: 429 });
+    const makeFn = () => vi.fn().mockRejectedValueOnce(err).mockResolvedValue('ok');
+
+    const a = withRetry(makeFn(), 'a', { maxRetries: 1, baseDelayMs: 1000, retryableStatusCodes: [429] });
+    const b = withRetry(makeFn(), 'b', { maxRetries: 1, baseDelayMs: 1000, retryableStatusCodes: [429] });
+    await vi.runAllTimersAsync();
+    await Promise.all([a, b]);
+
+    setTimeoutSpy.mockRestore();
+    randomSpy.mockRestore();
+    expect(capturedDelays).toHaveLength(2);
+    expect(capturedDelays[0]).not.toBe(capturedDelays[1]);
   });
 
   it('propagates non-retryable errors immediately', async () => {
@@ -270,6 +313,84 @@ describe('Retry logic — withRetry()', () => {
     const promise = withRetry(fn, 'test');
     await vi.runAllTimersAsync();
     expect(await promise).toBe('result');
+  });
+
+  it('honors Retry-After header in seconds (findings.md P2:1060)', async () => {
+    // findings.md P2:1060 — server told us to wait 30s; must not retry
+    // again inside that window.
+    const delays: number[] = [];
+    const originalSetTimeout = global.setTimeout;
+    const setTimeoutSpy = vi.spyOn(global, 'setTimeout').mockImplementation((fn, ms, ...args) => {
+      if (typeof ms === 'number') delays.push(ms);
+      return originalSetTimeout(fn as () => void, 0, ...args);
+    });
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0); // force jitter to 0
+
+    const err = Object.assign(new Error('rate limit'), {
+      status: 429,
+      headers: { 'retry-after': '30' },
+    });
+    const fn = vi.fn().mockRejectedValueOnce(err).mockResolvedValue('ok');
+
+    const promise = withRetry(fn, 'test', { maxRetries: 3, baseDelayMs: 100, retryableStatusCodes: [429] });
+    await vi.runAllTimersAsync();
+    await promise;
+
+    setTimeoutSpy.mockRestore();
+    randomSpy.mockRestore();
+    // 30s = 30000ms, which is far larger than the jittered backoff.
+    expect(delays[0]).toBe(30000);
+  });
+
+  it('honors Retry-After HTTP-date (findings.md P2:1060)', async () => {
+    // findings.md P2:1060 — RFC 7231 also allows an HTTP-date value.
+    const delays: number[] = [];
+    const originalSetTimeout = global.setTimeout;
+    const setTimeoutSpy = vi.spyOn(global, 'setTimeout').mockImplementation((fn, ms, ...args) => {
+      if (typeof ms === 'number') delays.push(ms);
+      return originalSetTimeout(fn as () => void, 0, ...args);
+    });
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const futureDate = new Date(Date.now() + 5000).toUTCString();
+
+    const err = Object.assign(new Error('rate limit'), {
+      status: 429,
+      headers: { 'retry-after': futureDate },
+    });
+    const fn = vi.fn().mockRejectedValueOnce(err).mockResolvedValue('ok');
+
+    const promise = withRetry(fn, 'test', { maxRetries: 3, baseDelayMs: 100, retryableStatusCodes: [429] });
+    await vi.runAllTimersAsync();
+    await promise;
+
+    setTimeoutSpy.mockRestore();
+    randomSpy.mockRestore();
+    // Within ~1s of 5000ms target.
+    expect(delays[0]).toBeGreaterThan(3500);
+    expect(delays[0]).toBeLessThanOrEqual(5000);
+  });
+
+  it('falls back to jittered backoff when Retry-After absent (findings.md P2:1060)', async () => {
+    // findings.md P2:1060 — no header means keep normal backoff behavior.
+    const delays: number[] = [];
+    const originalSetTimeout = global.setTimeout;
+    const setTimeoutSpy = vi.spyOn(global, 'setTimeout').mockImplementation((fn, ms, ...args) => {
+      if (typeof ms === 'number') delays.push(ms);
+      return originalSetTimeout(fn as () => void, 0, ...args);
+    });
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.9999);
+
+    const err = Object.assign(new Error('rate limit'), { status: 429 });
+    const fn = vi.fn().mockRejectedValueOnce(err).mockResolvedValue('ok');
+
+    const promise = withRetry(fn, 'test', { maxRetries: 3, baseDelayMs: 100, retryableStatusCodes: [429] });
+    await vi.runAllTimersAsync();
+    await promise;
+
+    setTimeoutSpy.mockRestore();
+    randomSpy.mockRestore();
+    expect(delays[0]).toBeGreaterThanOrEqual(99);
+    expect(delays[0]).toBeLessThanOrEqual(100);
   });
 });
 
@@ -436,6 +557,63 @@ describe('Fallback provider chain — createFallbackProvider()', () => {
     const proxy = createFallbackProvider(primary as never, ['fallback-1'], factory);
     await expect(proxy.continueWithToolResults(opts, [], [])).resolves.toBeDefined();
   });
+
+  // findings.md P2:1090 — when a provider lacks streaming, the proxy used
+  // to call the buffered variant and never fire onChunk, leaving UIs stuck
+  // on "waiting". The fix synthesizes a single chunk from the buffered
+  // content so callers always see their callback fire.
+  describe('stream synthesis when provider lacks streaming impl (P2:1090)', () => {
+    it('completeStream fires onChunk with buffered content', async () => {
+      const primary = makeProvider('primary', () => Promise.resolve(goodResult));
+      const proxy = createFallbackProvider(primary as never, ['fb'], () => primary as never);
+      const chunks: string[] = [];
+      const result = await proxy.completeStream!(opts, (c) => chunks.push(c));
+      expect(chunks).toEqual(['hello']);
+      expect(result).toEqual(goodResult);
+    });
+
+    it('completeWithToolsStream fires onChunk with buffered content', async () => {
+      const primary = makeProvider('primary', () => Promise.resolve({ ...goodResult, toolCalls: [] }));
+      const proxy = createFallbackProvider(primary as never, ['fb'], () => primary as never);
+      const chunks: string[] = [];
+      await proxy.completeWithToolsStream!(opts, (c) => chunks.push(c));
+      expect(chunks).toEqual(['hello']);
+    });
+
+    it('continueWithToolResultsStream fires onChunk with buffered content', async () => {
+      const primary = makeProvider('primary', () => Promise.resolve(goodResult));
+      const proxy = createFallbackProvider(primary as never, ['fb'], () => primary as never);
+      const chunks: string[] = [];
+      await proxy.continueWithToolResultsStream!(opts, [], [], (c) => chunks.push(c));
+      expect(chunks).toEqual(['hello']);
+    });
+
+    it('skips onChunk when buffered content is empty', async () => {
+      const emptyResult = { ...goodResult, content: '' };
+      const primary = makeProvider('primary', () => Promise.resolve(emptyResult));
+      const proxy = createFallbackProvider(primary as never, ['fb'], () => primary as never);
+      const chunks: string[] = [];
+      await proxy.completeStream!(opts, (c) => chunks.push(c));
+      expect(chunks).toEqual([]);
+    });
+
+    it('prefers native completeStream when provider has one', async () => {
+      const nativeStream = vi.fn((_opts: unknown, onChunk: (c: string) => void) => {
+        onChunk('a');
+        onChunk('b');
+        return Promise.resolve(goodResult);
+      });
+      const primary = {
+        ...makeProvider('primary', () => Promise.resolve(goodResult)),
+        completeStream: nativeStream,
+      };
+      const proxy = createFallbackProvider(primary as never, ['fb'], () => primary as never);
+      const chunks: string[] = [];
+      await proxy.completeStream!(opts, (c) => chunks.push(c));
+      expect(chunks).toEqual(['a', 'b']);
+      expect(nativeStream).toHaveBeenCalled();
+    });
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -463,6 +641,11 @@ describe('Budget enforcement — checkBudget() / recordUsage()', () => {
     delete process.env['LAIN_MONTHLY_TOKEN_CAP'];
     mockSetMeta.mockReturnValue(undefined);
     mockExecute.mockReturnValue({ changes: 1, lastInsertRowid: 0 });
+    // findings.md P2:1110 — recordUsage routes through an atomic helper
+    // now. Default stub echoes freshJson so the 80% warning math works.
+    mockAtomicMetaIncrementCounter.mockImplementation(
+      (p: { freshJson: string }) => p.freshJson,
+    );
   });
 
   it('passes when usage is zero', () => {
@@ -511,26 +694,31 @@ describe('Budget enforcement — checkBudget() / recordUsage()', () => {
     expect(() => checkBudget()).not.toThrow();
   });
 
-  it('recordUsage accumulates tokens', () => {
+  it('recordUsage routes through atomic helper with correct delta', () => {
     process.env['LAIN_MONTHLY_TOKEN_CAP'] = '1000000';
-    mockGetMeta.mockReturnValue(JSON.stringify({ month: currentMonth, tokens: 500 }));
     recordUsage(100, 50);
-    expect(mockSetMeta).toHaveBeenCalledWith(
-      'budget:monthly_usage',
-      expect.stringContaining('"tokens":650')
+    expect(mockAtomicMetaIncrementCounter).toHaveBeenCalledWith(
+      expect.objectContaining({
+        key: 'budget:monthly_usage',
+        counterField: 'tokens',
+        delta: 150,
+      })
     );
   });
 
   it('recordUsage is no-op when cap is 0', () => {
     process.env['LAIN_MONTHLY_TOKEN_CAP'] = '0';
     recordUsage(9999, 9999);
-    expect(mockSetMeta).not.toHaveBeenCalled();
+    expect(mockAtomicMetaIncrementCounter).not.toHaveBeenCalled();
   });
 
   it('recordUsage warns at 80% threshold', () => {
     process.env['LAIN_MONTHLY_TOKEN_CAP'] = '1000';
-    // tokens=750 before call; +100 = 850 = 85% → triggers warn
-    mockGetMeta.mockReturnValue(JSON.stringify({ month: currentMonth, tokens: 750 }));
+    // Simulate the atomic helper returning a post-increment value of 850
+    // (85%). Pre-increment was 750 (< 80%), so we cross the threshold once.
+    mockAtomicMetaIncrementCounter.mockReturnValue(
+      JSON.stringify({ month: currentMonth, tokens: 850 }),
+    );
     recordUsage(80, 20);
     expect(mockLoggerWarn).toHaveBeenCalledWith(
       expect.objectContaining({ cap: 1000 }),
@@ -734,9 +922,12 @@ describe('Memory store resilience — saveMemory()', () => {
     expect(mockLoggerWarn).toHaveBeenCalled();
   });
 
-  it('handles vec0 insert failure gracefully (non-critical)', async () => {
+  it('propagates vec0 insert failure (findings.md P2:381)', async () => {
+    // findings.md P2:381 — the prior silent try/catch around the vec0
+    // INSERT allowed memories to land without their embedding, degrading
+    // search coverage monotonically. saveMemory now wraps both inserts in
+    // one transaction; vec0 failure must propagate (and roll back the row).
     mockGenerateEmbedding.mockResolvedValue(new Float32Array(384).fill(0.1));
-    // First call = main memory INSERT (ok), second call = vec0 INSERT (fails)
     mockExecute
       .mockReturnValueOnce({ changes: 1, lastInsertRowid: 1 })
       .mockImplementationOnce(() => { throw new Error('vec0 table error'); });
@@ -750,7 +941,7 @@ describe('Memory store resilience — saveMemory()', () => {
       relatedTo: null,
       sourceMessageId: null,
       metadata: {},
-    })).resolves.toBeDefined();
+    })).rejects.toThrow('vec0 table error');
   });
 });
 

@@ -3,11 +3,35 @@
  * Uses LLM to extract key facts and memories
  */
 
+import { createHash } from 'node:crypto';
 import type { Provider } from '../providers/index.js';
 import type { StoredMessage, Memory } from './store.js';
 import { saveMemory } from './store.js';
+import { getMeta, setMeta } from '../storage/database.js';
 import { getLogger } from '../utils/logger.js';
-import { withTimeout } from '../utils/timeout.js';
+import { withAbortableTimeout } from '../utils/timeout.js';
+import { ExtractionParseError } from '../utils/errors.js';
+
+/**
+ * findings.md P2:539 — Compute the idempotency watermark for a batch of
+ * messages being extracted. Hash over sessionKey + firstId + lastId +
+ * count; changing any of these invalidates the watermark. Exported for
+ * test visibility.
+ */
+export function computeExtractionWatermark(
+  sessionKey: string,
+  messages: StoredMessage[],
+): string {
+  const first = messages[0]?.id ?? '';
+  const last = messages[messages.length - 1]?.id ?? '';
+  return createHash('sha256')
+    .update(`${sessionKey}|${first}|${last}|${messages.length}`)
+    .digest('hex');
+}
+
+function watermarkMetaKey(sessionKey: string): string {
+  return `extraction:watermark:${sessionKey}`;
+}
 
 const EXTRACTION_PROMPT = `You are a memory extraction system. Analyze the conversation and extract key memories.
 
@@ -66,44 +90,101 @@ export async function extractMemories(
     return [];
   }
 
+  // findings.md P2:539 — idempotency watermark. Re-running extraction
+  // on the same (sessionKey, first message, last message, message count)
+  // would otherwise burn LLM tokens and insert near-duplicate memories
+  // on every retry / scheduled re-run / crash-recovery pass. If the
+  // watermark matches what we stored last time, skip the LLM call and
+  // return empty — the prior extraction's memories are already in the
+  // store. The new memories from P2:549 carry the last-message-id as
+  // their `source_message_id`, so if operators ever need to delete a
+  // stale batch they can target it by that key.
+  const watermark = computeExtractionWatermark(sessionKey, messages);
+  const watermarkKey = watermarkMetaKey(sessionKey);
+  if (getMeta(watermarkKey) === watermark) {
+    logger.debug({ sessionKey, watermark }, 'Skipping extraction — watermark unchanged');
+    return [];
+  }
+
   // Format conversation for extraction
   const conversationText = messages
     .map((m) => m.role.toUpperCase() + ': ' + m.content)
     .join('\n');
 
+  let result: Awaited<ReturnType<typeof provider.complete>>;
   try {
-    const result = await withTimeout(
-      provider.complete({
-        messages: [
-          {
-            role: 'user',
-            content: EXTRACTION_PROMPT + conversationText,
-          },
-        ],
-        maxTokens: 2048,
-        temperature: 0.3, // Low temperature for consistent extraction
-        enableCaching: true,
-      }),
+    // findings.md P2:145 — withAbortableTimeout pipes its AbortSignal
+    // into provider.complete so timer expiry actually cancels the HTTP
+    // request instead of leaving it running for the full provider
+    // timeout (burning sockets / tokens after we've already given up).
+    result = await withAbortableTimeout(
+      (signal) =>
+        provider.complete({
+          messages: [
+            {
+              role: 'user',
+              content: EXTRACTION_PROMPT + conversationText,
+            },
+          ],
+          maxTokens: 2048,
+          temperature: 0.3, // Low temperature for consistent extraction
+          enableCaching: true,
+          abortSignal: signal,
+        }),
       60000,
       'Memory extraction'
     );
+  } catch (error) {
+    // Timeouts, network errors, provider auth / rate-limit failures —
+    // genuinely transient. Swallow and return empty so the caller
+    // doesn't tear down the conversation pipeline.
+    logger.error({ error }, 'Extraction LLM call failed; returning no memories');
+    return [];
+  }
 
-    // Parse extracted memories
-    const jsonMatch = result.content.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) {
-      logger.debug('No memories extracted from conversation');
-      return [];
-    }
+  // findings.md P2:511 — parse failures must NOT be silently conflated
+  // with "extraction worked and found nothing interesting". Throw a
+  // typed `ExtractionParseError` so the caller can distinguish
+  // "broken LLM output" from "legitimately empty result".
+  const rawResponse = result.content;
+  const jsonMatch = rawResponse.match(/\[[\s\S]*\]/);
+  if (!jsonMatch) {
+    throw new ExtractionParseError(
+      'Memory extraction response contained no JSON array',
+      rawResponse,
+    );
+  }
 
-    const extracted = JSON.parse(jsonMatch[0]) as Array<{
-      content: string;
-      type: string;
-      importance: number;
-      emotionalWeight?: number;
-      entity?: { name: string; entityType: string };
-    }>;
+  let extracted: Array<{
+    content: string;
+    type: string;
+    importance: number;
+    emotionalWeight?: number;
+    entity?: { name: string; entityType: string };
+  }>;
+  try {
+    extracted = JSON.parse(jsonMatch[0]);
+  } catch (err) {
+    throw new ExtractionParseError(
+      'Memory extraction response JSON.parse failed',
+      rawResponse,
+      err instanceof Error ? err : undefined,
+    );
+  }
 
-    // Save each memory with user association
+  // findings.md P2:549 — use the last message's ID as a batch watermark
+  // on every memory extracted from this call. Before, `sourceMessageId`
+  // was unconditionally null, losing the traceability the `memories`
+  // schema was designed for. Using the last ID (rather than per-memory
+  // LLM-provided indices) is coarse but lossless: it cleanly answers
+  // "which extraction batch produced this memory?" and enables the
+  // idempotency check in findings.md P2:539.
+  const batchSourceMessageId = messages[messages.length - 1]?.id ?? null;
+
+  // Save each memory with user association.
+  // Per-memory save failures are isolated: one bad row shouldn't lose
+  // the rest of the batch.
+  try {
     const savedIds: string[] = [];
     for (const mem of extracted) {
       const memoryType = validateMemoryType(mem.type);
@@ -130,7 +211,7 @@ export async function extractMemories(
         importance,
         emotionalWeight,
         relatedTo: null,
-        sourceMessageId: null,
+        sourceMessageId: batchSourceMessageId,
         metadata,
         lifecycleState: 'seed',
       });
@@ -138,6 +219,12 @@ export async function extractMemories(
       savedIds.push(id);
       logger.debug({ memoryId: id, type: memoryType, userId, isEntity: !!mem.entity }, 'Memory extracted and saved');
     }
+
+    // findings.md P2:539 — only record the watermark once the save loop
+    // completes successfully. If any save threw above, we skipped this
+    // block and leave the old watermark in place, so the next call will
+    // re-extract rather than silently swallow a partial batch.
+    setMeta(watermarkKey, watermark);
 
     return savedIds;
   } catch (error) {
@@ -169,13 +256,18 @@ export async function summarizeConversation(
   const prompt = 'Summarize this conversation in 3-5 sentences, focusing on the main topics discussed, emotional tone, any conclusions or decisions made, and any personal details shared:\n\n' + conversationText + '\n\nSummary:';
 
   try {
-    const result = await withTimeout(
-      provider.complete({
-        messages: [{ role: 'user', content: prompt }],
-        maxTokens: 1024,
-        temperature: 0.3,
-        enableCaching: true,
-      }),
+    // findings.md P2:145 — see extractMemories; same abort-on-timeout
+    // plumbing so a 30-second summarization request actually cancels
+    // when the timer fires.
+    const result = await withAbortableTimeout(
+      (signal) =>
+        provider.complete({
+          messages: [{ role: 'user', content: prompt }],
+          maxTokens: 1024,
+          temperature: 0.3,
+          enableCaching: true,
+          abortSignal: signal,
+        }),
       30000,
       'Conversation summarization'
     );

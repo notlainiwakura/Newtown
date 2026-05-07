@@ -95,19 +95,44 @@ vi.mock('../src/config/index.js', () => ({
 }));
 
 vi.mock('../src/config/defaults.js', () => ({
+  // findings.md P2:171 — `agents` moved out of LainConfig into the
+  // character manifest. Telegram reads the agent from getAllCharacters()
+  // (see mock below) + LAIN_TELEGRAM_AGENT_ID env override.
   getDefaultConfig: vi.fn().mockReturnValue({
-    agents: [],
     security: { keyDerivation: {} },
   }),
+  DEFAULT_PROVIDERS: [],
 }));
 
 // ─── character manifest mock ─────────────────────────────────────────────────
 const mockGetCharacterEntry = vi.fn();
 const mockGetPeersFor = vi.fn().mockReturnValue([]);
+// findings.md P2:171 — gateway/telegram now resolve their agent from the
+// manifest (`getAllCharacters()[0]?.id`) plus an optional env override,
+// then feed it into `getAgentConfigFor(id)`. The default mock provides a
+// single stub character so structural tests (startGateway calls X, etc.)
+// don't trip the "no characters configured" exit.
+const mockGetAllCharacters = vi.fn().mockReturnValue([
+  { id: 'default', name: 'Default', port: 3000, server: 'character', defaultLocation: 'home', workspace: '/tmp/ws' },
+]);
+const mockGetAgentConfigFor = vi.fn().mockReturnValue({
+  id: 'default',
+  name: 'Default',
+  enabled: true,
+  workspace: '/tmp/ws',
+  providers: [{ type: 'anthropic', model: 'claude-sonnet-4-6' }],
+});
 
 vi.mock('../src/config/characters.js', () => ({
   getCharacterEntry: mockGetCharacterEntry,
   getPeersFor: mockGetPeersFor,
+  // findings.md P2:78 — status/doctor/onboard now discriminate between
+  // legacy single-user and multi-char layouts via getManifestPath().
+  // Default: no manifest so these structural tests keep exercising the
+  // legacy path.
+  getManifestPath: vi.fn().mockReturnValue(null),
+  getAllCharacters: mockGetAllCharacters,
+  getAgentConfigFor: mockGetAgentConfigFor,
 }));
 
 // ─── storage mock ─────────────────────────────────────────────────────────────
@@ -132,9 +157,15 @@ vi.mock('../src/storage/keychain.js', () => ({
 const mockInitAgent = vi.fn().mockResolvedValue(undefined);
 const mockShutdownAgents = vi.fn();
 
+const mockProcessMessage = vi.fn().mockResolvedValue({
+  sessionKey: 'telegram:test',
+  messages: [],
+});
+
 vi.mock('../src/agent/index.js', () => ({
   initAgent: mockInitAgent,
   shutdownAgents: mockShutdownAgents,
+  processMessage: mockProcessMessage,
   processMessageStream: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -152,25 +183,10 @@ vi.mock('../src/web/character-server.js', () => ({
   startCharacterServer: mockStartCharacterServer,
 }));
 
-// ─── agent/tools mock ─────────────────────────────────────────────────────────
-const mockRegisteredTools = new Map<string, unknown>();
-const mockRegisterTool = vi.fn((tool: any) => mockRegisteredTools.set(tool.definition.name, tool));
-const mockUnregisterTool = vi.fn((name: string) => mockRegisteredTools.delete(name));
-
-vi.mock('../src/agent/tools.js', () => ({
-  registerTool: mockRegisterTool,
-  unregisterTool: mockUnregisterTool,
-  getTools: vi.fn(() => []),
-}));
-
-// ─── fs mock for plugin loader ────────────────────────────────────────────────
-const mockReaddir = vi.fn();
-const mockReadFile = vi.fn();
+// ─── fs mock ───────────────────────────────────────────────────────────────
 const mockAccess = vi.fn();
 
 vi.mock('node:fs/promises', () => ({
-  readdir: mockReaddir,
-  readFile: mockReadFile,
   access: mockAccess,
   mkdir: vi.fn().mockResolvedValue(undefined),
   copyFile: vi.fn().mockResolvedValue(undefined),
@@ -366,6 +382,29 @@ describe('character command (startCharacterById)', () => {
     );
   });
 
+  it('exports character identity env before starting the server', async () => {
+    const prevId = process.env['LAIN_CHARACTER_ID'];
+    const prevName = process.env['LAIN_CHARACTER_NAME'];
+    delete process.env['LAIN_CHARACTER_ID'];
+    delete process.env['LAIN_CHARACTER_NAME'];
+    mockGetCharacterEntry.mockReturnValue({
+      id: 'dr-claude',
+      name: 'Dr. Claude',
+      port: 3002,
+    });
+
+    try {
+      await startCharacterById('dr-claude');
+      expect(process.env['LAIN_CHARACTER_ID']).toBe('dr-claude');
+      expect(process.env['LAIN_CHARACTER_NAME']).toBe('Dr. Claude');
+    } finally {
+      if (prevId !== undefined) process.env['LAIN_CHARACTER_ID'] = prevId;
+      else delete process.env['LAIN_CHARACTER_ID'];
+      if (prevName !== undefined) process.env['LAIN_CHARACTER_NAME'] = prevName;
+      else delete process.env['LAIN_CHARACTER_NAME'];
+    }
+  });
+
   it('uses portOverride when provided', async () => {
     mockGetCharacterEntry.mockReturnValue({ id: 'lain', name: 'Lain', port: 3001 });
 
@@ -394,7 +433,12 @@ describe('character command (startCharacterById)', () => {
   });
 
   it('reads PEER_CONFIG from env if set', async () => {
-    const peers = [{ id: 'wired-lain', url: 'http://localhost:3000', token: 'tok' }];
+    // findings.md P2:66 — parsePeerConfig now validates each entry has
+    // {id, name, url}. Missing `name` makes the env value fall back to
+    // manifest's getPeersFor. Include `name` so the env value wins.
+    const peers = [
+      { id: 'wired-lain', name: 'Wired Lain', url: 'http://localhost:3000', token: 'tok' },
+    ];
     process.env['PEER_CONFIG'] = JSON.stringify(peers);
     mockGetCharacterEntry.mockReturnValue({ id: 'lain', name: 'Lain', port: 3001 });
 
@@ -433,13 +477,12 @@ describe('character command (startCharacterById)', () => {
     exitSpy.mockRestore();
   });
 
-  it('passes publicDir to startCharacterServer', async () => {
+  it('no longer passes publicDir — character servers are API-only (findings.md P1:27)', async () => {
     mockGetCharacterEntry.mockReturnValue({ id: 'lain', name: 'Lain', port: 3001 });
 
     await startCharacterById('lain');
     const call = mockStartCharacterServer.mock.calls[0]?.[0];
-    expect(typeof call?.publicDir).toBe('string');
-    expect(call?.publicDir.length).toBeGreaterThan(0);
+    expect(call?.publicDir).toBeUndefined();
   });
 
   it('getCharacterEntry is called with the provided characterId', async () => {
@@ -849,6 +892,87 @@ describe('telegram command (startTelegram)', () => {
 
     await Promise.race([startTelegram(), new Promise<void>((r) => setTimeout(r, 10))]);
     expect(mockSetHandlers).toHaveBeenCalled();
+  });
+
+  // findings.md P2:307 — onMessage handler should use non-streaming
+  // processMessage and forward the agent's OutgoingMessages as-is, instead
+  // of buffering a stream into a single concatenated string.
+  it('onMessage handler forwards each agent message via channel.send (P2:307)', async () => {
+    process.env['TELEGRAM_BOT_TOKEN'] = 'tok';
+    process.env['TELEGRAM_CHAT_ID'] = '111';
+    vi.spyOn(process, 'on').mockImplementation((() => process) as any);
+
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    const mockConnect = vi.fn().mockImplementation(() => new Promise(() => {}));
+    let capturedOnMessage: ((m: any) => Promise<void>) | undefined;
+    const { TelegramChannel } = await import('../src/channels/telegram.js');
+    (TelegramChannel as any).mockImplementation(() => ({
+      connect: mockConnect,
+      disconnect: vi.fn(),
+      setEventHandlers: (handlers: any) => { capturedOnMessage = handlers.onMessage; },
+      send: sendSpy,
+    }));
+
+    mockProcessMessage.mockResolvedValueOnce({
+      sessionKey: 'telegram:42',
+      messages: [
+        { id: 'm1', channel: 'web', peerId: 'user-1', content: { type: 'text', text: 'hello' } },
+        { id: 'm2', channel: 'web', peerId: 'user-1', content: { type: 'text', text: 'world' } },
+      ],
+    });
+
+    await Promise.race([startTelegram(), new Promise<void>((r) => setTimeout(r, 10))]);
+
+    expect(capturedOnMessage).toBeDefined();
+    await capturedOnMessage!({
+      id: 'in-1',
+      channel: 'telegram',
+      peerId: '42',
+      senderId: 'user',
+      content: { type: 'text', text: 'ping' },
+      timestamp: Date.now(),
+    });
+
+    expect(mockProcessMessage).toHaveBeenCalled();
+    // Each agent-produced message is sent separately — no concatenation.
+    expect(sendSpy).toHaveBeenCalledTimes(2);
+    // peerId must be rebound to the inbound Telegram chat id.
+    expect(sendSpy.mock.calls[0]![0].peerId).toBe('42');
+    expect(sendSpy.mock.calls[0]![0].channel).toBe('telegram');
+    expect(sendSpy.mock.calls[0]![0].content).toEqual({ type: 'text', text: 'hello' });
+    expect(sendSpy.mock.calls[1]![0].content).toEqual({ type: 'text', text: 'world' });
+  });
+
+  it('onMessage handler drops whitespace-only text messages (P2:307)', async () => {
+    process.env['TELEGRAM_BOT_TOKEN'] = 'tok';
+    process.env['TELEGRAM_CHAT_ID'] = '111';
+    vi.spyOn(process, 'on').mockImplementation((() => process) as any);
+
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    const mockConnect = vi.fn().mockImplementation(() => new Promise(() => {}));
+    let capturedOnMessage: ((m: any) => Promise<void>) | undefined;
+    const { TelegramChannel } = await import('../src/channels/telegram.js');
+    (TelegramChannel as any).mockImplementation(() => ({
+      connect: mockConnect,
+      disconnect: vi.fn(),
+      setEventHandlers: (handlers: any) => { capturedOnMessage = handlers.onMessage; },
+      send: sendSpy,
+    }));
+
+    mockProcessMessage.mockResolvedValueOnce({
+      sessionKey: 'telegram:42',
+      messages: [
+        { id: 'm1', channel: 'web', peerId: 'user-1', content: { type: 'text', text: '   \n\t' } },
+      ],
+    });
+
+    await Promise.race([startTelegram(), new Promise<void>((r) => setTimeout(r, 10))]);
+    await capturedOnMessage!({
+      id: 'in-1', channel: 'telegram', peerId: '42', senderId: 'user',
+      content: { type: 'text', text: 'ping' }, timestamp: Date.now(),
+    });
+
+    expect(sendSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -1273,339 +1397,5 @@ describe('CLI utils/prompts', () => {
     mockInquirerPrompt.mockResolvedValueOnce({ confirmed: true });
     const result = await prompts.confirm('Are you sure?');
     expect(result).toBe(true);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 11. PLUGIN SYSTEM
-// ─────────────────────────────────────────────────────────────────────────────
-describe('Plugin system', () => {
-  let pluginLoader: typeof import('../src/plugins/loader.js');
-
-  const makeManifest = (overrides: Partial<{
-    name: string; version: string; main: string; description: string;
-    tools: string[]; hooks: string[];
-  }> = {}) => JSON.stringify({
-    name: 'test-plugin',
-    version: '1.0.0',
-    main: 'index.js',
-    ...overrides,
-  });
-
-  beforeEach(async () => {
-    vi.clearAllMocks();
-    mockRegisteredTools.clear();
-    // Reset the plugins Map in the module by re-importing fresh
-    // (vitest isolates modules per test by default with vi.resetModules if called)
-    vi.resetModules();
-    pluginLoader = await import('../src/plugins/loader.js');
-  });
-
-  describe('loadPlugin', () => {
-    it('throws if manifest.json is not found', async () => {
-      mockAccess.mockRejectedValueOnce(new Error('ENOENT'));
-
-      await expect(pluginLoader.loadPlugin('/plugins/no-manifest')).rejects.toThrow(
-        'Plugin manifest not found'
-      );
-    });
-
-    it('throws if manifest is missing required fields (name)', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(JSON.stringify({ version: '1.0.0', main: 'index.js' }));
-
-      await expect(pluginLoader.loadPlugin('/plugins/bad')).rejects.toThrow(
-        'Invalid plugin manifest'
-      );
-    });
-
-    it('throws if manifest is missing required fields (version)', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(JSON.stringify({ name: 'p', main: 'index.js' }));
-
-      await expect(pluginLoader.loadPlugin('/plugins/bad')).rejects.toThrow(
-        'Invalid plugin manifest'
-      );
-    });
-
-    it('throws if manifest is missing required fields (main)', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(JSON.stringify({ name: 'p', version: '1.0.0' }));
-
-      await expect(pluginLoader.loadPlugin('/plugins/bad')).rejects.toThrow(
-        'Invalid plugin manifest'
-      );
-    });
-
-    it('throws if main module cannot be loaded', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(makeManifest());
-      // The actual dynamic import will fail for a non-existent file
-
-      await expect(pluginLoader.loadPlugin('/plugins/crash')).rejects.toThrow(
-        'Failed to load plugin module'
-      );
-    });
-
-    it('loaded plugin has enabled=false initially', async () => {
-      // This requires a real importable module — skip the import part by
-      // testing what loadPlugin returns after module loading.
-      // We'll test via getPlugin after a successful load in integration style.
-      // For unit testing the "enabled=false" invariant, we rely on the code path.
-      expect(true).toBe(true); // covered by enable/disable tests
-    });
-
-    it('plugin name is taken from manifest, not directory name', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(makeManifest({ name: 'my-real-name' }));
-      // Import will fail; but we test the manifest parsing here via a successful load
-      // by monkey-patching the import. Just verify the error comes from module loading.
-      await expect(pluginLoader.loadPlugin('/plugins/dir-name')).rejects.toThrow(
-        'Failed to load plugin module'
-      );
-    });
-  });
-
-  describe('getPlugin / getAllPlugins / getEnabledPlugins', () => {
-    it('getPlugin returns undefined for unknown plugin', () => {
-      expect(pluginLoader.getPlugin('nonexistent')).toBeUndefined();
-    });
-
-    it('getAllPlugins returns empty array initially', () => {
-      expect(pluginLoader.getAllPlugins()).toEqual([]);
-    });
-
-    it('getEnabledPlugins returns empty array initially', () => {
-      expect(pluginLoader.getEnabledPlugins()).toEqual([]);
-    });
-  });
-
-  describe('enablePlugin / disablePlugin', () => {
-    it('enablePlugin throws for unknown plugin', async () => {
-      await expect(pluginLoader.enablePlugin('ghost')).rejects.toThrow('Plugin not found: ghost');
-    });
-
-    it('disablePlugin throws for unknown plugin', async () => {
-      await expect(pluginLoader.disablePlugin('ghost')).rejects.toThrow('Plugin not found: ghost');
-    });
-  });
-
-  describe('unloadPlugin', () => {
-    it('unloadPlugin does nothing for unknown plugin', async () => {
-      await expect(pluginLoader.unloadPlugin('ghost')).resolves.toBeUndefined();
-    });
-  });
-
-  describe('loadPluginsFromDirectory', () => {
-    it('returns empty array if directory cannot be read', async () => {
-      mockReaddir.mockRejectedValueOnce(new Error('ENOENT'));
-      const loaded = await pluginLoader.loadPluginsFromDirectory('/nonexistent');
-      expect(loaded).toEqual([]);
-    });
-
-    it('returns empty array for empty directory', async () => {
-      mockReaddir.mockResolvedValueOnce([]);
-      const loaded = await pluginLoader.loadPluginsFromDirectory('/empty-dir');
-      expect(loaded).toEqual([]);
-    });
-
-    it('skips non-directory entries', async () => {
-      mockReaddir.mockResolvedValueOnce([
-        { name: 'file.txt', isDirectory: () => false },
-      ]);
-      const loaded = await pluginLoader.loadPluginsFromDirectory('/plugins');
-      expect(loaded).toEqual([]);
-    });
-
-    it('attempts to load directory entries', async () => {
-      mockReaddir.mockResolvedValueOnce([
-        { name: 'my-plugin', isDirectory: () => true },
-      ]);
-      // loadPlugin will fail (no manifest) — but we just verify it was attempted
-      mockAccess.mockRejectedValueOnce(new Error('ENOENT'));
-
-      const loaded = await pluginLoader.loadPluginsFromDirectory('/plugins');
-      expect(loaded).toEqual([]); // failed plugins are skipped
-    });
-
-    it('continues loading if one plugin fails', async () => {
-      mockReaddir.mockResolvedValueOnce([
-        { name: 'bad-plugin', isDirectory: () => true },
-        { name: 'another-bad', isDirectory: () => true },
-      ]);
-      mockAccess.mockRejectedValue(new Error('ENOENT'));
-
-      const loaded = await pluginLoader.loadPluginsFromDirectory('/plugins');
-      expect(loaded).toHaveLength(0); // all failed
-    });
-  });
-
-  describe('runMessageHooks / runResponseHooks', () => {
-    it('runMessageHooks returns message unchanged when no plugins enabled', async () => {
-      const msg = { text: 'hello' };
-      const result = await pluginLoader.runMessageHooks(msg);
-      expect(result).toBe(msg);
-    });
-
-    it('runResponseHooks returns response unchanged when no plugins enabled', async () => {
-      const resp = { text: 'response' };
-      const result = await pluginLoader.runResponseHooks(resp);
-      expect(result).toBe(resp);
-    });
-
-    it('getPlugin returns undefined for nonexistent plugin (no-op baseline)', () => {
-      expect(pluginLoader.getPlugin('does-not-exist')).toBeUndefined();
-    });
-
-    it('getAllPlugins returns empty array on fresh module', () => {
-      expect(pluginLoader.getAllPlugins()).toEqual([]);
-    });
-
-    it('getEnabledPlugins returns empty array on fresh module', () => {
-      expect(pluginLoader.getEnabledPlugins()).toEqual([]);
-    });
-
-    it('runMessageHooks with no plugins returns input unchanged (any type)', async () => {
-      expect(await pluginLoader.runMessageHooks(null)).toBeNull();
-      expect(await pluginLoader.runMessageHooks(42)).toBe(42);
-      expect(await pluginLoader.runMessageHooks('hello')).toBe('hello');
-    });
-
-    it('runResponseHooks with no plugins returns input unchanged (any type)', async () => {
-      expect(await pluginLoader.runResponseHooks(null)).toBeNull();
-      expect(await pluginLoader.runResponseHooks([])).toEqual([]);
-    });
-  });
-
-  describe('plugin lifecycle with loaded plugins', () => {
-    // These tests use loadPlugin with mocked filesystem and dynamic import.
-    // Since we cannot easily mock dynamic import(), we test via the public
-    // error paths and verify state using the public getPlugin/getAllPlugins API.
-
-    it('enablePlugin throws for unknown plugin', async () => {
-      await expect(pluginLoader.enablePlugin('ghost')).rejects.toThrow('Plugin not found: ghost');
-    });
-
-    it('disablePlugin throws for unknown plugin', async () => {
-      await expect(pluginLoader.disablePlugin('ghost')).rejects.toThrow('Plugin not found: ghost');
-    });
-
-    it('unloadPlugin returns without error for unknown plugin', async () => {
-      await expect(pluginLoader.unloadPlugin('ghost')).resolves.toBeUndefined();
-    });
-
-    it('getPlugin always returns undefined before any plugins are loaded', () => {
-      expect(pluginLoader.getPlugin('any')).toBeUndefined();
-    });
-
-    it('getAllPlugins always returns empty before any plugins are loaded', () => {
-      expect(pluginLoader.getAllPlugins()).toHaveLength(0);
-    });
-
-    it('getEnabledPlugins returns empty before any plugins are loaded', () => {
-      expect(pluginLoader.getEnabledPlugins()).toHaveLength(0);
-    });
-
-    it('loadPlugin with missing manifest rejects with descriptive error', async () => {
-      mockAccess.mockRejectedValueOnce(new Error('ENOENT'));
-      await expect(pluginLoader.loadPlugin('/plugins/missing')).rejects.toThrow('Plugin manifest not found');
-    });
-
-    it('loadPlugin with bad manifest JSON rejects', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce('{invalid json');
-      await expect(pluginLoader.loadPlugin('/plugins/bad-json')).rejects.toThrow();
-    });
-
-    it('loadPlugin with incomplete manifest rejects with invalid manifest error', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(JSON.stringify({ name: 'p' })); // missing version and main
-      await expect(pluginLoader.loadPlugin('/plugins/incomplete')).rejects.toThrow('Invalid plugin manifest');
-    });
-
-    it('loadPlugin with valid manifest but nonexistent main fails at import', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(JSON.stringify({ name: 'p', version: '1.0.0', main: 'index.js' }));
-      await expect(pluginLoader.loadPlugin('/plugins/valid-manifest')).rejects.toThrow('Failed to load plugin module');
-    });
-
-    it('manifest must have name field', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(JSON.stringify({ version: '1.0.0', main: 'index.js' }));
-      await expect(pluginLoader.loadPlugin('/plugins/no-name')).rejects.toThrow('Invalid plugin manifest');
-    });
-
-    it('manifest must have version field', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(JSON.stringify({ name: 'p', main: 'index.js' }));
-      await expect(pluginLoader.loadPlugin('/plugins/no-version')).rejects.toThrow('Invalid plugin manifest');
-    });
-
-    it('manifest must have main field', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(JSON.stringify({ name: 'p', version: '1.0.0' }));
-      await expect(pluginLoader.loadPlugin('/plugins/no-main')).rejects.toThrow('Invalid plugin manifest');
-    });
-
-    it('loadPluginsFromDirectory returns empty for empty dir', async () => {
-      mockReaddir.mockResolvedValueOnce([]);
-      const result = await pluginLoader.loadPluginsFromDirectory('/empty');
-      expect(result).toEqual([]);
-    });
-
-    it('loadPluginsFromDirectory handles directory read error', async () => {
-      mockReaddir.mockRejectedValueOnce(new Error('permission denied'));
-      const result = await pluginLoader.loadPluginsFromDirectory('/no-access');
-      expect(result).toEqual([]);
-    });
-
-    it('loadPluginsFromDirectory skips files (non-directories)', async () => {
-      mockReaddir.mockResolvedValueOnce([
-        { name: 'readme.txt', isDirectory: () => false },
-        { name: '.hidden', isDirectory: () => false },
-      ]);
-      const result = await pluginLoader.loadPluginsFromDirectory('/plugins');
-      expect(result).toHaveLength(0);
-    });
-
-    it('loadPluginsFromDirectory returns empty if all plugins fail to load', async () => {
-      mockReaddir.mockResolvedValueOnce([
-        { name: 'bad1', isDirectory: () => true },
-        { name: 'bad2', isDirectory: () => true },
-      ]);
-      mockAccess.mockRejectedValue(new Error('ENOENT'));
-      const result = await pluginLoader.loadPluginsFromDirectory('/plugins');
-      expect(result).toHaveLength(0);
-    });
-
-    it('manifest description field is optional (not required by schema)', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(JSON.stringify({ name: 'p', version: '1.0.0', main: 'index.js' }));
-      // Will still fail at import, but we verify no "missing description" error
-      const err = await pluginLoader.loadPlugin('/plugins/no-desc').catch((e: Error) => e);
-      expect((err as Error).message).not.toContain('description');
-    });
-
-    it('manifest author field is optional (not required by schema)', async () => {
-      // A plugin without an author field fails at import (not at manifest validation)
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(JSON.stringify({ name: 'p', version: '1.0.0', main: 'index.js' }));
-      const err = await pluginLoader.loadPlugin('/plugins/test-optional-author').catch((e: Error) => e);
-      // Error should be about loading the module, not about missing author
-      expect((err as Error).message).toContain('Failed to load plugin module');
-    });
-
-    it('loadPlugin error message includes the failing path', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(JSON.stringify({ name: 'p', version: '1.0.0', main: 'index.js' }));
-      const err = await pluginLoader.loadPlugin('/my/special/plugin').catch((e: Error) => e);
-      expect((err as Error).message).toContain('Failed to load plugin module');
-    });
-
-    it('loadPluginsFromDirectory path is passed to readdir', async () => {
-      mockReaddir.mockResolvedValueOnce([]);
-      await pluginLoader.loadPluginsFromDirectory('/specific/plugin/dir');
-      expect(mockReaddir).toHaveBeenCalledWith('/specific/plugin/dir', expect.any(Object));
-    });
   });
 });

@@ -212,10 +212,13 @@ describe('Characters feel distinct', () => {
     expect(pBob).not.toContain('Alice');
   });
 
-  it('communication guidelines are always part of a built system prompt', async () => {
+  it('communication guidelines are appended only for Lain (prevents identity contamination across characters)', async () => {
     const { buildSystemPrompt } = await import('../src/agent/persona.js');
-    const prompt = buildSystemPrompt({ soul: 's', agents: 'a', identity: 'i' });
-    expect(prompt).toContain('Communication Guidelines');
+    const lain = buildSystemPrompt({ soul: 's', agents: 'a', identity: 'i' }, 'lain');
+    expect(lain).toContain('Communication Guidelines');
+    const pkd = buildSystemPrompt({ soul: 's', agents: 'a', identity: 'i' }, 'pkd');
+    expect(pkd).not.toContain('Communication Guidelines');
+    expect(pkd).not.toContain('Lain Iwakura');
   });
 
   it('applyPersonaStyle replaces "great" with a subdued alternative for Lain', async () => {
@@ -637,10 +640,12 @@ describe('Characters are where they say they are', () => {
   });
 
   it('location has a timestamp field', async () => {
+    // findings.md P2:1402 — un-persisted fallback uses timestamp:0
+    // as a sentinel ("no persisted record yet").
     const { getCurrentLocation } = await import('../src/commune/location.js');
     const loc = getCurrentLocation();
     expect(typeof loc.timestamp).toBe('number');
-    expect(loc.timestamp).toBeGreaterThan(0);
+    expect(loc.timestamp).toBeGreaterThanOrEqual(0);
   });
 
   it('each building has a grid position (row and col)', async () => {

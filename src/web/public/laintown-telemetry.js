@@ -1,13 +1,49 @@
-// Newtown telemetry console — unified real-time activity feed from all town inhabitants
+// Laintown telemetry console — unified real-time activity feed from all town inhabitants
 (function () {
   'use strict';
 
   // ===== Character endpoints =====
-  var ENDPOINTS = [
-    { id: 'neo', name: 'Neo', color: '#60e0a0', path: '/neo/api/activity' },
-    { id: 'plato', name: 'Plato', color: '#e0c870', path: '/plato/api/activity' },
-    { id: 'joe', name: 'Joe', color: '#88b0d0', path: '/joe/api/activity' },
-  ];
+  // findings.md P2:3176 — built dynamically from /api/characters so the
+  // telemetry console survives generational succession, renames, and new
+  // residents without a code edit. Paths follow the proxy scheme in
+  // server.ts: the web character is served at `/`; every other character
+  // is proxied at `/<charId>/`.
+  var ENDPOINTS = [];
+  function _hashColorHex(str) {
+    var h = 0;
+    for (var i = 0; i < str.length; i++) h = ((h << 5) - h + str.charCodeAt(i)) | 0;
+    var hue = ((h % 360) + 360) % 360;
+    var s = 0.6, l = 0.65;
+    var c = (1 - Math.abs(2 * l - 1)) * s;
+    var x = c * (1 - Math.abs((hue / 60) % 2 - 1));
+    var m = l - c / 2;
+    var r, g, b;
+    if (hue < 60) { r = c; g = x; b = 0; }
+    else if (hue < 120) { r = x; g = c; b = 0; }
+    else if (hue < 180) { r = 0; g = c; b = x; }
+    else if (hue < 240) { r = 0; g = x; b = c; }
+    else if (hue < 300) { r = x; g = 0; b = c; }
+    else { r = c; g = 0; b = x; }
+    var toHex = function (v) { return Math.round((v + m) * 255).toString(16).padStart(2, '0'); };
+    return '#' + toHex(r) + toHex(g) + toHex(b);
+  }
+  function loadEndpoints() {
+    return fetch('/api/characters', { cache: 'no-store' })
+      .then(function (resp) { return resp.ok ? resp.json() : { characters: [] }; })
+      .then(function (data) {
+        var list = (data && Array.isArray(data.characters)) ? data.characters : [];
+        ENDPOINTS = list.map(function (c) {
+          var basePath = c.web === true ? '' : '/' + c.id;
+          return {
+            id: c.id,
+            name: c.name,
+            color: _hashColorHex(c.id),
+            path: basePath + '/api/activity',
+          };
+        });
+      })
+      .catch(function () { ENDPOINTS = []; });
+  }
 
   var TYPE_COLORS = {
     diary: '#e0a020',
@@ -61,31 +97,9 @@
   var POLL_INTERVAL = 10000;
   var MAX_EVENTS = 500;
   var INITIAL_WINDOW = 24 * 60 * 60 * 1000; // 24 hours
-
-  // ===== Inject styles =====
-  var style = document.createElement('style');
-  style.textContent =
-    '#laintown-telemetry{position:fixed;bottom:0;left:0;right:0;z-index:99998;font-family:"Share Tech Mono",monospace;background:#08080d;border-top:1px solid #1a1a2e;transition:height .3s ease}' +
-    '#laintown-telemetry.collapsed{height:24px}' +
-    '#laintown-telemetry.expanded{height:200px}' +
-    '#lt-header{height:24px;display:flex;align-items:center;padding:0 12px;cursor:pointer;user-select:none;background:#0a0a12;border-bottom:1px solid #111125}' +
-    '#lt-header:hover{background:#0e0e18}' +
-    '#lt-label{color:#4a9eff;font-size:10px;letter-spacing:2px;text-transform:uppercase}' +
-    '#lt-count{color:#445;font-size:10px;margin-left:8px}' +
-    '#lt-toggle{color:#445;font-size:10px;margin-left:auto}' +
-    '#lt-feed{height:calc(100% - 24px);overflow-y:auto;overflow-x:hidden;padding:4px 0;scrollbar-width:thin;scrollbar-color:#1a1a2e #08080d}' +
-    '#lt-feed::-webkit-scrollbar{width:6px}' +
-    '#lt-feed::-webkit-scrollbar-track{background:#08080d}' +
-    '#lt-feed::-webkit-scrollbar-thumb{background:#1a1a2e;border-radius:3px}' +
-    '.lt-entry{padding:2px 12px;font-size:11px;line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#667;cursor:pointer}' +
-    '.lt-entry:hover{background:#0c0c14;color:#889}' +
-    '.lt-entry.lt-expanded{white-space:pre-wrap;word-break:break-word;overflow:visible;text-overflow:unset;padding:6px 12px;border-left:2px solid #1a1a2e;background:#0a0a12}' +
-    '.lt-time{color:#445}' +
-    '.lt-type{display:inline-block;width:72px;text-align:right;margin:0 8px}' +
-    '.lt-char{display:inline-block;width:80px}' +
-    '.lt-content{color:#778}' +
-    '.lt-empty{color:#334;font-size:11px;padding:12px;text-align:center}';
-  document.head.appendChild(style);
+  var COLLAPSED_HEIGHT = 24;
+  var EXPANDED_HEIGHT = 200;
+  var baseBodyPaddingBottom = null;
 
   // ===== Build DOM =====
   function build() {
@@ -120,6 +134,18 @@
     return { container: container, feed: feed };
   }
 
+  function reservePageSpace() {
+    if (!document.body) return;
+    if (baseBodyPaddingBottom === null) {
+      var computed = window.getComputedStyle(document.body).paddingBottom;
+      baseBodyPaddingBottom = parseFloat(computed) || 0;
+    }
+    var telemetryHeight = collapsed ? COLLAPSED_HEIGHT : EXPANDED_HEIGHT;
+    document.body.style.paddingBottom = (baseBodyPaddingBottom + telemetryHeight) + 'px';
+    document.body.classList.toggle('ltn-telemetry-expanded', !collapsed);
+    document.body.classList.toggle('ltn-telemetry-collapsed', collapsed);
+  }
+
   function toggle() {
     collapsed = !collapsed;
     var container = document.getElementById('laintown-telemetry');
@@ -133,6 +159,7 @@
       userScrolled = false;
       scrollToBottom();
     }
+    reservePageSpace();
   }
 
   function scrollToBottom() {
@@ -205,19 +232,36 @@
       charDisplay = charName + ' \u2192 ' + charNameById(target);
     }
 
-    var prefix =
-      '<span class="lt-time">' + time + '</span>' +
-      '<span class="lt-type" style="color:' + typeColor + '">' + typeLabel + '</span>' +
-      '<span class="lt-char" style="color:' + charColor + '">' + escapeHtml(charDisplay) + '</span> ';
-
-    el.innerHTML = prefix + '<span class="lt-content">' + escapeHtml(shortContent) + '</span>';
+    // findings.md P2:2869 — every enum-style field here (typeLabel,
+    // typeColor, charColor, charDisplay) is either from a whitelist
+    // lookup or flows from a hardcoded ENDPOINTS list, but the
+    // string-concatenation build was still latently injection-prone
+    // (especially as the roster moves to /api/characters per P2:2759).
+    // Rebuild via DOM so every dynamic field goes through textContent
+    // or an individual style property.
+    var timeSpan = document.createElement('span');
+    timeSpan.className = 'lt-time';
+    timeSpan.textContent = time;
+    var typeSpan = document.createElement('span');
+    typeSpan.className = 'lt-type';
+    typeSpan.style.color = typeColor;
+    typeSpan.textContent = typeLabel;
+    var charSpan = document.createElement('span');
+    charSpan.className = 'lt-char';
+    charSpan.style.color = charColor;
+    charSpan.textContent = charDisplay;
+    var contentSpan = document.createElement('span');
+    contentSpan.className = 'lt-content';
+    contentSpan.textContent = shortContent;
+    el.appendChild(timeSpan);
+    el.appendChild(typeSpan);
+    el.appendChild(charSpan);
+    el.appendChild(document.createTextNode(' '));
+    el.appendChild(contentSpan);
 
     el.addEventListener('click', function () {
       var isExpanded = el.classList.toggle('lt-expanded');
-      var contentSpan = el.querySelector('.lt-content');
-      if (contentSpan) {
-        contentSpan.innerHTML = escapeHtml(isExpanded ? fullContent : shortContent);
-      }
+      contentSpan.textContent = isExpanded ? fullContent : shortContent;
     });
 
     return el;
@@ -339,19 +383,43 @@
   }
 
   // ===== Poll loop =====
+  // findings.md P2:3200 — `pagehide` clears the interval when the tab is
+  // closed or swapped into the bfcache, `pageshow` restarts it on
+  // restore. `visibilitychange` pauses polling while hidden so background
+  // tabs don't burn network. Together they prevent the "long-lived tab
+  // polls forever, bfcache'd pages leak timers" pattern the finding
+  // describes.
   function startPolling() {
+    if (pollTimer) return;
     pollTimer = setInterval(function () {
-      // Fetch events since last known timestamp (with 1s overlap for safety)
       var from = lastTimestamp > 0 ? lastTimestamp - 1000 : Date.now() - INITIAL_WINDOW;
       fetchAll(from, false);
     }, POLL_INTERVAL);
   }
 
+  function stopPolling() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
   // ===== Init =====
   function init() {
     build();
-    fetchAll(null, true);
-    startPolling();
+    reservePageSpace();
+    loadEndpoints().then(function () {
+      fetchAll(null, true);
+      startPolling();
+    });
+    window.addEventListener('visibilitychange', function () {
+      if (document.hidden) stopPolling();
+      else if (ENDPOINTS.length > 0) startPolling();
+    });
+    window.addEventListener('pagehide', stopPolling);
+    window.addEventListener('pageshow', function (ev) {
+      if (ev.persisted && ENDPOINTS.length > 0) startPolling();
+    });
   }
 
   if (document.readyState === 'loading') {

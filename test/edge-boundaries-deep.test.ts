@@ -1475,19 +1475,20 @@ describe('Configuration edge cases', () => {
   // ── Default config ───────────────────────────────────────────────────────
   describe('Default config', () => {
     it('getDefaultConfig returns all required sections', async () => {
+      // findings.md P2:171 — `agents` removed from LainConfig.
       const { getDefaultConfig } = await import('../src/config/defaults.js');
       const cfg = getDefaultConfig();
       expect(cfg.version).toBeDefined();
       expect(cfg.gateway).toBeDefined();
       expect(cfg.security).toBeDefined();
-      expect(cfg.agents).toBeDefined();
       expect(cfg.logging).toBeDefined();
+      expect((cfg as Record<string, unknown>)['agents']).toBeUndefined();
     });
 
-    it('default config has at least one agent', async () => {
-      const { getDefaultConfig } = await import('../src/config/defaults.js');
-      const cfg = getDefaultConfig();
-      expect(cfg.agents.length).toBeGreaterThanOrEqual(1);
+    it('DEFAULT_PROVIDERS has at least one tier', async () => {
+      // findings.md P2:171 — replaces old `config.agents.length >= 1`.
+      const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+      expect(DEFAULT_PROVIDERS.length).toBeGreaterThanOrEqual(1);
     });
 
     it('default security maxMessageLength is 100000', async () => {

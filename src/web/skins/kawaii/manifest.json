@@ -4,9 +4,9 @@
   "description": "Pastel pinks, lavenders, and gentle glows",
   "fonts": { "heading": "Quicksand", "body": "Nunito", "mono": "Fira Code" },
   "buildingIcons": {
-    "pub": "🧋", "station": "🎀", "abandoned-house": "🌈", "field": "🌸",
-    "windmill": "⭐", "locksmith": "🔑", "mystery-tower": "🎒", "theater": "🍰", "square": "📖"
+    "library": "📖", "bar": "🧋", "field": "🌸", "windmill": "🎀",
+    "lighthouse": "⭐", "school": "🎒", "market": "🍰", "locksmith": "🔑", "threshold": "🌈"
   },
   "googleFontsUrl": "https://fonts.googleapis.com/css2?family=Quicksand:wght@400;700&family=Nunito:wght@400;600&family=Fira+Code&display=swap",
-  "previewColors": ["#90ffb0", "#ffc080", "#80d8ff"]
+  "previewColors": ["#ffb0d0", "#b0d0ff", "#d0b0ff"]
 }

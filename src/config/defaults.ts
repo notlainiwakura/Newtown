@@ -1,9 +1,39 @@
 /**
- * Default configuration values for Newtown
+ * Default configuration values for Lain
  */
 
-import type { LainConfig } from '../types/config.js';
+import type { LainConfig, ProviderConfig } from '../types/config.js';
 import { getPaths } from './paths.js';
+
+/**
+ * findings.md P2:171 — default three-tier provider chain. Exported so the
+ * character manifest loader (`src/config/characters.ts`) can fall back to
+ * this when a `CharacterManifestEntry` omits `providers`. Order maps to
+ * tiers `['personality', 'memory', 'light']` in `src/agent/index.ts:183-194`.
+ * [1] and [2] both default to Haiku 4.5 because the Anthropic 4.x lineup does
+ * not currently offer a tier strictly cheaper than Haiku 4.5; operators who
+ * want a cheaper background tier override [2] per-character in `characters.json`.
+ */
+export const DEFAULT_PROVIDERS: ProviderConfig[] = [
+  {
+    type: 'anthropic',
+    model: 'claude-sonnet-4-6',
+    apiKeyEnv: 'ANTHROPIC_API_KEY',
+    fallbackModels: ['claude-sonnet-4-5-20241022', 'claude-sonnet-4-20250514', 'claude-sonnet-latest'],
+  },
+  {
+    type: 'anthropic',
+    model: 'claude-haiku-4-5-20251001',
+    apiKeyEnv: 'ANTHROPIC_API_KEY',
+    fallbackModels: ['claude-haiku-4-5-latest', 'claude-haiku-latest'],
+  },
+  {
+    type: 'anthropic',
+    model: 'claude-haiku-4-5-20251001',
+    apiKeyEnv: 'ANTHROPIC_API_KEY',
+    fallbackModels: ['claude-haiku-4-5-latest', 'claude-haiku-latest'],
+  },
+];
 
 export function getDefaultConfig(): LainConfig {
   const paths = getPaths();
@@ -32,34 +62,6 @@ export function getDefaultConfig(): LainConfig {
         parallelism: 4,
       },
     },
-    agents: [
-      {
-        id: 'default',
-        name: process.env['LAIN_CHARACTER_NAME'] || 'Newtown Guide',
-        enabled: true,
-        workspace: paths.workspace,
-        providers: [
-          {
-            type: 'openai',
-            model: process.env['OPENAI_MODEL'] || 'MiniMax-M2.7',
-            apiKeyEnv: 'OPENAI_API_KEY',
-            baseURL: process.env['OPENAI_BASE_URL'] || 'http://192.168.68.69:8080/v1',
-          },
-          {
-            type: 'openai',
-            model: process.env['OPENAI_MODEL'] || 'MiniMax-M2.7',
-            apiKeyEnv: 'OPENAI_API_KEY',
-            baseURL: process.env['OPENAI_BASE_URL'] || 'http://192.168.68.69:8080/v1',
-          },
-          {
-            type: 'openai',
-            model: process.env['OPENAI_MODEL'] || 'MiniMax-M2.7',
-            apiKeyEnv: 'OPENAI_API_KEY',
-            baseURL: process.env['OPENAI_BASE_URL'] || 'http://192.168.68.69:8080/v1',
-          },
-        ],
-      },
-    ],
     logging: {
       level: 'info',
       prettyPrint: true,
@@ -71,14 +73,20 @@ export function getDefaultConfig(): LainConfig {
  * Generate a sample configuration file content with comments
  */
 export function generateSampleConfig(): string {
-  return `// Newtown Configuration
+  return `// Lain Configuration
+// See documentation for full options: https://github.com/lain/lain#configuration
+//
+// findings.md P2:171 — agent/provider configuration lives in
+// characters.json, not here. Each character entry may declare its own
+// "providers" array (tiered [personality, memory, light]); omitting it
+// uses the baked-in DEFAULT_PROVIDERS chain.
 {
   "version": "1",
 
   // Gateway settings
   "gateway": {
     // Unix socket path for local communication
-    // "socketPath": "~/.newtown/newtown.sock",
+    // "socketPath": "~/.lain/gateway.sock",
 
     // Socket file permissions (octal)
     // "socketPermissions": 384, // 0600
@@ -103,42 +111,11 @@ export function generateSampleConfig(): string {
     "maxMessageLength": 100000
   },
 
-  // Agent configurations
-  "agents": [
-    {
-      "id": "default",
-      "name": "Newtown Guide",
-      "enabled": true,
-      // "workspace": "~/.newtown/workspace",
-      // Providers by tier: [0]=personality, [1]=memory, [2]=light
-      "providers": [
-        {
-          "type": "openai",
-          "model": "MiniMax-M2.7",
-          "apiKeyEnv": "OPENAI_API_KEY",
-          "baseURL": "http://192.168.68.69:8080/v1"
-        },
-        {
-          "type": "openai",
-          "model": "MiniMax-M2.7",
-          "apiKeyEnv": "OPENAI_API_KEY",
-          "baseURL": "http://192.168.68.69:8080/v1"
-        },
-        {
-          "type": "openai",
-          "model": "MiniMax-M2.7",
-          "apiKeyEnv": "OPENAI_API_KEY",
-          "baseURL": "http://192.168.68.69:8080/v1"
-        }
-      ]
-    }
-  ],
-
   // Logging settings
   "logging": {
     "level": "info",
     "prettyPrint": true
-    // "file": "~/.newtown/newtown.log"
+    // "file": "~/.lain/lain.log"
   }
 }
 `;

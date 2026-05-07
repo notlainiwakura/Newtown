@@ -215,9 +215,7 @@ export async function compressConversation(
     if (msg.role === 'assistant' && text.startsWith('[Earlier in this conversation]')) {
       existingSummary = text;
     } else {
-      const prefix = msg.role === 'user'
-        ? 'User'
-        : (process.env['LAIN_CHARACTER_NAME'] || 'Newtown');
+      const prefix = msg.role === 'user' ? 'User' : 'Lain';
       compressionInput += `${prefix}: ${text}\n`;
     }
   }

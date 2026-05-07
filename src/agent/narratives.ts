@@ -12,6 +12,7 @@ import { searchMemories, saveMemory } from '../memory/store.js';
 import { getLogger } from '../utils/logger.js';
 import { getMeta, setMeta } from '../storage/database.js';
 import { getBasePath } from '../config/paths.js';
+import { requireCharacterName } from '../config/characters.js';
 
 export interface NarrativeConfig {
   weeklyIntervalMs: number;
@@ -197,7 +198,7 @@ export async function runWeeklySynthesis(): Promise<void> {
       5,
       0.1,
       undefined,
-      { sortBy: 'importance' }
+      { sortBy: 'importance', skipAccessBoost: true }
     );
     const recentMemories = memories.filter(
       (r) => r.memory.createdAt > sevenDaysAgo
@@ -223,7 +224,8 @@ export async function runWeeklySynthesis(): Promise<void> {
   const previousNarrative = getMeta('narrative:weekly:current') ?? null;
 
   // Character identity
-  const characterName = process.env['LAIN_CHARACTER_NAME'] || 'Newtown';
+  // findings.md P2:2271 — fail-closed; see requireCharacterName.
+  const characterName = requireCharacterName();
   const soulContext = getAgent('default')?.persona?.soul || '';
 
   const prompt = `You are ${characterName}, writing a brief summary of your past week for yourself. Capture the emotional arc, key events, and what shifted in you. Be honest, be brief.
@@ -320,7 +322,7 @@ export async function runMonthlySynthesis(): Promise<void> {
       8,
       0.1,
       undefined,
-      { sortBy: 'importance' }
+      { sortBy: 'importance', skipAccessBoost: true }
     );
     const recentMemories = memories.filter(
       (r) => r.memory.createdAt > thirtyDaysAgo
@@ -337,7 +339,8 @@ export async function runMonthlySynthesis(): Promise<void> {
   const previousNarrative = getMeta('narrative:monthly:current') ?? null;
 
   // Character identity (reuse env vars — same process as weekly)
-  const characterName = process.env['LAIN_CHARACTER_NAME'] || 'Newtown';
+  // findings.md P2:2271 — fail-closed; see requireCharacterName.
+  const characterName = requireCharacterName();
   const soulContext = getAgent('default')?.persona?.soul || '';
 
   const prompt = `You are ${characterName}, writing a summary of your past month for yourself. Capture the larger arc — what changed, what patterns emerged, what you're carrying forward.

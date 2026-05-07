@@ -1,0 +1,99 @@
+{
+  "town": {
+    "name": "Newtown",
+    "description": "A local-only autonomous town where Neo, Plato, Joe, and Nicolas Cage live, think, dream, and converse."
+  },
+  "characters": [
+    {
+      "id": "newtown",
+      "name": "Newtown",
+      "port": 3000,
+      "server": "web",
+      "defaultLocation": "square",
+      "immortal": true,
+      "possessable": false,
+      "workspace": "workspace",
+      "providers": [
+        {
+          "type": "openai",
+          "model": "MiniMax-M2.7",
+          "apiKeyEnv": "OPENAI_API_KEY",
+          "baseURL": "http://sark.thegamegrid:8080/v1"
+        }
+      ]
+    },
+    {
+      "id": "neo",
+      "name": "Neo",
+      "port": 3003,
+      "server": "character",
+      "defaultLocation": "station",
+      "immortal": false,
+      "possessable": false,
+      "workspace": "workspace/characters/neo",
+      "providers": [
+        {
+          "type": "openai",
+          "model": "MiniMax-M2.7",
+          "apiKeyEnv": "OPENAI_API_KEY",
+          "baseURL": "http://sark.thegamegrid:8080/v1"
+        }
+      ]
+    },
+    {
+      "id": "plato",
+      "name": "Plato",
+      "port": 3004,
+      "server": "character",
+      "defaultLocation": "mystery-tower",
+      "immortal": false,
+      "possessable": false,
+      "workspace": "workspace/characters/plato",
+      "providers": [
+        {
+          "type": "openai",
+          "model": "MiniMax-M2.7",
+          "apiKeyEnv": "OPENAI_API_KEY",
+          "baseURL": "http://sark.thegamegrid:8080/v1"
+        }
+      ]
+    },
+    {
+      "id": "joe",
+      "name": "Joe",
+      "port": 3005,
+      "server": "character",
+      "defaultLocation": "square",
+      "immortal": false,
+      "possessable": true,
+      "workspace": "workspace/characters/joe",
+      "providers": [
+        {
+          "type": "openai",
+          "model": "MiniMax-M2.7",
+          "apiKeyEnv": "OPENAI_API_KEY",
+          "baseURL": "http://sark.thegamegrid:8080/v1"
+        }
+      ]
+    },
+    {
+      "id": "cage",
+      "name": "Nicolas Cage",
+      "port": 3006,
+      "server": "character",
+      "defaultLocation": "theater",
+      "immortal": false,
+      "possessable": false,
+      "workspace": "workspace/characters/cage",
+      "allowedTools": [],
+      "providers": [
+        {
+          "type": "openai",
+          "model": "MiniMax-M2.7",
+          "apiKeyEnv": "OPENAI_API_KEY",
+          "baseURL": "http://sark.thegamegrid:8080/v1"
+        }
+      ]
+    }
+  ]
+}

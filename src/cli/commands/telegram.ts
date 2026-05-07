@@ -5,10 +5,11 @@
 import 'dotenv/config';
 import { nanoid } from 'nanoid';
 import { TelegramChannel, type TelegramConfig } from '../../channels/telegram.js';
-import { initAgent, processMessageStream } from '../../agent/index.js';
+import { initAgent, processMessage } from '../../agent/index.js';
 import { initDatabase } from '../../storage/database.js';
 import { getPaths } from '../../config/index.js';
 import { getDefaultConfig } from '../../config/defaults.js';
+import { getAllCharacters, getAgentConfigFor } from '../../config/characters.js';
 import { getLogger } from '../../utils/logger.js';
 import type { IncomingMessage, OutgoingMessage, TextContent } from '../../types/message.js';
 
@@ -36,17 +37,29 @@ export async function startTelegram(): Promise<void> {
   console.log('Initializing database...');
   await initDatabase(paths.database, config.security.keyDerivation);
 
-  console.log('Initializing agent...');
-  for (const agentConfig of config.agents) {
-    await initAgent(agentConfig);
+  // findings.md P2:125 — hard-coded `'default'` used to match only the
+  // default-config id; lain.json5 overrides silently misrouted messages.
+  // findings.md P2:171 — after config.agents[] was removed, Telegram
+  // resolves the character from characters.json:
+  //   1. `LAIN_TELEGRAM_AGENT_ID` env var (explicit override)
+  //   2. First character in the manifest
+  const agentId = process.env['LAIN_TELEGRAM_AGENT_ID'] ?? getAllCharacters()[0]?.id;
+  if (!agentId) {
+    console.error(
+      'Error: no characters configured (characters.json is empty and LAIN_TELEGRAM_AGENT_ID is unset)',
+    );
+    process.exit(1);
   }
+
+  console.log('Initializing agent...');
+  await initAgent(getAgentConfigFor(agentId));
 
   // Create Telegram channel config
   const telegramConfig: TelegramConfig = {
     id: 'telegram-main',
     type: 'telegram',
     enabled: true,
-    agentId: 'default',
+    agentId,
     token: botToken,
     allowedUsers: [allowedChatId], // Only allow messages from the configured user
   };
@@ -73,33 +86,45 @@ export async function startTelegram(): Promise<void> {
       }
 
       try {
-        // Collect streamed response
-        let fullResponse = '';
+        // findings.md P2:307 — previously this used processMessageStream and
+        // concatenated chunks into a string before sending. Telegram has no
+        // incremental-send path wired up here, so the stream callback was
+        // pure buffering: users saw nothing until generation finished, and
+        // the agent's already-shaped OutgoingMessage list was thrown away
+        // in favour of a single text concatenation. Switch to processMessage
+        // and forward the agent's messages directly — same latency, simpler
+        // code, preserves non-text messages if the agent ever produces them.
+        const agentResponse = await processMessage({
+          sessionKey,
+          message,
+        });
 
-        await processMessageStream(
-          {
-            sessionKey,
-            message,
-          },
-          (chunk: string) => {
-            fullResponse += chunk;
-          }
-        );
-
-        // Send the complete response
-        if (fullResponse.trim()) {
+        let sentCount = 0;
+        let textLength = 0;
+        for (const out of agentResponse.messages) {
+          // Rebind the outbound peerId/channel to this Telegram chat. The
+          // agent populates these with its own defaults which don't know
+          // which channel delivered the inbound message.
           const outgoing: OutgoingMessage = {
-            id: nanoid(16),
+            ...out,
+            id: out.id ?? nanoid(16),
             channel: 'telegram',
             peerId: message.peerId,
-            content: {
-              type: 'text',
-              text: fullResponse,
-            },
           };
-
+          if (outgoing.content.type === 'text') {
+            const text = (outgoing.content as TextContent).text;
+            if (!text.trim()) continue;
+            textLength += text.length;
+          }
           await channel.send(outgoing);
-          logger.info({ chatId: message.peerId, responseLength: fullResponse.length }, 'Response sent');
+          sentCount++;
+        }
+
+        if (sentCount > 0) {
+          logger.info(
+            { chatId: message.peerId, sentCount, textLength },
+            'Response sent',
+          );
         }
       } catch (error) {
         logger.error({ error, chatId: message.peerId }, 'Error processing message');

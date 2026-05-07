@@ -29,6 +29,41 @@ vi.mock('../src/utils/logger.js', () => ({
   }),
 }));
 
+// Redirect safeFetch/safeFetchFollow to globalThis.fetch so existing
+// `globalThis.fetch = vi.fn()` mocks still drive the fetch_webpage /
+// fetch_and_show_image / view_image handlers after the SSRF refactor.
+// The mock preserves the production scheme-reject behavior so invalid-
+// scheme tests still assert via a thrown SSRF-protection error.
+vi.mock('../src/security/ssrf.js', () => {
+  const BLOCKED = ['file:', 'ftp:', 'gopher:', 'data:', 'javascript:'];
+  const ALLOWED = ['http:', 'https:'];
+  const checkScheme = (url: string): void => {
+    let parsed: URL;
+    try { parsed = new URL(url); } catch {
+      throw new Error('SSRF protection: Invalid URL');
+    }
+    if (BLOCKED.includes(parsed.protocol)) {
+      throw new Error(`SSRF protection: Blocked URL scheme: ${parsed.protocol}`);
+    }
+    if (!ALLOWED.includes(parsed.protocol)) {
+      throw new Error(`SSRF protection: Unsupported URL scheme: ${parsed.protocol}`);
+    }
+  };
+  const passthrough = async (url: string, options?: RequestInit) => {
+    checkScheme(url);
+    return globalThis.fetch(url, options);
+  };
+  // findings.md P2:1305 — sanitizeURL/isAllowedDomain/isBlockedDomain
+  // removed from the SSRF module surface; the mock no longer needs to
+  // shim them.
+  return {
+    safeFetch: vi.fn(passthrough),
+    safeFetchFollow: vi.fn(passthrough),
+    checkSSRF: vi.fn().mockResolvedValue({ safe: true }),
+    isPrivateIP: vi.fn().mockReturnValue(false),
+  };
+});
+
 vi.mock('../src/storage/database.js', () => ({
   query: vi.fn().mockReturnValue([]),
   queryOne: vi.fn().mockReturnValue(null),
@@ -69,6 +104,7 @@ vi.mock('../src/memory/embeddings.js', () => ({
   cosineSimilarity: vi.fn().mockReturnValue(0.8),
   serializeEmbedding: vi.fn().mockReturnValue(Buffer.alloc(0)),
   deserializeEmbedding: vi.fn().mockReturnValue(new Float32Array(256)),
+  CURRENT_EMBEDDING_MODEL: 'Xenova/all-MiniLM-L6-v2',
 }));
 
 vi.mock('../src/config/paths.js', () => ({
@@ -88,13 +124,6 @@ vi.mock('../src/config/characters.js', () => ({
   getMortalCharacters: vi.fn().mockReturnValue([]),
   getWebCharacter: vi.fn().mockReturnValue(null),
   getPeersFor: vi.fn().mockReturnValue([]),
-}));
-
-vi.mock('../src/agent/skills.js', () => ({
-  saveCustomTool: vi.fn().mockResolvedValue(true),
-  listCustomTools: vi.fn().mockResolvedValue(['my_tool']),
-  deleteCustomTool: vi.fn().mockResolvedValue(true),
-  loadCustomTools: vi.fn().mockResolvedValue(0),
 }));
 
 vi.mock('../src/agent/letter.js', () => ({
@@ -142,9 +171,12 @@ vi.mock('pdf-parse', () => ({
   PDFParse: vi.fn(),
 }));
 
-vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn(),
-}));
+vi.mock('@anthropic-ai/sdk', async () => {
+  // findings.md P2:838 — preserve real APIError exports so the provider's
+  // `err instanceof APIError` retry classification works under test.
+  const actual = await vi.importActual<typeof import('@anthropic-ai/sdk')>('@anthropic-ai/sdk');
+  return { ...actual, default: vi.fn() };
+});
 
 vi.mock('grammy', () => ({
   Bot: vi.fn().mockImplementation(() => ({
@@ -160,12 +192,10 @@ import {
   getToolDefinitions,
   executeTool,
   executeTools,
-  toolRequiresApproval,
   extractTextFromHtml,
 } from '../src/agent/tools.js';
 import type { ToolCall, ToolResult } from '../src/providers/base.js';
 import { saveMemory, searchMemories, getMemory, getAssociatedMemories, updateMemoryAccess } from '../src/memory/store.js';
-import { saveCustomTool, listCustomTools, deleteCustomTool } from '../src/agent/skills.js';
 import { runLetterCycle } from '../src/agent/letter.js';
 import { getCurrentLocation, setCurrentLocation } from '../src/commune/location.js';
 
@@ -598,12 +628,20 @@ describe('Tool Execution Behavioral', () => {
   // ── search_images ─────────────────────────────────────────────────────
 
   describe('search_images', () => {
+    // findings.md P2:1799 — the tool is now honest about returning placeholders.
     it('returns picsum URLs based on query', async () => {
       const call = makeToolCall('search_images', { query: 'sunset' });
       const result = await executeTool(call);
       expectSuccess(result);
-      expect(result.content).toContain('found images for "sunset"');
+      expect(result.content).toContain('sunset');
       expect(result.content).toContain('picsum.photos');
+    });
+
+    it('labels the output as placeholder / NOT query-relevant', async () => {
+      const call = makeToolCall('search_images', { query: 'sunset' });
+      const result = await executeTool(call);
+      expect(result.content.toLowerCase()).toContain('placeholder');
+      expect(result.content).toContain('NOT');
     });
 
     it('returns 3 image results', async () => {
@@ -623,113 +661,35 @@ describe('Tool Execution Behavioral', () => {
     });
   });
 
-  // ── create_tool ───────────────────────────────────────────────────────
+  // ── create_tool / list_my_tools / delete_tool: REMOVED ────────────────
+  // These LLM-authored tool meta-tools were removed in findings.md P1:1561
+  // because they handed `new Function()` + `require` + `process` to LLM-
+  // authored JavaScript, making every cross-peer injection path a route to
+  // host RCE. See test/tools.test.ts and test/type-safety.test.ts for the
+  // regression guards asserting they stay removed.
 
-  describe('create_tool', () => {
-    beforeEach(() => {
-      vi.mocked(saveCustomTool).mockClear();
-    });
-
-    it('saves custom tool and returns success', async () => {
-      vi.mocked(saveCustomTool).mockResolvedValue(true);
+  describe('removed create_tool / list_my_tools / delete_tool (P1 findings.md:1561)', () => {
+    it('create_tool is no longer in the registry — executeTool rejects it', async () => {
       const call = makeToolCall('create_tool', {
-        name: 'my_tool',
-        description: 'A test tool',
-        parameters: '{"x": {"type": "number", "description": "value"}}',
-        code: 'return "ok";',
+        name: 'x', description: 'y', parameters: '{}', code: 'return "z";',
       });
       const result = await executeTool(call);
-      expectSuccess(result);
-      expect(result.content).toContain('created tool "my_tool"');
-      expect(saveCustomTool).toHaveBeenCalledOnce();
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('Unknown tool "create_tool"');
     });
 
-    it('normalizes tool name to lowercase with underscores', async () => {
-      vi.mocked(saveCustomTool).mockResolvedValue(true);
-      const call = makeToolCall('create_tool', {
-        name: 'My-Tool!@#',
-        description: 'test',
-        parameters: '{}',
-        code: 'return "ok";',
-      });
-      const result = await executeTool(call);
-      expect(result.content).toContain('my_tool');
-    });
-
-    it('returns error on invalid parameters JSON', async () => {
-      const call = makeToolCall('create_tool', {
-        name: 'test',
-        description: 'test',
-        parameters: 'NOT JSON',
-        code: 'return "ok";',
-      });
-      const result = await executeTool(call);
-      expect(result.content).toContain('error: parameters must be valid JSON');
-    });
-
-    it('handles save failure', async () => {
-      vi.mocked(saveCustomTool).mockResolvedValue(false);
-      const call = makeToolCall('create_tool', {
-        name: 'fail_tool',
-        description: 'test',
-        parameters: '{}',
-        code: 'return "ok";',
-      });
-      const result = await executeTool(call);
-      expect(result.content).toContain('failed to create tool');
-    });
-
-    it('parses required_params into array', async () => {
-      vi.mocked(saveCustomTool).mockResolvedValue(true);
-      const call = makeToolCall('create_tool', {
-        name: 'test',
-        description: 'test',
-        parameters: '{"a": {"type": "string", "description": "a"}}',
-        required_params: 'a, b',
-        code: 'return "ok";',
-      });
-      await executeTool(call);
-      const savedSkill = vi.mocked(saveCustomTool).mock.calls[0]![0];
-      expect(savedSkill.inputSchema.required).toEqual(['a', 'b']);
-    });
-  });
-
-  // ── list_my_tools ─────────────────────────────────────────────────────
-
-  describe('list_my_tools', () => {
-    it('returns list of custom tools', async () => {
-      vi.mocked(listCustomTools).mockResolvedValue(['tool_a', 'tool_b']);
+    it('list_my_tools is no longer in the registry — executeTool rejects it', async () => {
       const call = makeToolCall('list_my_tools', {});
       const result = await executeTool(call);
-      expectSuccess(result);
-      expect(result.content).toContain('tool_a');
-      expect(result.content).toContain('tool_b');
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('Unknown tool "list_my_tools"');
     });
 
-    it('returns message when no tools exist', async () => {
-      vi.mocked(listCustomTools).mockResolvedValue([]);
-      const call = makeToolCall('list_my_tools', {});
+    it('delete_tool is no longer in the registry — executeTool rejects it', async () => {
+      const call = makeToolCall('delete_tool', { name: 'anything' });
       const result = await executeTool(call);
-      expect(result.content).toContain('no custom tools created yet');
-    });
-  });
-
-  // ── delete_tool ───────────────────────────────────────────────────────
-
-  describe('delete_tool', () => {
-    it('deletes tool and returns success', async () => {
-      vi.mocked(deleteCustomTool).mockResolvedValue(true);
-      const call = makeToolCall('delete_tool', { name: 'old_tool' });
-      const result = await executeTool(call);
-      expectSuccess(result);
-      expect(result.content).toContain('deleted tool "old_tool"');
-    });
-
-    it('returns failure message when tool does not exist', async () => {
-      vi.mocked(deleteCustomTool).mockResolvedValue(false);
-      const call = makeToolCall('delete_tool', { name: 'nonexistent' });
-      const result = await executeTool(call);
-      expect(result.content).toContain('failed to delete');
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('Unknown tool "delete_tool"');
     });
   });
 
@@ -846,7 +806,11 @@ describe('Tool Execution Behavioral', () => {
       const call = makeToolCall('__test_throw', {});
       const result = await executeTool(call);
       expectError(result);
-      expect(result.content).toContain('kaboom');
+      // P2:1851 — handler error messages are no longer echoed back to the LLM;
+      // the tool result carries an opaque incident ID instead. The full error
+      // still reaches the server-side logger.
+      expect(result.content).not.toContain('kaboom');
+      expect(result.content).toMatch(/incident [0-9a-f]+/);
       unregisterTool('__test_throw');
     });
 
@@ -858,7 +822,8 @@ describe('Tool Execution Behavioral', () => {
       const call = makeToolCall('__test_throw_str', {});
       const result = await executeTool(call);
       expectError(result);
-      expect(result.content).toContain('string error');
+      expect(result.content).not.toContain('string error');
+      expect(result.content).toMatch(/incident [0-9a-f]+/);
       unregisterTool('__test_throw_str');
     });
   });
@@ -894,7 +859,10 @@ describe('Tool Execution Behavioral', () => {
       expect(result.content).toContain('no results found');
     });
 
-    it('handles fetch failure gracefully', async () => {
+    it('handles fetch failure gracefully (cascades through all tiers → no results)', async () => {
+      // With the DDG HTML → DDG Lite → Wikipedia fallback chain, a 503 from
+      // one tier cascades to the next. Mock returns 503 for every call →
+      // every tier returns [] → tool reports "no results found".
       globalThis.fetch = vi.fn().mockResolvedValue({
         ok: false,
         status: 503,
@@ -902,15 +870,15 @@ describe('Tool Execution Behavioral', () => {
 
       const call = makeToolCall('web_search', { query: 'test' });
       const result = await executeTool(call);
-      expect(result.content).toContain('search failed');
+      expect(result.content).toContain('no results found');
     });
 
-    it('handles network error gracefully', async () => {
+    it('handles network error gracefully (cascades through all tiers → no results)', async () => {
       globalThis.fetch = vi.fn().mockRejectedValue(new Error('Network error')) as unknown as typeof fetch;
 
       const call = makeToolCall('web_search', { query: 'test' });
       const result = await executeTool(call);
-      expect(result.content).toContain('search failed');
+      expect(result.content).toContain('no results found');
     });
   });
 
@@ -933,7 +901,9 @@ describe('Tool Execution Behavioral', () => {
     it('rejects non-http protocol', async () => {
       const call = makeToolCall('fetch_webpage', { url: 'ftp://example.com' });
       const result = await executeTool(call);
-      expect(result.content).toContain('only http and https URLs are supported');
+      // safeFetch throws "SSRF protection: Blocked URL scheme: ftp:";
+      // handler surfaces the message to the user.
+      expect(result.content).toContain('SSRF protection');
     });
 
     it('handles fetch error', async () => {
@@ -987,23 +957,10 @@ describe('Tool Execution Behavioral', () => {
     });
   });
 
-  // ── toolRequiresApproval ──────────────────────────────────────────────
-
-  describe('toolRequiresApproval', () => {
-    it('returns true for telegram_call', () => {
-      expect(toolRequiresApproval('telegram_call')).toBe(true);
-    });
-
-    it('returns false for regular tools', () => {
-      expect(toolRequiresApproval('calculate')).toBe(false);
-      expect(toolRequiresApproval('get_current_time')).toBe(false);
-      expect(toolRequiresApproval('remember')).toBe(false);
-    });
-
-    it('returns false for unknown tools', () => {
-      expect(toolRequiresApproval('nonexistent')).toBe(false);
-    });
-  });
+  // Note: toolRequiresApproval was removed as a P1 in findings.md —
+  // the helper existed but executeTool never consulted it, so tagged
+  // tools ran unattended anyway. Source-level regression for the
+  // removal lives in test/tools.test.ts.
 
   // ── registerTool / unregisterTool ─────────────────────────────────────
 
@@ -1234,7 +1191,7 @@ describe('Tool Input Validation', () => {
     it('rejects file:// protocol', async () => {
       const call = makeToolCall('fetch_webpage', { url: 'file:///etc/passwd' });
       const result = await executeTool(call);
-      expect(result.content).toContain('only http and https URLs are supported');
+      expect(result.content).toContain('SSRF protection');
     });
 
     it('handles malformed URL', async () => {
@@ -1250,41 +1207,7 @@ describe('Tool Input Validation', () => {
     });
   });
 
-  // ── create_tool input validation ──────────────────────────────────────
-
-  describe('create_tool — invalid inputs', () => {
-    it('handles missing name', async () => {
-      const call = makeToolCall('create_tool', {
-        description: 'test',
-        parameters: '{}',
-        code: 'return "ok";',
-      });
-      const result = await executeTool(call);
-      expect(typeof result.content).toBe('string');
-    });
-
-    it('handles missing code', async () => {
-      const call = makeToolCall('create_tool', {
-        name: 'test',
-        description: 'test',
-        parameters: '{}',
-      });
-      const result = await executeTool(call);
-      expect(typeof result.content).toBe('string');
-    });
-
-    it('handles deeply nested parameters JSON', async () => {
-      vi.mocked(saveCustomTool).mockResolvedValue(true);
-      const call = makeToolCall('create_tool', {
-        name: 'test',
-        description: 'test',
-        parameters: '{"a": {"type": "object", "description": "nested"}}',
-        code: 'return "ok";',
-      });
-      const result = await executeTool(call);
-      expect(typeof result.content).toBe('string');
-    });
-  });
+  // create_tool input-validation tests removed: tool is gone (P1 findings.md:1561).
 
   // ── expand_memory input validation ────────────────────────────────────
 
@@ -1348,23 +1271,7 @@ describe('Tool Input Validation', () => {
     });
   });
 
-  // ── delete_tool input validation ──────────────────────────────────────
-
-  describe('delete_tool — invalid inputs', () => {
-    it('handles missing name', async () => {
-      vi.mocked(deleteCustomTool).mockResolvedValue(false);
-      const call = makeToolCall('delete_tool', {});
-      const result = await executeTool(call);
-      expect(typeof result.content).toBe('string');
-    });
-
-    it('handles empty name', async () => {
-      vi.mocked(deleteCustomTool).mockResolvedValue(false);
-      const call = makeToolCall('delete_tool', { name: '' });
-      const result = await executeTool(call);
-      expect(typeof result.content).toBe('string');
-    });
-  });
+  // delete_tool input-validation tests removed: tool is gone (P1 findings.md:1561).
 
   // ── search_images input validation ────────────────────────────────────
 
@@ -1593,7 +1500,7 @@ describe('Tool Loop Behavioral', () => {
       expect(result.toolCallId).toBe('err-id');
     });
 
-    it('thrown error produces error result with message', async () => {
+    it('thrown error produces error result with incident id (P2:1851)', async () => {
       registerTool({
         definition: { name: '__struct_throw', description: 'test', inputSchema: { type: 'object', properties: {} } },
         handler: async () => { throw new TypeError('type error'); },
@@ -1601,7 +1508,8 @@ describe('Tool Loop Behavioral', () => {
 
       const result = await executeTool(makeToolCall('__struct_throw', {}, 'throw-id'));
       expect(result.isError).toBe(true);
-      expect(result.content).toContain('type error');
+      expect(result.content).not.toContain('type error');
+      expect(result.content).toMatch(/incident [0-9a-f]+/);
 
       unregisterTool('__struct_throw');
     });
@@ -1685,7 +1593,9 @@ describe('Tool Loop Behavioral', () => {
 
       const result = await executeTool(makeToolCall('__async_reject', {}, 'reject-id'));
       expect(result.isError).toBe(true);
-      expect(result.content).toContain('async fail');
+      // P2:1851 — raw error text is not echoed back; only the incident ID is.
+      expect(result.content).not.toContain('async fail');
+      expect(result.content).toMatch(/incident [0-9a-f]+/);
 
       unregisterTool('__async_reject');
     });
@@ -1747,13 +1657,10 @@ describe('Doctor Tools Behavioral', () => {
 
     it('includes all expected doctor tools', () => {
       const names = getDoctorToolDefinitions().map(d => d.name);
-      expect(names).toContain('run_diagnostic_tests');
       expect(names).toContain('check_service_health');
       expect(names).toContain('get_health_status');
       expect(names).toContain('get_telemetry');
       expect(names).toContain('read_file');
-      expect(names).toContain('edit_file');
-      expect(names).toContain('run_command');
       expect(names).toContain('get_reports');
     });
 
@@ -1960,73 +1867,6 @@ describe('Doctor Tools Behavioral', () => {
     });
   });
 
-  describe('edit_file — path security', () => {
-    it('rejects .env file', async () => {
-      const result = await executeDoctorTool({
-        id: 'ef-1',
-        name: 'edit_file',
-        input: { path: '.env', old_text: 'a', new_text: 'b' },
-      });
-      expect(result.content).toContain('Access denied');
-    });
-
-    it('rejects path traversal', async () => {
-      const result = await executeDoctorTool({
-        id: 'ef-2',
-        name: 'edit_file',
-        input: { path: '../../etc/shadow', old_text: 'a', new_text: 'b' },
-      });
-      expect(result.content).toContain('Access denied');
-    });
-
-    it('rejects disallowed extension', async () => {
-      const result = await executeDoctorTool({
-        id: 'ef-3',
-        name: 'edit_file',
-        input: { path: 'test.bin', old_text: 'a', new_text: 'b' },
-      });
-      expect(result.content).toContain('File type not allowed');
-    });
-  });
-
-  describe('run_command — safety', () => {
-    it('blocks sudo', async () => {
-      const result = await executeDoctorTool({
-        id: 'rc-1',
-        name: 'run_command',
-        input: { command: 'sudo rm -rf /' },
-      });
-      expect(result.content).toContain('Command blocked');
-    });
-
-    it('blocks rm -rf /', async () => {
-      const result = await executeDoctorTool({
-        id: 'rc-2',
-        name: 'run_command',
-        input: { command: 'rm -rf /' },
-      });
-      expect(result.content).toContain('Command blocked');
-    });
-
-    it('blocks fork bomb', async () => {
-      const result = await executeDoctorTool({
-        id: 'rc-3',
-        name: 'run_command',
-        input: { command: ':(){:|:&};:' },
-      });
-      expect(result.content).toContain('Command blocked');
-    });
-
-    it('blocks dd if=', async () => {
-      const result = await executeDoctorTool({
-        id: 'rc-4',
-        name: 'run_command',
-        input: { command: 'dd if=/dev/zero of=/dev/sda' },
-      });
-      expect(result.content).toContain('Command blocked');
-    });
-  });
-
   describe('executeDoctorTools parallel', () => {
     it('executes multiple doctor tools', async () => {
       const results = await executeDoctorTools([
@@ -2053,13 +1893,19 @@ describe('Character Tools Behavioral', () => {
   ];
 
   beforeAll(async () => {
+    // Per-character interlink auth needs both envs; tools return early otherwise.
+    process.env['LAIN_CHARACTER_ID'] = 'test-char';
+    process.env['LAIN_INTERLINK_TOKEN'] = 'test-master-token';
+    // findings.md P2:1923 — research_request now resolves its own port from
+    // PORT env or the manifest. Tests don't ship a real manifest, so set
+    // PORT so the research_request suite has a deterministic replyTo.
+    process.env['PORT'] = '4000';
     // Register character tools
     const { registerCharacterTools } = await import('../src/agent/character-tools.js');
     registerCharacterTools(
       'test-char',
       'Test Character',
       'http://localhost:3000',
-      'fake-token',
       testPeers
     );
   });
@@ -2699,9 +2545,10 @@ describe('Tool x Provider Interaction', () => {
       expect(names).toContain('expand_memory');
       expect(names).toContain('web_search');
       expect(names).toContain('fetch_webpage');
-      expect(names).toContain('create_tool');
-      expect(names).toContain('list_my_tools');
-      expect(names).toContain('delete_tool');
+      // create_tool / list_my_tools / delete_tool removed (P1 findings.md:1561)
+      expect(names).not.toContain('create_tool');
+      expect(names).not.toContain('list_my_tools');
+      expect(names).not.toContain('delete_tool');
       expect(names).toContain('introspect_list');
       expect(names).toContain('introspect_read');
       expect(names).toContain('introspect_search');
@@ -3240,6 +3087,8 @@ describe('Additional Character Tool Edge Cases', () => {
       expect(body.question).toBe('Q');
       expect(body.reason).toBe('R');
       expect(body.url).toBe('https://example.com');
+      // findings.md P2:1923 — replyTo uses PORT env when set
+      expect(body.replyTo).toBe('http://localhost:4000');
     });
 
     it('handles ok: false response', async () => {
@@ -3483,20 +3332,6 @@ describe('Additional Doctor Tool Edge Cases', () => {
     });
   });
 
-  describe('run_command — timeout configuration', () => {
-    it('respects custom timeout (capped at 60000)', async () => {
-      // We cannot easily test the actual timeout enforcement in unit tests,
-      // but we can verify the tool accepts the parameter without error.
-      const result = await executeDoctorTool({
-        id: 'rc-t1',
-        name: 'run_command',
-        input: { command: 'echo "quick"', timeout: 100000 },
-      });
-      // The timeout will be capped to 60000 internally.
-      expect(typeof result.content).toBe('string');
-    });
-  });
-
   describe('read_file — .git/hooks path', () => {
     it('rejects .git/hooks path', async () => {
       const result = await executeDoctorTool({
@@ -3506,47 +3341,6 @@ describe('Additional Doctor Tool Edge Cases', () => {
       });
       // .git/ is blocked
       expect(result.content).toContain('Access denied');
-    });
-  });
-
-  describe('edit_file — edge cases', () => {
-    it('rejects .git directory (path-level block)', async () => {
-      const result = await executeDoctorTool({
-        id: 'ef-git',
-        name: 'edit_file',
-        input: { path: '.git/config', old_text: 'a', new_text: 'b' },
-      });
-      // .git/ is caught by BLOCKED_PATHS before extension check
-      expect(result.content).toContain('Access denied');
-    });
-  });
-
-  describe('run_command — blocks chmod 777', () => {
-    it('blocks chmod -R 777 / (lowercase variant)', async () => {
-      // The BLOCKED_COMMANDS list entry is 'chmod -R 777 /' and isCommandSafe
-      // lowercases the input command, so we must test with lowercase -r to match.
-      const result = await executeDoctorTool({
-        id: 'rc-chmod',
-        name: 'run_command',
-        input: { command: 'chmod -r 777 /' },
-      });
-      // Note: the blocked list has 'chmod -R 777 /' (capital R) compared against
-      // lowercased input 'chmod -r 777 /', so only lowercase matches.
-      // The actual blocked list entries are not lowercased themselves, so
-      // 'chmod -R 777 /' (capital R) won't match against lowercased input.
-      // This is a known quirk; test the actual behavior:
-      expect(typeof result.content).toBe('string');
-    });
-  });
-
-  describe('run_command — blocks mkfs', () => {
-    it('blocks mkfs commands', async () => {
-      const result = await executeDoctorTool({
-        id: 'rc-mkfs',
-        name: 'run_command',
-        input: { command: 'mkfs.ext4 /dev/sda1' },
-      });
-      expect(result.content).toContain('Command blocked');
     });
   });
 

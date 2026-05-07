@@ -55,6 +55,15 @@ vi.mock('../src/config/characters.js', () => ({
     { id: 'pkd', name: 'Philip K. Dick', port: 3003, workspace: '/opt/lain/workspace/characters/pkd' },
     { id: 'mckenna', name: 'Terence McKenna', port: 3004, workspace: '/opt/lain/workspace/characters/mckenna' },
   ]),
+  getDossierSubjects: vi.fn().mockReturnValue([
+    { id: 'lain', name: 'Lain', port: 3001 },
+    { id: 'dr-claude', name: 'Dr. Claude', port: 3002 },
+    { id: 'pkd', name: 'Philip K. Dick', port: 3003 },
+    { id: 'mckenna', name: 'Terence McKenna', port: 3004 },
+    { id: 'john', name: 'John', port: 3005 },
+    { id: 'hiru', name: 'Hiru', port: 3006 },
+  ]),
+  requireCharacterName: vi.fn(() => 'TestChar'),
 }));
 
 vi.mock('../src/events/bus.js', () => ({
@@ -144,6 +153,47 @@ describe('Object store — createObject', () => {
     expect(obj.metadata).toEqual(meta);
   });
 
+  // findings.md P2:3334 — non-system callers cannot mint immortal fixtures.
+  it('createObject strips metadata.fixture when no isSystem flag', () => {
+    const obj = store.createObject('Shrine', 'Immortal', 'lain', 'Lain', 'library', { fixture: true });
+    expect(obj.metadata['fixture']).toBeUndefined();
+  });
+
+  it('createObject preserves other keys when stripping fixture', () => {
+    const obj = store.createObject('Shrine', 'Immortal', 'lain', 'Lain', 'library', {
+      fixture: true, color: 'gold', weight: 50,
+    });
+    expect(obj.metadata).toEqual({ color: 'gold', weight: 50 });
+  });
+
+  it('createObject strips fixture when isSystem is omitted', () => {
+    const obj = store.createObject('Pillar', 'Tall', 'lain', 'Lain', 'library', { fixture: true }, {});
+    expect(obj.metadata['fixture']).toBeUndefined();
+  });
+
+  it('createObject strips fixture when isSystem is false', () => {
+    const obj = store.createObject('Statue', 'Marble', 'lain', 'Lain', 'library', { fixture: true }, { isSystem: false });
+    expect(obj.metadata['fixture']).toBeUndefined();
+  });
+
+  it('createObject preserves fixture when isSystem is true', () => {
+    const obj = store.createObject('Lamp', 'Wrought iron', 'system', 'System', 'library', { fixture: true }, { isSystem: true });
+    expect(obj.metadata['fixture']).toBe(true);
+  });
+
+  it('createObject persists sanitized metadata to the DB (not original)', () => {
+    (dbMock.execute as ReturnType<typeof vi.fn>).mockClear();
+    store.createObject('Shrine', 'Immortal', 'lain', 'Lain', 'library', { fixture: true, tag: 'x' });
+    const calls = (dbMock.execute as ReturnType<typeof vi.fn>).mock.calls as [string, unknown[]][];
+    const insertCall = calls.find(([sql]) => sql.includes('INSERT INTO objects ('));
+    expect(insertCall).toBeDefined();
+    const params = insertCall![1];
+    const metadataJson = params[params.length - 1] as string;
+    const parsed = JSON.parse(metadataJson) as Record<string, unknown>;
+    expect(parsed['fixture']).toBeUndefined();
+    expect(parsed['tag']).toBe('x');
+  });
+
   it('createObject calls execute with INSERT statement', () => {
     store.createObject('Pen', 'A writing pen', 'lain', 'Lain', 'school');
     expect(dbMock.execute).toHaveBeenCalledWith(
@@ -214,6 +264,89 @@ describe('Object store — getObject', () => {
   });
 });
 
+describe('Object store — corrupt metadata JSON (findings.md P2:3344)', () => {
+  let store: typeof import('../src/objects/store.js');
+  let dbMock: typeof import('../src/storage/database.js');
+
+  beforeEach(async () => {
+    vi.resetModules();
+    store = await import('../src/objects/store.js');
+    dbMock = await import('../src/storage/database.js');
+  });
+
+  it('getObject returns metadata:{} when row has corrupt JSON, does not throw', () => {
+    (dbMock.queryOne as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: 'corrupt1', name: 'Book', description: 'A book',
+      creator_id: 'lain', creator_name: 'Lain',
+      owner_id: null, owner_name: null, location: 'library',
+      created_at: 1000, updated_at: 1000,
+      metadata: '{not valid json',
+    });
+    const obj = store.getObject('corrupt1');
+    expect(obj).not.toBeNull();
+    expect(obj?.metadata).toEqual({});
+  });
+
+  it('getObject tolerates non-object JSON (array)', () => {
+    (dbMock.queryOne as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: 'arr1', name: 'Book', description: 'A book',
+      creator_id: 'lain', creator_name: 'Lain',
+      owner_id: null, owner_name: null, location: 'library',
+      created_at: 1000, updated_at: 1000,
+      metadata: '[1,2,3]',
+    });
+    const obj = store.getObject('arr1');
+    expect(obj?.metadata).toEqual({});
+  });
+
+  it('getObject tolerates non-object JSON (string scalar)', () => {
+    (dbMock.queryOne as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: 'str1', name: 'Book', description: 'A book',
+      creator_id: 'lain', creator_name: 'Lain',
+      owner_id: null, owner_name: null, location: 'library',
+      created_at: 1000, updated_at: 1000,
+      metadata: '"hello"',
+    });
+    const obj = store.getObject('str1');
+    expect(obj?.metadata).toEqual({});
+  });
+
+  it('getAllObjects returns all rows even when one has corrupt metadata', () => {
+    (dbMock.query as ReturnType<typeof vi.fn>).mockReturnValue([
+      {
+        id: 'good', name: 'Book', description: 'A book',
+        creator_id: 'lain', creator_name: 'Lain',
+        owner_id: null, owner_name: null, location: 'library',
+        created_at: 1000, updated_at: 1000,
+        metadata: '{"fixture":true}',
+      },
+      {
+        id: 'bad', name: 'Rotten', description: 'A rotten row',
+        creator_id: 'lain', creator_name: 'Lain',
+        owner_id: null, owner_name: null, location: 'library',
+        created_at: 2000, updated_at: 2000,
+        metadata: '{corrupt',
+      },
+    ]);
+    const objs = store.getAllObjects();
+    expect(objs).toHaveLength(2);
+    expect(objs[0]?.metadata?.['fixture']).toBe(true);
+    expect(objs[1]?.metadata).toEqual({});
+  });
+
+  it('getObject handles null metadata column as {}', () => {
+    (dbMock.queryOne as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: 'nullmeta', name: 'Book', description: 'A book',
+      creator_id: 'lain', creator_name: 'Lain',
+      owner_id: null, owner_name: null, location: 'library',
+      created_at: 1000, updated_at: 1000,
+      metadata: null,
+    });
+    const obj = store.getObject('nullmeta');
+    expect(obj?.metadata).toEqual({});
+  });
+});
+
 describe('Object store — location and owner queries', () => {
   let store: typeof import('../src/objects/store.js');
   let dbMock: typeof import('../src/storage/database.js');
@@ -232,10 +365,11 @@ describe('Object store — location and owner queries', () => {
   it('getObjectsByLocation queries for unowned objects at location', () => {
     (dbMock.query as ReturnType<typeof vi.fn>).mockReturnValue([]);
     store.getObjectsByLocation('bar');
-    expect(dbMock.query).toHaveBeenCalledWith(
-      expect.stringContaining('owner_id IS NULL'),
-      ['bar']
-    );
+    const call = (dbMock.query as ReturnType<typeof vi.fn>).mock.calls.at(-1) as [string, unknown[]];
+    expect(call[0]).toContain('owner_id IS NULL');
+    expect(call[0]).toContain('expires_at');
+    expect(call[1]?.[0]).toBe('bar');
+    expect(typeof call[1]?.[1]).toBe('number');
   });
 
   it('getObjectsByOwner returns empty array when owner has no objects', () => {
@@ -257,6 +391,91 @@ describe('Object store — location and owner queries', () => {
     store.getAllObjects();
     const lastCall = (dbMock.query as ReturnType<typeof vi.fn>).mock.calls.at(-1) as unknown[];
     expect(lastCall[0]).toContain('ORDER BY updated_at DESC');
+  });
+
+  // findings.md P2:3354 — unbounded getAllObjects
+  it('getAllObjects applies a LIMIT clause (default page size)', () => {
+    (dbMock.query as ReturnType<typeof vi.fn>).mockReturnValue([]);
+    store.getAllObjects();
+    const call = (dbMock.query as ReturnType<typeof vi.fn>).mock.calls.at(-1) as [string, unknown[]];
+    expect(call[0]).toMatch(/LIMIT \?/);
+    expect(call[0]).toContain('expires_at');
+    expect(typeof call[1]?.[0]).toBe('number');
+    expect(call[1]?.[1]).toBe(store.DEFAULT_OBJECT_PAGE_SIZE);
+  });
+});
+
+describe('Object store — listObjectsPage pagination (findings.md P2:3354)', () => {
+  let store: typeof import('../src/objects/store.js');
+  let dbMock: typeof import('../src/storage/database.js');
+
+  beforeEach(async () => {
+    vi.resetModules();
+    store = await import('../src/objects/store.js');
+    dbMock = await import('../src/storage/database.js');
+  });
+
+  function makeRow(id: string, updatedAt: number): Record<string, unknown> {
+    return {
+      id, name: id, description: 'x',
+      creator_id: 'lain', creator_name: 'Lain',
+      owner_id: null, owner_name: null, location: 'library',
+      created_at: updatedAt, updated_at: updatedAt, expires_at: null, metadata: '{}',
+    };
+  }
+
+  it('listObjectsPage respects default limit + clamps oversized requests', () => {
+    (dbMock.query as ReturnType<typeof vi.fn>).mockReturnValue([]);
+    store.listObjectsPage({ limit: 99999 });
+    const call = (dbMock.query as ReturnType<typeof vi.fn>).mock.calls.at(-1) as [string, unknown[]];
+    expect(call[0]).toContain('expires_at');
+    expect(typeof call[1]?.[0]).toBe('number');
+    expect(call[1]?.[1]).toBe(store.MAX_OBJECT_PAGE_SIZE + 1);
+  });
+
+  it('listObjectsPage returns nextCursor when there are more rows', () => {
+    const rows = [
+      makeRow('a', 1000),
+      makeRow('b', 900),
+      makeRow('c', 800),
+    ];
+    (dbMock.query as ReturnType<typeof vi.fn>).mockReturnValue(rows);
+    const page = store.listObjectsPage({ limit: 2 });
+    expect(page.objects).toHaveLength(2);
+    expect(page.nextCursor).toBe('900:b');
+  });
+
+  it('listObjectsPage returns nextCursor:null when last page', () => {
+    (dbMock.query as ReturnType<typeof vi.fn>).mockReturnValue([makeRow('a', 1000)]);
+    const page = store.listObjectsPage({ limit: 5 });
+    expect(page.nextCursor).toBeNull();
+  });
+
+  it('listObjectsPage cursor forms a (updated_at, id) lexical WHERE', () => {
+    (dbMock.query as ReturnType<typeof vi.fn>).mockReturnValue([]);
+    store.listObjectsPage({ cursor: '900:b', limit: 10 });
+    const call = (dbMock.query as ReturnType<typeof vi.fn>).mock.calls.at(-1) as [string, unknown[]];
+    expect(call[0]).toContain('updated_at < ?');
+    expect(call[0]).toContain('updated_at = ? AND id < ?');
+    expect(typeof call[1]?.[0]).toBe('number');
+    expect(call[1]?.slice(1)).toEqual([900, 900, 'b', 11]);
+  });
+
+  it('listObjectsPage falls back to no-cursor query on malformed cursor', () => {
+    (dbMock.query as ReturnType<typeof vi.fn>).mockReturnValue([]);
+    store.listObjectsPage({ cursor: 'garbage', limit: 10 });
+    const call = (dbMock.query as ReturnType<typeof vi.fn>).mock.calls.at(-1) as [string, unknown[]];
+    expect(call[0]).not.toContain('updated_at < ?');
+    expect(call[0]).toContain('expires_at');
+    expect(typeof call[1]?.[0]).toBe('number');
+    expect(call[1]?.[1]).toBe(11);
+  });
+
+  it('listObjectsPage returns empty page + null cursor on empty result', () => {
+    (dbMock.query as ReturnType<typeof vi.fn>).mockReturnValue([]);
+    const page = store.listObjectsPage();
+    expect(page.objects).toEqual([]);
+    expect(page.nextCursor).toBeNull();
   });
 });
 
@@ -408,15 +627,30 @@ describe('Object store — counts and fixtures', () => {
 describe('Building memory — recordBuildingEvent', () => {
   let mod: typeof import('../src/commune/building-memory.js');
   let fetchSpy: ReturnType<typeof vi.fn>;
+  let prevCharId: string | undefined;
+  let prevInterlink: string | undefined;
 
   beforeEach(async () => {
+    // Per-character interlink auth (findings.md P1:2289) — recordBuildingEvent
+    // skips the fetch when getInterlinkHeaders() returns null, which requires
+    // both LAIN_CHARACTER_ID and LAIN_INTERLINK_TOKEN to be set.
+    prevCharId = process.env['LAIN_CHARACTER_ID'];
+    prevInterlink = process.env['LAIN_INTERLINK_TOKEN'];
+    process.env['LAIN_CHARACTER_ID'] = 'test-char';
+    process.env['LAIN_INTERLINK_TOKEN'] = 'test-master-token';
     vi.resetModules();
     fetchSpy = vi.fn().mockResolvedValue({ ok: true, json: async () => [] });
     vi.stubGlobal('fetch', fetchSpy);
     mod = await import('../src/commune/building-memory.js');
   });
 
-  afterEach(() => { vi.unstubAllGlobals(); });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    if (prevCharId === undefined) delete process.env['LAIN_CHARACTER_ID'];
+    else process.env['LAIN_CHARACTER_ID'] = prevCharId;
+    if (prevInterlink === undefined) delete process.env['LAIN_INTERLINK_TOKEN'];
+    else process.env['LAIN_INTERLINK_TOKEN'] = prevInterlink;
+  });
 
   it('recordBuildingEvent POSTs to the correct endpoint', async () => {
     await mod.recordBuildingEvent({
@@ -616,13 +850,23 @@ describe('Building memory — queryBuildingEvents and storeBuildingEventLocal', 
     expect(mockRun).toHaveBeenCalled();
   });
 
-  it('queryBuildingEvents prunes events older than 48h', () => {
+  it('pruneBuildingEvents deletes events older than the retention window', () => {
+    // findings.md P2:1473 — prune is no longer on the read path.
+    // The query path must not touch DELETE; callers invoke
+    // pruneBuildingEvents on a scheduled loop.
     const mockAll = vi.fn().mockReturnValue([]);
-    const mockRun = vi.fn();
+    const mockRun = vi.fn().mockReturnValue({ changes: 0 });
     const mockPrepare = vi.fn().mockReturnValue({ all: mockAll, run: mockRun });
     const mockDb = { prepare: mockPrepare } as unknown as import('better-sqlite3').Database;
 
+    // Reading must not DELETE.
     mod.queryBuildingEvents(mockDb, 'library', 24);
+    const readCalls = mockPrepare.mock.calls.map((c) => c[0]);
+    expect(readCalls.some((sql: string) => sql.includes('DELETE FROM building_events'))).toBe(false);
+
+    // But pruneBuildingEvents must run the DELETE.
+    mockPrepare.mockClear();
+    mod.pruneBuildingEvents(mockDb);
     expect(mockPrepare).toHaveBeenCalledWith(expect.stringContaining('DELETE FROM building_events'));
   });
 

@@ -9,7 +9,7 @@ import 'dotenv/config';
 import { createServer } from 'node:http';
 import type { ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { join, extname } from 'node:path';
+import { join, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { nanoid } from 'nanoid';
 import { createProvider } from '../providers/index.js';
@@ -19,11 +19,17 @@ import { loadPersona } from '../agent/persona.js';
 import { initDatabase } from '../storage/database.js';
 import { getPaths } from '../config/index.js';
 import { getDefaultConfig } from '../config/defaults.js';
+import { getProvidersFor } from '../config/characters.js';
+import { getCurrentLocation } from '../commune/location.js';
+import { BUILDING_MAP } from '../commune/buildings.js';
 import {
   getDoctorToolDefinitions,
   executeDoctorTools,
 } from '../agent/doctor-tools.js';
 import { isOwner } from './owner-auth.js';
+import { applyCorsHeaders } from './cors.js';
+import { createRateLimiter } from './rate-limit.js';
+import { applySecurityHeaders, HTML_PAGE_CSP } from './security-headers.js';
 import type {
   Provider,
   Message,
@@ -45,8 +51,42 @@ const MIME_TYPES: Record<string, string> = {
 
 const MAX_TOOL_ITERATIONS = 6;
 
-// In-memory conversation history per session
+// In-memory conversation history per session.
+// findings.md P2:2424 — previously unbounded in both directions
+// (session count and per-session growth). A long-running doctor-server
+// would grow forever on every new sessionId until OOM or restart.
+// Cap: up to MAX_SESSIONS entries, evicted LRU on insert; anything
+// older than SESSION_TTL_MS is swept out on the hourly janitor.
+const MAX_SESSIONS = 500;
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const sessions = new Map<string, Message[]>();
+const sessionLastAccess = new Map<string, number>();
+
+function touchSession(id: string, history: Message[]): void {
+  // Re-insert to move to the end of Map iteration order (LRU tail).
+  if (sessions.has(id)) sessions.delete(id);
+  sessions.set(id, history);
+  sessionLastAccess.set(id, Date.now());
+  while (sessions.size > MAX_SESSIONS) {
+    const oldest = sessions.keys().next().value;
+    if (oldest === undefined) break;
+    sessions.delete(oldest);
+    sessionLastAccess.delete(oldest);
+  }
+}
+
+function evictStaleSessions(): number {
+  const now = Date.now();
+  let evicted = 0;
+  for (const [id, lastAccess] of sessionLastAccess) {
+    if (now - lastAccess > SESSION_TTL_MS) {
+      sessions.delete(id);
+      sessionLastAccess.delete(id);
+      evicted++;
+    }
+  }
+  return evicted;
+}
 
 interface ChatRequest {
   message: string;
@@ -64,12 +104,12 @@ async function runDoctorChat(
   userMessage: string,
   onChunk?: (chunk: string) => void
 ): Promise<string> {
-  // Get or create conversation history
+  // Get or create conversation history (LRU-tracked; see touchSession).
   let history = sessions.get(sessionId);
   if (!history) {
     history = [];
-    sessions.set(sessionId, history);
   }
+  touchSession(sessionId, history);
 
   // Add user message
   history.push({ role: 'user', content: userMessage });
@@ -85,16 +125,18 @@ async function runDoctorChat(
   // Initial completion
   let result: CompletionWithToolsResult;
 
-  if (onChunk && provider.completeWithToolsStream) {
+  // findings.md P2:818 — branch on supportsStreaming so the choice is
+  // driven by a single capability flag instead of method presence.
+  if (onChunk && provider.supportsStreaming && provider.completeWithToolsStream) {
     result = await provider.completeWithToolsStream(
-      { messages, tools, maxTokens: 4096, temperature: 0.5, enableCaching: true },
+      { messages, tools, maxTokens: 8192, temperature: 0.5, enableCaching: true },
       onChunk
     );
   } else {
     result = await provider.completeWithTools({
       messages,
       tools,
-      maxTokens: 4096,
+      maxTokens: 8192,
       temperature: 0.5,
       enableCaching: true,
     });
@@ -115,21 +157,26 @@ async function runDoctorChat(
     }
 
     const currentToolCalls = result.toolCalls;
+    // findings.md P2:930 — carry prior text forward to preserve
+    // narration across tool iterations.
+    const priorAssistantText = result.content;
     const toolResults = await executeDoctorTools(currentToolCalls);
 
     // Continue with tool results
-    if (onChunk && provider.continueWithToolResultsStream) {
+    if (onChunk && provider.supportsStreaming && provider.continueWithToolResultsStream) {
       result = await provider.continueWithToolResultsStream(
-        { messages, tools, maxTokens: 4096, temperature: 0.5, enableCaching: true },
+        { messages, tools, maxTokens: 8192, temperature: 0.5, enableCaching: true },
         currentToolCalls,
         toolResults,
-        onChunk
+        onChunk,
+        priorAssistantText
       );
     } else {
       result = await provider.continueWithToolResults(
-        { messages, tools, maxTokens: 4096, temperature: 0.5, enableCaching: true },
+        { messages, tools, maxTokens: 8192, temperature: 0.5, enableCaching: true },
         currentToolCalls,
-        toolResults
+        toolResults,
+        priorAssistantText
       );
       if (result.content && onChunk) {
         onChunk(result.content);
@@ -186,7 +233,9 @@ async function runDoctorChat(
   // Trim history if too long (keep last 40 messages)
   if (history.length > 40) {
     const trimmed = history.slice(-40);
-    sessions.set(sessionId, trimmed);
+    touchSession(sessionId, trimmed);
+  } else {
+    touchSession(sessionId, history);
   }
 
   return result.content;
@@ -223,12 +272,11 @@ async function handleChatStream(
   const request: ChatRequest = JSON.parse(body);
   const sessionId = request.sessionId || `dr:${nanoid(8)}`;
 
-  // SSE headers
+  // CORS set by the top-level applyCorsHeaders() above (P2:2366).
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
   });
 
   // Send session ID
@@ -250,10 +298,19 @@ async function handleChatStream(
   }
 }
 
+// findings.md P2:2356 — `path.replace(/\.\./g, '')` is a weak traversal
+// guard: it misses URL-encoded `..` (e.g. `%2e%2e%2f`), unicode-normalized
+// variants, and doesn't defend against symlink escape through non-`..`
+// paths. Use resolve() + startsWith(rootResolved) like server.ts and the
+// /skins branch in character-server.ts already do.
 async function serveStatic(path: string): Promise<{ content: Buffer; type: string } | null> {
   try {
-    const safePath = path.replace(/\.\./g, '').replace(/^\/+/, '');
-    const filePath = join(PUBLIC_DIR, safePath || 'index.html');
+    const safePath = path.replace(/^\/+/, '') || 'index.html';
+    const rootResolved = resolve(PUBLIC_DIR);
+    const filePath = resolve(rootResolved, safePath);
+    if (filePath !== rootResolved && !filePath.startsWith(rootResolved + '/')) {
+      return null;
+    }
     const content = await readFile(filePath);
     const ext = extname(filePath);
     const type = MIME_TYPES[ext] || 'application/octet-stream';
@@ -275,19 +332,23 @@ export async function startDoctorServer(port = 3002): Promise<void> {
   console.log('Initializing database...');
   await initDatabase(paths.database, config.security.keyDerivation);
 
-  // Create provider directly
+  // Create provider directly. findings.md P2:171 — provider chain now comes
+  // from Dr. Claude's characters.json entry (or DEFAULT_PROVIDERS fallback).
   console.log('Creating provider...');
-  const providerConfig = config.agents[0]?.providers[0];
+  const providerConfig = getProvidersFor('dr-claude')[0];
   if (!providerConfig) {
-    throw new Error('No provider configured');
+    throw new Error('No provider configured for dr-claude');
   }
   const provider = createProvider(providerConfig);
 
   eventBus.setCharacterId('dr-claude');
 
-  // Load Dr. Claude persona
+  // findings.md P2:2434 — anchor the workspace path against __dirname so a
+  // systemd WorkingDirectory change (or any CWD drift) can't silently
+  // load the wrong persona, or no persona at all. PUBLIC_DIR in this
+  // same file already uses the __dirname-relative pattern; unify.
   console.log('Loading Dr. Claude persona...');
-  const doctorWorkspace = join(process.cwd(), 'workspace', 'doctor');
+  const doctorWorkspace = join(__dirname, '..', '..', 'workspace', 'doctor');
   const persona = await loadPersona({ workspacePath: doctorWorkspace });
 
   // Build system prompt (without Lain-specific communication guidelines)
@@ -305,6 +366,13 @@ ${persona.agents}
 
 ${persona.identity}`;
 
+  // findings.md P2:2494 — gate /api/chat and /api/chat/stream behind a
+  // per-IP cap. Dr. Claude is an owner-only endpoint, so this is
+  // primarily a defense-in-depth against a cookie leak (no public
+  // visitor should reach these routes). Shares semantics with the main
+  // server's rate limiter.
+  const chatLimiter = createRateLimiter();
+
   // Create server
   const server = createServer(async (req, res) => {
     let url: URL;
@@ -316,10 +384,16 @@ ${persona.identity}`;
       return;
     }
 
-    // CORS
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    // findings.md P2:2366 — CORS origin comes from LAIN_CORS_ORIGIN, default
+    // is no header emitted (doctor-server serves owner/diagnostic endpoints;
+    // it has no cross-origin use case by default).
+    applyCorsHeaders(res, { headers: 'Content-Type' });
+
+    // findings.md P2:2512 — doctor-server used to emit zero security
+    // headers. Use the main-server-matching HTML CSP because this
+    // server also serves HTML pages from public-doctor/ (index page,
+    // etc.). frame-ancestors 'none' defeats clickjacking either way.
+    applySecurityHeaders(res, { csp: HTML_PAGE_CSP });
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
@@ -327,16 +401,22 @@ ${persona.identity}`;
       return;
     }
 
-    // Location (no auth — public for commune map; Dr. Claude is fixed at school)
+    // findings.md P2:2414 — the location used to be hardcoded to school.
+    // If Dr. Claude ever joins the commune movement lifecycle, the
+    // self-reported location would diverge from the actual persisted
+    // record. Read from the commune location store (process-local, so
+    // correct for this server's own DB) and translate via BUILDING_MAP.
     if (url.pathname === '/api/location' && req.method === 'GET') {
+      const record = getCurrentLocation('dr-claude');
+      const building = BUILDING_MAP.get(record.building);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         characterId: 'dr-claude',
-        location: 'school',
-        buildingName: 'School',
-        row: 1,
-        col: 2,
-        timestamp: Date.now(),
+        location: record.building,
+        buildingName: building?.name ?? record.building,
+        row: building?.row ?? 1,
+        col: building?.col ?? 2,
+        timestamp: record.timestamp || Date.now(),
       }));
       return;
     }
@@ -350,11 +430,11 @@ ${persona.identity}`;
 
     // SSE event stream (public — visitors can watch)
     if (url.pathname === '/api/events' && req.method === 'GET') {
+      // CORS set by the top-level applyCorsHeaders() above (P2:2366).
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
       });
       const handler = (event: SystemEvent) => {
         if (!isBackgroundEvent(event)) return;
@@ -391,6 +471,9 @@ ${persona.identity}`;
         res.end(JSON.stringify({ error: 'Unauthorized' }));
         return;
       }
+      // findings.md P2:2494 — rate-limit after auth so unauthenticated
+      // probes still 403, but a leaked cookie can't burst this server.
+      if (!chatLimiter.guard(req, res)) return;
       let body = '';
       req.on('data', (chunk) => {
         body += chunk.toString();
@@ -414,6 +497,8 @@ ${persona.identity}`;
         res.end(JSON.stringify({ error: 'Unauthorized' }));
         return;
       }
+      // findings.md P2:2494 — see /api/chat/stream above for rationale.
+      if (!chatLimiter.guard(req, res)) return;
       let body = '';
       req.on('data', (chunk) => {
         body += chunk.toString();
@@ -471,6 +556,13 @@ ${persona.identity}`;
       }
     }
   });
+
+  // findings.md P2:2424 — hourly janitor evicts sessions that have been
+  // idle past SESSION_TTL_MS. The MAX_SESSIONS LRU cap handles growth
+  // bursts; this handles long tails of stale one-shot sessions.
+  setInterval(() => {
+    try { evictStaleSessions(); } catch { /* ignore */ }
+  }, 60 * 60 * 1000);
 
   server.listen(port, () => {
     console.log(`

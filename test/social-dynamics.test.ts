@@ -955,6 +955,7 @@ describe('Awareness dynamics', () => {
 
   it('awareness internal state summary is included when available', async () => {
     process.env['LAIN_INTERLINK_TOKEN'] = 'test-token';
+    process.env['LAIN_CHARACTER_ID'] = 'test-char';
     const mockFetch = vi.fn()
       .mockResolvedValueOnce({ ok: true, json: async () => ({ location: 'library' }) })
       .mockResolvedValueOnce({ ok: true, json: async () => ({ summary: 'feeling contemplative' }) });
@@ -968,6 +969,7 @@ describe('Awareness dynamics', () => {
     expect(result).toContain('feeling contemplative');
     vi.unstubAllGlobals();
     delete process.env['LAIN_INTERLINK_TOKEN'];
+    delete process.env['LAIN_CHARACTER_ID'];
   });
 });
 
@@ -1089,14 +1091,14 @@ describe('Desire-driven social behavior', () => {
     expect(ctx).toContain('I want to connect');
   });
 
-  it('getDesireContext uses intensity labels: strongly/somewhat/faintly', () => {
+  it('getDesireContext uses intensity labels: [pull: strong/moderate/faint]', () => {
     createDesire({ type: 'social', description: 'strong desire', source: 'test', intensity: 0.8 });
     createDesire({ type: 'intellectual', description: 'moderate desire', source: 'test', intensity: 0.5 });
     createDesire({ type: 'emotional', description: 'faint desire', source: 'test', intensity: 0.2 });
     const ctx = getDesireContext();
-    expect(ctx).toContain('strongly');
-    expect(ctx).toContain('somewhat');
-    expect(ctx).toContain('faintly');
+    expect(ctx).toContain('[pull: strong]');
+    expect(ctx).toContain('[pull: moderate]');
+    expect(ctx).toContain('[pull: faint]');
   });
 
   it('checkLoneliness returns null if interaction < 6 hours ago', async () => {
@@ -1164,8 +1166,23 @@ describe('Desire-driven social behavior', () => {
 // ═════════════════════════════════════════════════════════════════════════════
 
 describe('Dossier accuracy', () => {
-  beforeEach(setupTestDb);
-  afterEach(teardownTestDb);
+  // Ensure the manifest points at the production fixture for every dossier
+  // test: the setup/teardown helpers wipe anything not present in originalEnv,
+  // and the manifest is cached after first read — so re-establish both on
+  // each test.
+  beforeEach(async () => {
+    process.env['CHARACTERS_CONFIG'] = join(
+      process.cwd(), 'test', 'fixtures', 'manifest-production.json'
+    );
+    const chars = await import('../src/config/characters.js');
+    chars._resetManifestCache();
+    await setupTestDb();
+  });
+  afterEach(async () => {
+    await teardownTestDb();
+    const chars = await import('../src/config/characters.js');
+    chars._resetManifestCache();
+  });
 
   it('getDossier returns null for character with no dossier', () => {
     const result = getDossier('lain');

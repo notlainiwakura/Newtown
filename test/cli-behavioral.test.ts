@@ -99,21 +99,54 @@ vi.mock('../src/config/index.js', () => ({
   createInitialConfig: mockCreateInitialConfig,
 }));
 
+// Default config with one 'default' agent so telegram happy-path tests
+// mirror the real defaults.ts shape. Telegram's agentId-derivation
+// test (findings.md P2:125) re-overrides this per-test.
+const mockGetDefaultConfig = vi.fn().mockReturnValue({
+  agents: [
+    {
+      id: 'default',
+      name: 'default',
+      enabled: true,
+      workspace: '/tmp/.lain/workspace',
+      providers: [],
+    },
+  ],
+  security: { keyDerivation: {} },
+});
+
 vi.mock('../src/config/defaults.js', () => ({
-  getDefaultConfig: vi.fn().mockReturnValue({
-    agents: [],
-    security: { keyDerivation: {} },
-  }),
+  getDefaultConfig: mockGetDefaultConfig,
 }));
 
 // ─── character manifest mock ─────────────────────────────────────────────────
 const mockGetCharacterEntry = vi.fn();
 const mockGetPeersFor = vi.fn().mockReturnValue([]);
+// findings.md P2:78 — doctor/status/onboard now discriminate between the
+// legacy single-user layout and the multi-char town via getManifestPath().
+// Default: no manifest (legacy). Individual tests override to exercise the
+// multi-char branch.
+const mockGetManifestPath = vi.fn().mockReturnValue(null);
+// findings.md P2:171 — gateway/telegram resolve agentId from
+// getAllCharacters() + getAgentConfigFor(), not from config.agents.
+// DEFAULT_CHARACTER_MOCK is reused by every describe-block afterEach
+// that needs to restore the default (previously reset to `[]`, which
+// permanently blanked the character list for all downstream tests).
+const DEFAULT_CHARACTER_MOCK = [
+  { id: 'default', name: 'Default', port: 3000, server: 'character', defaultLocation: 'bar', workspace: '/tmp' },
+];
+const mockGetAllCharacters = vi.fn().mockReturnValue(DEFAULT_CHARACTER_MOCK);
+const mockGetAgentConfigFor = vi.fn().mockReturnValue({
+  id: 'default', name: 'Default', enabled: true, workspace: '/tmp',
+  providers: [{ type: 'anthropic', model: 'claude-haiku-4-5-20251001' }],
+});
 
 vi.mock('../src/config/characters.js', () => ({
   getCharacterEntry: mockGetCharacterEntry,
   getPeersFor: mockGetPeersFor,
-  getAllCharacters: vi.fn().mockReturnValue([]),
+  getAllCharacters: mockGetAllCharacters,
+  getAgentConfigFor: mockGetAgentConfigFor,
+  getManifestPath: mockGetManifestPath,
   loadManifest: vi.fn().mockReturnValue({ town: { name: 'Test Town' }, characters: [] }),
 }));
 
@@ -159,31 +192,29 @@ vi.mock('../src/web/character-server.js', () => ({
   startCharacterServer: mockStartCharacterServer,
 }));
 
-// ─── agent/tools mock ────────────────────────────────────────────────────────
-const mockRegisteredTools = new Map<string, unknown>();
-const mockRegisterTool = vi.fn((tool: any) => mockRegisteredTools.set(tool.definition.name, tool));
-const mockUnregisterTool = vi.fn((name: string) => mockRegisteredTools.delete(name));
-
-vi.mock('../src/agent/tools.js', () => ({
-  registerTool: mockRegisterTool,
-  unregisterTool: mockUnregisterTool,
-  getTools: vi.fn(() => []),
-}));
-
-// ─── fs mock for plugin loader ───────────────────────────────────────────────
-const mockReaddir = vi.fn();
-const mockReadFile = vi.fn();
+// ─── fs mock ─────────────────────────────────────────────────────────────────
 const mockAccess = vi.fn();
 const mockMkdir = vi.fn().mockResolvedValue(undefined);
 const mockCopyFile = vi.fn().mockResolvedValue(undefined);
 
 vi.mock('node:fs/promises', () => ({
-  readdir: mockReaddir,
-  readFile: mockReadFile,
   access: mockAccess,
   mkdir: mockMkdir,
   copyFile: mockCopyFile,
   constants: { R_OK: 4 },
+}));
+
+// findings.md P2:90 — doctor now reads characters.json via existsSync +
+// readFileSync. Default to "present with one character"; individual tests
+// override for missing / malformed scenarios.
+const mockExistsSync = vi.fn().mockReturnValue(true);
+const mockReadFileSync = vi
+  .fn()
+  .mockReturnValue(JSON.stringify({ characters: [{ id: 'lain', name: 'Lain', port: 3001 }] }));
+
+vi.mock('node:fs', () => ({
+  existsSync: mockExistsSync,
+  readFileSync: mockReadFileSync,
 }));
 
 // ─── node:child_process mock ─────────────────────────────────────────────────
@@ -292,23 +323,10 @@ describe('Character command behavioral', () => {
       expect(mockStartCharacterServer.mock.calls[0]?.[0]?.port).toBe(0);
     });
 
-    it('config includes a publicDir string', async () => {
+    it('config does not include publicDir — character servers are API-only (findings.md P1:27)', async () => {
       await startCharacterById('lain');
       const config = mockStartCharacterServer.mock.calls[0]?.[0];
-      expect(config?.publicDir).toEqual(expect.any(String));
-    });
-
-    it('publicDir contains the character id', async () => {
-      await startCharacterById('lain');
-      const config = mockStartCharacterServer.mock.calls[0]?.[0];
-      expect(config?.publicDir).toContain('public-lain');
-    });
-
-    it('publicDir for different characters uses their id', async () => {
-      mockGetCharacterEntry.mockReturnValue({ id: 'pkd', name: 'PKD', port: 3003 });
-      await startCharacterById('pkd');
-      const config = mockStartCharacterServer.mock.calls[0]?.[0];
-      expect(config?.publicDir).toContain('public-pkd');
+      expect(config?.publicDir).toBeUndefined();
     });
 
     it('config includes peers array', async () => {
@@ -405,6 +423,77 @@ describe('Character command behavioral', () => {
       process.env['PEER_CONFIG'] = '[]';
       await startCharacterById('lain');
       expect(mockStartCharacterServer.mock.calls[0]?.[0]?.peers).toEqual([]);
+    });
+
+    // findings.md P2:66 — `JSON.parse(raw) as PeerConfig[]` used to accept
+    // whatever came back and hand it to startDesireLoop / startCommuneLoop,
+    // which then crashed with opaque "peers[i].url is undefined" errors.
+    describe('shape validation (findings.md P2:66)', () => {
+      function warnSpy() {
+        const warns: string[] = [];
+        const spy = vi
+          .spyOn(console, 'warn')
+          .mockImplementation((...args: unknown[]) => {
+            warns.push(args.map(String).join(' '));
+          });
+        return { warns, output: () => warns.join('\n'), restore: () => spy.mockRestore() };
+      }
+
+      it('falls back when PEER_CONFIG is valid JSON but not an array', async () => {
+        process.env['PEER_CONFIG'] = '{"id":"x","name":"X","url":"http://a"}';
+        const expected = [{ id: 'manifest-peer', name: 'Manifest', url: 'http://localhost:3000' }];
+        mockGetPeersFor.mockReturnValue(expected);
+        const warn = warnSpy();
+        await startCharacterById('lain');
+        expect(mockStartCharacterServer.mock.calls[0]?.[0]?.peers).toEqual(expected);
+        expect(warn.output().toLowerCase()).toContain('wrong shape');
+        warn.restore();
+      });
+
+      it('falls back when any entry is missing a required field', async () => {
+        process.env['PEER_CONFIG'] = JSON.stringify([
+          { id: 'a', name: 'A', url: 'http://a' },
+          { id: 'b', name: 'B' }, // missing url
+        ]);
+        const expected = [{ id: 'm', name: 'M', url: 'http://m' }];
+        mockGetPeersFor.mockReturnValue(expected);
+        const warn = warnSpy();
+        await startCharacterById('lain');
+        expect(mockStartCharacterServer.mock.calls[0]?.[0]?.peers).toEqual(expected);
+        expect(warn.output().toLowerCase()).toContain('wrong shape');
+        warn.restore();
+      });
+
+      it('falls back when a required field has the wrong type', async () => {
+        process.env['PEER_CONFIG'] = JSON.stringify([{ id: 'a', name: 'A', url: 1234 }]);
+        const expected = [{ id: 'm', name: 'M', url: 'http://m' }];
+        mockGetPeersFor.mockReturnValue(expected);
+        const warn = warnSpy();
+        await startCharacterById('lain');
+        expect(mockStartCharacterServer.mock.calls[0]?.[0]?.peers).toEqual(expected);
+        warn.restore();
+      });
+
+      it('falls back when an entry is null', async () => {
+        process.env['PEER_CONFIG'] = JSON.stringify([null, { id: 'a', name: 'A', url: 'http://a' }]);
+        const expected = [{ id: 'm', name: 'M', url: 'http://m' }];
+        mockGetPeersFor.mockReturnValue(expected);
+        const warn = warnSpy();
+        await startCharacterById('lain');
+        expect(mockStartCharacterServer.mock.calls[0]?.[0]?.peers).toEqual(expected);
+        warn.restore();
+      });
+
+      it('accepts a well-formed array (happy path pinned)', async () => {
+        const peers = [
+          { id: 'a', name: 'A', url: 'http://a' },
+          { id: 'b', name: 'B', url: 'http://b' },
+        ];
+        process.env['PEER_CONFIG'] = JSON.stringify(peers);
+        await startCharacterById('lain');
+        expect(mockStartCharacterServer.mock.calls[0]?.[0]?.peers).toEqual(peers);
+        expect(mockGetPeersFor).not.toHaveBeenCalled();
+      });
     });
   });
 
@@ -731,23 +820,26 @@ describe('Gateway command behavioral', () => {
       processOnSpy.mockRestore();
     });
 
-    it('initializes agents from config.agents array', async () => {
+    it('initializes exactly one agent from characters manifest (P2:171)', async () => {
+      // findings.md P2:171 — gateway serves a single character. Agent
+      // runtime is single-tenant (see agent/index.ts:167-176); the
+      // legacy `for (const a of config.agents) initAgent(a)` loop was
+      // only ever safe because config.agents had one entry. Now the
+      // gateway resolves LAIN_GATEWAY_AGENT_ID → first manifest entry.
       mockGetServerPid.mockResolvedValueOnce(null);
-      const agents = [
-        { id: 'agent1', name: 'Agent 1', enabled: true, workspace: '/tmp' },
-        { id: 'agent2', name: 'Agent 2', enabled: true, workspace: '/tmp' },
-      ];
       mockLoadConfig.mockResolvedValue({
         version: '0.1.0',
-        agents,
         gateway: { socketPath: '/tmp/.lain/lain.sock' },
         security: { requireAuth: true, maxMessageLength: 4096, keyDerivation: {} },
         logging: {},
       });
+      mockGetAllCharacters.mockReturnValueOnce([
+        { id: 'alice', name: 'Alice', port: 3000, server: 'character', defaultLocation: 'bar', workspace: '/tmp' },
+      ]);
       const processOnSpy = vi.spyOn(process, 'on').mockImplementation((() => process) as any);
 
       await startGateway();
-      expect(mockInitAgent).toHaveBeenCalledTimes(2);
+      expect(mockInitAgent).toHaveBeenCalledTimes(1);
 
       processOnSpy.mockRestore();
     });
@@ -1051,6 +1143,79 @@ describe('Gateway command behavioral', () => {
 
       vi.useRealTimers();
     });
+
+    // findings.md P2:115 — the old code slept exactly 1000 ms and then
+    // checked once. On cold boxes (DB init, keychain unlock, slow disk)
+    // the daemon is still coming up past the 1 s window and the parent
+    // falsely reports "Failed to start daemon". Verify the startup
+    // check now polls until the pid file appears.
+    describe('cold-boot startup polling (findings.md P2:115)', () => {
+      it('waits past 1s and then succeeds when pid file appears later', async () => {
+        vi.useFakeTimers();
+        // gateway not already running, and the daemon takes a while to write its pid
+        mockGetServerPid
+          .mockResolvedValueOnce(null) // initial "already running?" check
+          .mockResolvedValueOnce(null) // poll 1
+          .mockResolvedValueOnce(null) // poll 2
+          .mockResolvedValueOnce(null) // poll 3
+          .mockResolvedValueOnce(null) // poll 4
+          .mockResolvedValueOnce(null) // poll 5
+          .mockResolvedValueOnce(9999); // poll 6 — ~1.2 s in
+        mockIsProcessRunning.mockReturnValue(true);
+        const console_ = captureConsole();
+
+        const p = startDaemon();
+        await vi.runAllTimersAsync();
+        await p;
+
+        expect(console_.output()).toContain('9999');
+        expect(console_.output().toLowerCase()).not.toContain('failed to start');
+
+        console_.restore();
+        vi.useRealTimers();
+      });
+
+      it('rejects with timeout-shaped error when the daemon never appears', async () => {
+        vi.useFakeTimers();
+        mockGetServerPid.mockResolvedValue(null);
+        mockIsProcessRunning.mockReturnValue(false);
+        const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+        const console_ = captureConsole();
+
+        const p = startDaemon();
+        await vi.runAllTimersAsync();
+        await p;
+
+        expect(exit).toHaveBeenCalledWith(1);
+        expect(console_.output().toLowerCase()).toMatch(/failed to start daemon.*no pid/);
+
+        console_.restore();
+        exit.mockRestore();
+        vi.useRealTimers();
+      });
+
+      it('respects LAIN_DAEMON_STARTUP_TIMEOUT_MS override (early failure)', async () => {
+        vi.useFakeTimers();
+        const saved = process.env['LAIN_DAEMON_STARTUP_TIMEOUT_MS'];
+        process.env['LAIN_DAEMON_STARTUP_TIMEOUT_MS'] = '200';
+        mockGetServerPid.mockResolvedValue(null);
+        mockIsProcessRunning.mockReturnValue(false);
+        const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+        const console_ = captureConsole();
+
+        const p = startDaemon();
+        await vi.runAllTimersAsync();
+        await p;
+
+        expect(console_.output()).toContain('200ms');
+
+        console_.restore();
+        exit.mockRestore();
+        if (saved === undefined) delete process.env['LAIN_DAEMON_STARTUP_TIMEOUT_MS'];
+        else process.env['LAIN_DAEMON_STARTUP_TIMEOUT_MS'] = saved;
+        vi.useRealTimers();
+      });
+    });
   });
 
   describe('CLI program gateway sub-commands', () => {
@@ -1174,10 +1339,17 @@ describe('Status command behavioral', () => {
       console_.restore();
     });
 
-    it('shows agent count from config', async () => {
+    it('shows character count from characters.json manifest (P2:171)', async () => {
+      // findings.md P2:171 — the character/agent count is sourced from
+      // characters.json, not the removed config.agents[] field.
+      mockGetManifestPath.mockReturnValueOnce('/cwd/characters.json');
+      mockGetAllCharacters.mockReturnValueOnce([
+        { id: 'a', name: 'A', port: 3001, workspace: 'workspace/characters/a' },
+        { id: 'b', name: 'B', port: 3002, workspace: 'workspace/characters/b' },
+        { id: 'c', name: 'C', port: 3003, workspace: 'workspace/characters/c' },
+      ]);
       mockLoadConfig.mockResolvedValue({
         version: '1.0',
-        agents: [{ id: 'a' }, { id: 'b' }, { id: 'c' }],
         security: { requireAuth: false },
       });
       const console_ = captureConsole();
@@ -1344,6 +1516,89 @@ describe('Status command behavioral', () => {
       const console_ = captureConsole();
       await status();
       expect(console_.output()).toContain('Summary');
+      console_.restore();
+    });
+  });
+
+  // findings.md P2:78 — status used to report agent count from
+  // lain.json5 and workspace files from the legacy single-user
+  // `~/.lain/workspace/` path. Both diverged from reality in multi-char
+  // towns. When a characters.json is present, status should report from
+  // the manifest + per-character workspace layout instead.
+  describe('multi-char reporting (findings.md P2:78)', () => {
+    afterEach(() => {
+      // Reset to the module-level default. An earlier version reset to `[]`,
+      // which permanently blanked the character list for every test after
+      // this describe block — breaking gateway/telegram tests downstream.
+      mockGetManifestPath.mockReturnValue(null);
+      mockGetAllCharacters.mockReturnValue(DEFAULT_CHARACTER_MOCK);
+    });
+
+    it('reports "Characters (manifest)" count instead of lain.json5 agent count when manifest present', async () => {
+      mockGetManifestPath.mockReturnValue('/cwd/characters.json');
+      mockGetAllCharacters.mockReturnValue([
+        { id: 'lain', name: 'Lain', port: 3001, workspace: 'workspace/characters/lain' },
+        { id: 'wired-lain', name: 'Wired Lain', port: 3000, workspace: 'workspace/characters/wired-lain' },
+      ]);
+      const console_ = captureConsole();
+
+      await status();
+      expect(console_.output()).toContain('Characters (manifest)');
+      expect(console_.output()).toContain('/cwd/characters.json');
+
+      console_.restore();
+    });
+
+    it('reports "Layout: Multi-char town" and per-character OK when all files present', async () => {
+      mockGetManifestPath.mockReturnValue('/cwd/characters.json');
+      mockGetAllCharacters.mockReturnValue([
+        { id: 'lain', name: 'Lain', port: 3001, workspace: 'workspace/characters/lain' },
+      ]);
+      mockAccess.mockResolvedValue(undefined);
+      const console_ = captureConsole();
+
+      await status();
+      expect(console_.output()).toContain('Multi-char town');
+      expect(console_.output()).toContain('lain');
+      expect(console_.output()).toContain('OK');
+
+      console_.restore();
+    });
+
+    it('reports per-character missing files when a character workspace is incomplete', async () => {
+      mockGetManifestPath.mockReturnValue('/cwd/characters.json');
+      mockGetAllCharacters.mockReturnValue([
+        { id: 'hiru', name: 'Hiru', port: 3005, workspace: 'workspace/characters/hiru' },
+      ]);
+      mockAccess.mockImplementation((path: string) => {
+        if (path.includes('SOUL.md')) return Promise.reject(new Error('ENOENT'));
+        return Promise.resolve(undefined);
+      });
+      const console_ = captureConsole();
+
+      await status();
+      expect(console_.output()).toContain('hiru');
+      expect(console_.output()).toContain('missing SOUL.md');
+
+      console_.restore();
+    });
+
+    it('shows "Not found — add characters.json" and legacy workspace view when no manifest (P2:171)', async () => {
+      // findings.md P2:171 — legacy `config.agents[]` fallback was removed.
+      // When no manifest exists, status shows the single-user workspace
+      // layout and prompts the operator to add characters.json.
+      mockGetManifestPath.mockReturnValue(null);
+      mockLoadConfig.mockResolvedValueOnce({
+        version: '1.0',
+        security: { requireAuth: false },
+      });
+      mockAccess.mockResolvedValue(undefined);
+      const console_ = captureConsole();
+
+      await status();
+      expect(console_.output()).toContain('Not found — add characters.json');
+      expect(console_.output()).not.toContain('Multi-char town');
+
       console_.restore();
     });
   });
@@ -1546,6 +1801,23 @@ describe('Onboard command behavioral', () => {
 
       console_.restore();
     });
+
+    // findings.md P2:105 — the old failure hint pointed at
+    // `lain token generate`, which doesn't exist. Verify the new
+    // guidance routes operators back through `lain onboard`.
+    it('does not suggest the nonexistent `lain token generate` subcommand on failure (findings.md P2:105)', async () => {
+      mockInquirerPrompt.mockResolvedValueOnce({ confirmSetup: true, generateToken: true });
+      mockAccess.mockRejectedValue(new Error('ENOENT'));
+      mockGenerateAuthToken.mockRejectedValueOnce(new Error('keychain locked'));
+      const console_ = captureConsole();
+
+      await onboard();
+      const output = console_.output();
+      expect(output).not.toContain('lain token generate');
+      expect(output.toLowerCase()).toContain('lain onboard');
+
+      console_.restore();
+    });
   });
 
   describe('next steps output', () => {
@@ -1628,6 +1900,65 @@ describe('Onboard command behavioral', () => {
       expect(console_.output()).toContain('present day');
 
       console_.restore();
+    });
+  });
+
+  // findings.md P2:78 — the old copyWorkspaceFiles() silently skipped
+  // every file (SOUL/AGENTS/IDENTITY.md live under
+  // `workspace/characters/<id>/` in a multi-char town, not at the
+  // workspace/ root) and then reported "Lain is ready", leaving an
+  // empty target. Detect the multi-char layout and point the operator
+  // at SETUP.md instead of silently pretending nothing was needed.
+  describe('multi-char workspace handling (findings.md P2:78)', () => {
+    afterEach(() => {
+      mockGetManifestPath.mockReturnValue(null);
+      mockGetAllCharacters.mockReturnValue(DEFAULT_CHARACTER_MOCK);
+    });
+
+    it('points operators at workspace/characters/<id>/ when a manifest is present', async () => {
+      mockInquirerPrompt.mockResolvedValueOnce({ confirmSetup: true, generateToken: false });
+      mockAccess.mockRejectedValue(new Error('ENOENT'));
+      mockGetManifestPath.mockReturnValue('/cwd/characters.json');
+      mockGetAllCharacters.mockReturnValue([
+        { id: 'lain', name: 'Lain', port: 3001, workspace: 'workspace/characters/lain' },
+      ]);
+      const console_ = captureConsole();
+
+      await onboard();
+      const out = console_.output();
+      expect(out).toContain('workspace/characters/');
+      expect(out).toContain('SETUP.md');
+      expect(out).toContain('Multi-char town detected');
+
+      console_.restore();
+    });
+
+    it('does not copy top-level SOUL.md/AGENTS.md/IDENTITY.md when manifest is present', async () => {
+      mockInquirerPrompt.mockResolvedValueOnce({ confirmSetup: true, generateToken: false });
+      mockAccess.mockRejectedValue(new Error('ENOENT'));
+      mockGetManifestPath.mockReturnValue('/cwd/characters.json');
+      mockGetAllCharacters.mockReturnValue([
+        { id: 'lain', name: 'Lain', port: 3001, workspace: 'workspace/characters/lain' },
+      ]);
+
+      await onboard();
+      // The legacy copy path tried to copyFile from sourceWorkspace/SOUL.md
+      // etc. With a manifest present, we skip that entire path.
+      expect(mockCopyFile).not.toHaveBeenCalled();
+    });
+
+    it('keeps legacy copy behaviour when no manifest is present', async () => {
+      mockInquirerPrompt.mockResolvedValueOnce({ confirmSetup: true, generateToken: false });
+      // Source workspace files exist; target workspace files don't.
+      mockAccess.mockImplementation((path: string) => {
+        if (path.includes('/tmp/.lain/workspace')) return Promise.reject(new Error('ENOENT'));
+        return Promise.resolve(undefined);
+      });
+      mockGetManifestPath.mockReturnValue(null);
+
+      await onboard();
+      // Legacy path calls copyFile for each source file that exists.
+      expect(mockCopyFile).toHaveBeenCalled();
     });
   });
 });
@@ -1852,6 +2183,194 @@ describe('Doctor command behavioral', () => {
       exit.mockRestore();
       process.env['ANTHROPIC_API_KEY'] = original ?? 'test-key';
     });
+
+    // findings.md P2:90 — the old check looked at ANTHROPIC_API_KEY only,
+    // misleading operators who picked OpenAI or Google as their primary
+    // provider. Verify all three keys are surfaced.
+    it('surfaces OPENAI_API_KEY when set (findings.md P2:90)', async () => {
+      const anth = process.env['ANTHROPIC_API_KEY'];
+      const oai = process.env['OPENAI_API_KEY'];
+      delete process.env['ANTHROPIC_API_KEY'];
+      process.env['OPENAI_API_KEY'] = 'sk-openai';
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output()).toContain('OPENAI_API_KEY');
+
+      console_.restore();
+      exit.mockRestore();
+      if (anth !== undefined) process.env['ANTHROPIC_API_KEY'] = anth;
+      if (oai === undefined) delete process.env['OPENAI_API_KEY'];
+      else process.env['OPENAI_API_KEY'] = oai;
+    });
+
+    it('warns when no provider key is set', async () => {
+      const saved = {
+        a: process.env['ANTHROPIC_API_KEY'],
+        o: process.env['OPENAI_API_KEY'],
+        g: process.env['GOOGLE_API_KEY'],
+      };
+      delete process.env['ANTHROPIC_API_KEY'];
+      delete process.env['OPENAI_API_KEY'];
+      delete process.env['GOOGLE_API_KEY'];
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output().toLowerCase()).toContain('no llm provider');
+
+      console_.restore();
+      exit.mockRestore();
+      if (saved.a !== undefined) process.env['ANTHROPIC_API_KEY'] = saved.a;
+      if (saved.o !== undefined) process.env['OPENAI_API_KEY'] = saved.o;
+      if (saved.g !== undefined) process.env['GOOGLE_API_KEY'] = saved.g;
+    });
+  });
+
+  // findings.md P2:90 — doctor used to miss the three most common
+  // "town won't start" misconfigs: missing/invalid characters.json and
+  // unset interlink/owner tokens.
+  describe('town manifest + tokens check (findings.md P2:90)', () => {
+    beforeEach(() => {
+      mockExistsSync.mockReturnValue(true);
+      mockReadFileSync.mockReturnValue(
+        JSON.stringify({ characters: [{ id: 'lain', name: 'Lain', port: 3001 }] }),
+      );
+    });
+
+    it('passes when characters.json is present and has at least one character', async () => {
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output()).toContain('Characters manifest');
+      expect(console_.output()).toContain('[green]');
+
+      console_.restore();
+      exit.mockRestore();
+    });
+
+    it('fails (exit 1) when characters.json is missing', async () => {
+      mockExistsSync.mockReturnValue(false);
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output()).toContain('characters.json not found');
+      expect(exit).toHaveBeenCalledWith(1);
+
+      console_.restore();
+      exit.mockRestore();
+    });
+
+    it('fails when characters.json is unparseable', async () => {
+      mockReadFileSync.mockReturnValue('{not json');
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output().toLowerCase()).toContain('characters.json invalid');
+      expect(exit).toHaveBeenCalledWith(1);
+
+      console_.restore();
+      exit.mockRestore();
+    });
+
+    it('fails when characters.json has no characters array', async () => {
+      mockReadFileSync.mockReturnValue(JSON.stringify({ town: { name: 'x' } }));
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output().toLowerCase()).toContain('no `characters` array');
+      expect(exit).toHaveBeenCalledWith(1);
+
+      console_.restore();
+      exit.mockRestore();
+    });
+
+    it('fails when characters.json has an empty characters array', async () => {
+      mockReadFileSync.mockReturnValue(JSON.stringify({ characters: [] }));
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output().toLowerCase()).toContain('empty characters[]');
+      expect(exit).toHaveBeenCalledWith(1);
+
+      console_.restore();
+      exit.mockRestore();
+    });
+
+    it('warns (does not fail) when LAIN_INTERLINK_TOKEN is unset', async () => {
+      const saved = process.env['LAIN_INTERLINK_TOKEN'];
+      delete process.env['LAIN_INTERLINK_TOKEN'];
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output()).toContain('LAIN_INTERLINK_TOKEN');
+
+      console_.restore();
+      exit.mockRestore();
+      if (saved !== undefined) process.env['LAIN_INTERLINK_TOKEN'] = saved;
+    });
+
+    it('reports LAIN_INTERLINK_TOKEN as set when present', async () => {
+      const saved = process.env['LAIN_INTERLINK_TOKEN'];
+      process.env['LAIN_INTERLINK_TOKEN'] = 'abc';
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output()).toMatch(/\[green\].*LAIN_INTERLINK_TOKEN/);
+
+      console_.restore();
+      exit.mockRestore();
+      if (saved === undefined) delete process.env['LAIN_INTERLINK_TOKEN'];
+      else process.env['LAIN_INTERLINK_TOKEN'] = saved;
+    });
+
+    it('warns (does not fail) when LAIN_OWNER_TOKEN is unset', async () => {
+      const saved = process.env['LAIN_OWNER_TOKEN'];
+      delete process.env['LAIN_OWNER_TOKEN'];
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output()).toContain('LAIN_OWNER_TOKEN');
+
+      console_.restore();
+      exit.mockRestore();
+      if (saved !== undefined) process.env['LAIN_OWNER_TOKEN'] = saved;
+    });
+
+    it('reports LAIN_OWNER_TOKEN as set when present', async () => {
+      const saved = process.env['LAIN_OWNER_TOKEN'];
+      process.env['LAIN_OWNER_TOKEN'] = 'xyz';
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output()).toMatch(/\[green\].*LAIN_OWNER_TOKEN/);
+
+      console_.restore();
+      exit.mockRestore();
+      if (saved === undefined) delete process.env['LAIN_OWNER_TOKEN'];
+      else process.env['LAIN_OWNER_TOKEN'] = saved;
+    });
+
+    it('displays Town section header', async () => {
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output()).toContain('Town');
+
+      console_.restore();
+      exit.mockRestore();
+    });
   });
 
   describe('summary', () => {
@@ -1943,6 +2462,117 @@ describe('Doctor command behavioral', () => {
       const console_ = captureConsole();
       await doctor();
       expect(console_.output()).toContain('Environment');
+      console_.restore();
+      exit.mockRestore();
+    });
+  });
+
+  // findings.md P2:78 — checkWorkspace used to look only at the legacy
+  // single-user `~/.lain/workspace/{SOUL,AGENTS,IDENTITY}.md` layout, so
+  // every healthy town install (which uses `workspace/characters/<id>/`)
+  // got "Workspace not initialized". Verify the new multi-char aware
+  // branch reports per-character status when a manifest is present, and
+  // that the legacy fallback still works when it isn't.
+  describe('multi-char workspace check (findings.md P2:78)', () => {
+    afterEach(() => {
+      mockGetManifestPath.mockReturnValue(null);
+      mockGetAllCharacters.mockReturnValue(DEFAULT_CHARACTER_MOCK);
+    });
+
+    it('passes when every character workspace has all three files', async () => {
+      mockGetManifestPath.mockReturnValue('/cwd/characters.json');
+      mockGetAllCharacters.mockReturnValue([
+        { id: 'lain', name: 'Lain', port: 3001, workspace: 'workspace/characters/lain' },
+        { id: 'wired-lain', name: 'Wired Lain', port: 3000, workspace: 'workspace/characters/wired-lain' },
+      ]);
+      mockAccess.mockResolvedValue(undefined);
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output()).toContain('Multi-char workspace OK');
+      expect(console_.output()).toContain('2 characters');
+
+      console_.restore();
+      exit.mockRestore();
+    });
+
+    it('checks each character workspace under <cwd>/<entry.workspace>/', async () => {
+      mockGetManifestPath.mockReturnValue('/cwd/characters.json');
+      mockGetAllCharacters.mockReturnValue([
+        { id: 'lain', name: 'Lain', port: 3001, workspace: 'workspace/characters/lain' },
+      ]);
+      mockAccess.mockResolvedValue(undefined);
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+
+      await doctor();
+      const accessPaths = mockAccess.mock.calls.map((c: any[]) => String(c[0]));
+      expect(
+        accessPaths.some((p) => p.includes('workspace/characters/lain') && p.includes('SOUL.md')),
+      ).toBe(true);
+      expect(
+        accessPaths.some((p) => p.includes('workspace/characters/lain') && p.includes('AGENTS.md')),
+      ).toBe(true);
+      expect(
+        accessPaths.some((p) => p.includes('workspace/characters/lain') && p.includes('IDENTITY.md')),
+      ).toBe(true);
+
+      exit.mockRestore();
+    });
+
+    it('fails (exit 1) with per-character file list when a character workspace is missing files', async () => {
+      mockGetManifestPath.mockReturnValue('/cwd/characters.json');
+      mockGetAllCharacters.mockReturnValue([
+        { id: 'lain', name: 'Lain', port: 3001, workspace: 'workspace/characters/lain' },
+        { id: 'hiru', name: 'Hiru', port: 3005, workspace: 'workspace/characters/hiru' },
+      ]);
+      mockAccess.mockImplementation((path: string) => {
+        // hiru is missing AGENTS.md; everyone else is fine
+        if (path.includes('hiru') && path.includes('AGENTS.md')) {
+          return Promise.reject(new Error('ENOENT'));
+        }
+        return Promise.resolve(undefined);
+      });
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output()).toContain('hiru');
+      expect(console_.output()).toContain('AGENTS.md');
+      expect(exit).toHaveBeenCalledWith(1);
+
+      console_.restore();
+      exit.mockRestore();
+    });
+
+    it('fails (exit 1) when manifest lists zero characters', async () => {
+      mockGetManifestPath.mockReturnValue('/cwd/characters.json');
+      mockGetAllCharacters.mockReturnValue([]);
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      expect(console_.output().toLowerCase()).toContain('0 characters');
+      expect(exit).toHaveBeenCalledWith(1);
+
+      console_.restore();
+      exit.mockRestore();
+    });
+
+    it('falls back to legacy workspace check when no manifest is present', async () => {
+      mockGetManifestPath.mockReturnValue(null);
+      mockAccess.mockResolvedValue(undefined);
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+      const console_ = captureConsole();
+
+      await doctor();
+      // Legacy path checks the single-user workspace directly.
+      const accessPaths = mockAccess.mock.calls.map((c: any[]) => String(c[0]));
+      expect(
+        accessPaths.some((p) => p.includes('/tmp/.lain/workspace') && p.includes('SOUL.md')),
+      ).toBe(true);
+      expect(console_.output().toLowerCase()).not.toContain('multi-char');
+
       console_.restore();
       exit.mockRestore();
     });
@@ -2199,6 +2829,64 @@ describe('Telegram command behavioral', () => {
       console_.restore();
     });
   });
+
+  // findings.md P2:125 — the old code hard-coded `agentId: 'default'`,
+  // which silently broke the bot on any install whose first agent id
+  // was not literally 'default'.
+  describe('agentId derivation (findings.md P2:125)', () => {
+    beforeEach(() => {
+      process.env['TELEGRAM_BOT_TOKEN'] = 'bot-token-123';
+      process.env['TELEGRAM_CHAT_ID'] = '999888';
+    });
+
+    afterEach(() => {
+      delete process.env['LAIN_TELEGRAM_AGENT_ID'];
+    });
+
+    it('uses LAIN_TELEGRAM_AGENT_ID when set', async () => {
+      process.env['LAIN_TELEGRAM_AGENT_ID'] = 'wired-lain';
+      vi.spyOn(process, 'on').mockImplementation((() => process) as any);
+      const { TelegramChannel } = await import('../src/channels/telegram.js');
+
+      await Promise.race([startTelegram(), new Promise<void>(r => setTimeout(r, 10))]);
+
+      expect(TelegramChannel).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: 'wired-lain' }),
+      );
+    });
+
+    it('falls back to first manifest character when env is unset (P2:171)', async () => {
+      // findings.md P2:171 — telegram now reads the agent from the
+      // characters.json manifest, not from config.agents[].
+      mockGetAllCharacters.mockReturnValueOnce([
+        { id: 'lain', name: 'Lain', port: 3001, server: 'character', defaultLocation: 'bar', workspace: '/tmp' },
+      ]);
+      vi.spyOn(process, 'on').mockImplementation((() => process) as any);
+      const { TelegramChannel } = await import('../src/channels/telegram.js');
+
+      await Promise.race([startTelegram(), new Promise<void>(r => setTimeout(r, 10))]);
+
+      expect(TelegramChannel).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: 'lain' }),
+      );
+    });
+
+    it('exits with error when both env and manifest are empty (P2:171)', async () => {
+      mockGetAllCharacters.mockReturnValueOnce([]);
+      const exit = vi.spyOn(process, 'exit').mockImplementation((() => {
+        throw new Error('process.exit(1)');
+      }) as any);
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      await expect(startTelegram()).rejects.toThrow();
+      expect(exit).toHaveBeenCalledWith(1);
+      const joined = errSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+      expect(joined).toMatch(/no characters configured/i);
+
+      errSpy.mockRestore();
+      exit.mockRestore();
+    });
+  });
 });
 
 // =============================================================================
@@ -2329,6 +3017,93 @@ describe('Chat command behavioral', () => {
     });
   });
 
+  describe('chat() auth response validation (findings.md P2:46)', () => {
+    // findings.md P2:46 — the earlier check was `'authenticated' in result`,
+    // which returned true when the gateway replied with
+    // `{ authenticated: false }`. The client then entered chat mode with no
+    // server-side session. Verify the client now checks the VALUE === true
+    // and exits otherwise.
+
+    // NOTE: chat.ts wraps handleResponse in a try/catch that swallows the
+    // synchronous throw from the mocked process.exit. We therefore assert on
+    // exit.exitCalls (the spy's call list) rather than expecting the data
+    // handler to propagate the exit. The real code still calls process.exit(1).
+
+    it('exits when gateway replies { authenticated: false }', async () => {
+      mockGetServerPid.mockResolvedValueOnce(1234);
+      mockIsProcessRunning.mockReturnValueOnce(true);
+      mockGetAuthToken.mockResolvedValueOnce('token');
+
+      const mockSocket = { on: vi.fn(), write: vi.fn(), end: vi.fn() };
+      mockNetConnect.mockReturnValueOnce(mockSocket);
+
+      const exit = mockProcessExit();
+      const console_ = captureConsole();
+
+      const p = chatModule.chat();
+      await new Promise(r => setTimeout(r, 0));
+
+      const dataHandler = mockSocket.on.mock.calls.find((c: any[]) => c[0] === 'data')?.[1];
+      const response = JSON.stringify({ id: '1', result: { authenticated: false } }) + '\n';
+      dataHandler?.(Buffer.from(response));
+      await p.catch(() => {});
+
+      expect(exit.exitCalls).toContain(1);
+      expect(console_.output().toLowerCase()).toContain('authentication failed');
+
+      console_.restore();
+      exit.restore();
+    });
+
+    it('exits when gateway replies with empty result object', async () => {
+      mockGetServerPid.mockResolvedValueOnce(1234);
+      mockIsProcessRunning.mockReturnValueOnce(true);
+      mockGetAuthToken.mockResolvedValueOnce('token');
+
+      const mockSocket = { on: vi.fn(), write: vi.fn(), end: vi.fn() };
+      mockNetConnect.mockReturnValueOnce(mockSocket);
+
+      const exit = mockProcessExit();
+      const console_ = captureConsole();
+
+      const p = chatModule.chat();
+      await new Promise(r => setTimeout(r, 0));
+
+      const dataHandler = mockSocket.on.mock.calls.find((c: any[]) => c[0] === 'data')?.[1];
+      const response = JSON.stringify({ id: '1', result: {} }) + '\n';
+      dataHandler?.(Buffer.from(response));
+      await p.catch(() => {});
+
+      expect(exit.exitCalls).toContain(1);
+      console_.restore();
+      exit.restore();
+    });
+
+    it('exits when result is a non-object', async () => {
+      mockGetServerPid.mockResolvedValueOnce(1234);
+      mockIsProcessRunning.mockReturnValueOnce(true);
+      mockGetAuthToken.mockResolvedValueOnce('token');
+
+      const mockSocket = { on: vi.fn(), write: vi.fn(), end: vi.fn() };
+      mockNetConnect.mockReturnValueOnce(mockSocket);
+
+      const exit = mockProcessExit();
+      const console_ = captureConsole();
+
+      const p = chatModule.chat();
+      await new Promise(r => setTimeout(r, 0));
+
+      const dataHandler = mockSocket.on.mock.calls.find((c: any[]) => c[0] === 'data')?.[1];
+      const response = JSON.stringify({ id: '1', result: 'ok' }) + '\n';
+      dataHandler?.(Buffer.from(response));
+      await p.catch(() => {});
+
+      expect(exit.exitCalls).toContain(1);
+      console_.restore();
+      exit.restore();
+    });
+  });
+
   describe('sendMessage()', () => {
     it('exits if gateway not running', async () => {
       mockGetServerPid.mockResolvedValueOnce(null);
@@ -2384,7 +3159,7 @@ describe('Chat command behavioral', () => {
       mockIsProcessRunning.mockReturnValueOnce(true);
       mockGetAuthToken.mockResolvedValueOnce('my-token');
 
-      const mockSocket = { on: vi.fn(), write: vi.fn(), end: vi.fn() };
+      const mockSocket = { on: vi.fn(), write: vi.fn(), end: vi.fn(), destroy: vi.fn() };
       mockNetConnect.mockReturnValueOnce(mockSocket);
 
       const p = chatModule.sendMessage('hello world');
@@ -2411,237 +3186,111 @@ describe('Chat command behavioral', () => {
       errorHandler?.(new Error('done'));
       await p.catch(() => {});
     });
-  });
-});
 
-// =============================================================================
-// 9. PLUGIN LOADER BEHAVIORAL
-// =============================================================================
-describe('Plugin loader behavioral', () => {
-  let pluginLoader: typeof import('../src/plugins/loader.js');
+    // findings.md P2:56 — before this fix, sendMessage() registered only
+    // data + error listeners and no wall-clock timeout. A gateway that
+    // accepted the socket and then crashed/early-exited left the Promise
+    // hanging indefinitely. Verify both escape hatches now reject.
+    describe('hang protection (findings.md P2:56)', () => {
+      it('registers a close handler on the socket', async () => {
+        mockGetServerPid.mockResolvedValueOnce(1234);
+        mockIsProcessRunning.mockReturnValueOnce(true);
+        mockGetAuthToken.mockResolvedValueOnce('tok');
 
-  const makeManifest = (overrides: Partial<{
-    name: string; version: string; main: string; description: string;
-    tools: string[]; hooks: string[];
-  }> = {}) => JSON.stringify({
-    name: 'test-plugin',
-    version: '1.0.0',
-    main: 'index.js',
-    ...overrides,
-  });
+        const mockSocket = { on: vi.fn(), write: vi.fn(), end: vi.fn(), destroy: vi.fn() };
+        mockNetConnect.mockReturnValueOnce(mockSocket);
 
-  beforeEach(async () => {
-    vi.clearAllMocks();
-    mockRegisteredTools.clear();
-    vi.resetModules();
-    pluginLoader = await import('../src/plugins/loader.js');
-  });
+        const p = chatModule.sendMessage('hi');
+        await new Promise(r => setTimeout(r, 0));
 
-  describe('loadPlugin manifest validation', () => {
-    it('rejects when manifest.json does not exist', async () => {
-      mockAccess.mockRejectedValueOnce(new Error('ENOENT'));
-      await expect(pluginLoader.loadPlugin('/plugins/no-manifest')).rejects.toThrow('manifest not found');
-    });
+        const events = mockSocket.on.mock.calls.map((c: any[]) => c[0]);
+        expect(events).toContain('close');
 
-    it('rejects when manifest is not valid JSON', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce('not json');
-      await expect(pluginLoader.loadPlugin('/plugins/bad-json')).rejects.toThrow();
-    });
+        // unwind
+        const closeHandler = mockSocket.on.mock.calls.find((c: any[]) => c[0] === 'close')?.[1];
+        closeHandler?.();
+        await p.catch(() => {});
+      });
 
-    it('rejects when name is missing', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(JSON.stringify({ version: '1.0', main: 'index.js' }));
-      await expect(pluginLoader.loadPlugin('/p')).rejects.toThrow('Invalid plugin manifest');
-    });
+      it('rejects when the socket closes before a response arrives', async () => {
+        mockGetServerPid.mockResolvedValueOnce(1234);
+        mockIsProcessRunning.mockReturnValueOnce(true);
+        mockGetAuthToken.mockResolvedValueOnce('tok');
 
-    it('rejects when version is missing', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(JSON.stringify({ name: 'test', main: 'index.js' }));
-      await expect(pluginLoader.loadPlugin('/p')).rejects.toThrow('Invalid plugin manifest');
-    });
+        const mockSocket = { on: vi.fn(), write: vi.fn(), end: vi.fn(), destroy: vi.fn() };
+        mockNetConnect.mockReturnValueOnce(mockSocket);
 
-    it('rejects when main is missing', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(JSON.stringify({ name: 'test', version: '1.0' }));
-      await expect(pluginLoader.loadPlugin('/p')).rejects.toThrow('Invalid plugin manifest');
-    });
+        const p = chatModule.sendMessage('hi');
+        await new Promise(r => setTimeout(r, 0));
 
-    it('accepts manifest with only required fields', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(makeManifest());
-      // Will fail at import, but manifest validation passes
-      const err = await pluginLoader.loadPlugin('/p').catch((e: Error) => e);
-      expect((err as Error).message).toContain('Failed to load plugin module');
-    });
+        const closeHandler = mockSocket.on.mock.calls.find((c: any[]) => c[0] === 'close')?.[1];
+        closeHandler?.();
 
-    it('accepts manifest with description and author (optional fields)', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(makeManifest({
-        description: 'A test plugin',
-      }));
-      const err = await pluginLoader.loadPlugin('/p').catch((e: Error) => e);
-      expect((err as Error).message).toContain('Failed to load plugin module');
-    });
+        await expect(p).rejects.toThrow(/gateway closed/i);
+      });
 
-    it('accepts manifest with tools array', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(makeManifest({ tools: ['myTool'] }));
-      const err = await pluginLoader.loadPlugin('/p').catch((e: Error) => e);
-      expect((err as Error).message).toContain('Failed to load plugin module');
-    });
+      it('rejects with timeout when the gateway never responds', async () => {
+        vi.useFakeTimers();
+        const prev = process.env['LAIN_CLI_TIMEOUT_MS'];
+        process.env['LAIN_CLI_TIMEOUT_MS'] = '5000';
+        try {
+          mockGetServerPid.mockResolvedValueOnce(1234);
+          mockIsProcessRunning.mockReturnValueOnce(true);
+          mockGetAuthToken.mockResolvedValueOnce('tok');
 
-    it('accepts manifest with hooks array', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(makeManifest({ hooks: ['onMessage'] }));
-      const err = await pluginLoader.loadPlugin('/p').catch((e: Error) => e);
-      expect((err as Error).message).toContain('Failed to load plugin module');
-    });
-  });
+          const mockSocket = { on: vi.fn(), write: vi.fn(), end: vi.fn(), destroy: vi.fn() };
+          mockNetConnect.mockReturnValueOnce(mockSocket);
 
-  describe('loadPlugin module loading', () => {
-    it('rejects when main module cannot be imported', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(makeManifest({ main: 'nonexistent.js' }));
-      await expect(pluginLoader.loadPlugin('/plugins/bad')).rejects.toThrow('Failed to load plugin module');
-    });
+          const p = chatModule.sendMessage('hi');
+          // Attach a rejection swallower synchronously so the timer-driven
+          // rejection isn't flagged as unhandled when it fires below.
+          const assertion = expect(p).rejects.toThrow(/timed out/i);
 
-    it('error message includes original error info', async () => {
-      mockAccess.mockResolvedValueOnce(undefined);
-      mockReadFile.mockResolvedValueOnce(makeManifest());
-      const err = await pluginLoader.loadPlugin('/plugins/crash').catch((e: Error) => e);
-      expect((err as Error).message).toBeTruthy();
-    });
-  });
+          // Let the async scaffolding settle so the timer is scheduled.
+          await vi.advanceTimersByTimeAsync(0);
+          await vi.advanceTimersByTimeAsync(5001);
 
-  describe('plugin state management', () => {
-    it('getPlugin returns undefined for unknown plugin', () => {
-      expect(pluginLoader.getPlugin('nonexistent')).toBeUndefined();
-    });
+          expect(mockSocket.destroy).toHaveBeenCalled();
+          await assertion;
+        } finally {
+          if (prev === undefined) delete process.env['LAIN_CLI_TIMEOUT_MS'];
+          else process.env['LAIN_CLI_TIMEOUT_MS'] = prev;
+          vi.useRealTimers();
+        }
+      });
 
-    it('getAllPlugins starts empty', () => {
-      expect(pluginLoader.getAllPlugins()).toEqual([]);
-    });
+      it('does not reject after a successful response (close/timeout are no-ops post-resolve)', async () => {
+        mockGetServerPid.mockResolvedValueOnce(1234);
+        mockIsProcessRunning.mockReturnValueOnce(true);
+        mockGetAuthToken.mockResolvedValueOnce('tok');
 
-    it('getEnabledPlugins starts empty', () => {
-      expect(pluginLoader.getEnabledPlugins()).toEqual([]);
-    });
+        const mockSocket = { on: vi.fn(), write: vi.fn(), end: vi.fn(), destroy: vi.fn() };
+        mockNetConnect.mockReturnValueOnce(mockSocket);
 
-    it('enablePlugin throws for unknown plugin', async () => {
-      await expect(pluginLoader.enablePlugin('ghost')).rejects.toThrow('Plugin not found');
-    });
+        const console_ = captureConsole();
+        const p = chatModule.sendMessage('hi');
+        await new Promise(r => setTimeout(r, 0));
 
-    it('disablePlugin throws for unknown plugin', async () => {
-      await expect(pluginLoader.disablePlugin('ghost')).rejects.toThrow('Plugin not found');
-    });
+        const dataHandler = mockSocket.on.mock.calls.find((c: any[]) => c[0] === 'data')?.[1];
+        // Auth success
+        dataHandler?.(
+          Buffer.from(JSON.stringify({ id: '1', result: { authenticated: true } }) + '\n'),
+        );
+        // Chat response
+        dataHandler?.(
+          Buffer.from(JSON.stringify({ id: '2', result: { response: 'ok' } }) + '\n'),
+        );
 
-    it('unloadPlugin is a no-op for unknown plugin', async () => {
-      await expect(pluginLoader.unloadPlugin('ghost')).resolves.toBeUndefined();
-    });
-  });
+        // Now fire close + wait; Promise must have already resolved.
+        const closeHandler = mockSocket.on.mock.calls.find((c: any[]) => c[0] === 'close')?.[1];
+        closeHandler?.();
 
-  describe('loadPluginsFromDirectory', () => {
-    it('returns empty array when directory does not exist', async () => {
-      mockReaddir.mockRejectedValueOnce(new Error('ENOENT'));
-      const result = await pluginLoader.loadPluginsFromDirectory('/no-dir');
-      expect(result).toEqual([]);
-    });
-
-    it('returns empty array for empty directory', async () => {
-      mockReaddir.mockResolvedValueOnce([]);
-      const result = await pluginLoader.loadPluginsFromDirectory('/empty');
-      expect(result).toEqual([]);
-    });
-
-    it('skips non-directory entries', async () => {
-      mockReaddir.mockResolvedValueOnce([
-        { name: 'file.js', isDirectory: () => false },
-        { name: '.DS_Store', isDirectory: () => false },
-      ]);
-      const result = await pluginLoader.loadPluginsFromDirectory('/plugins');
-      expect(result).toEqual([]);
-    });
-
-    it('tries to load each directory entry as a plugin', async () => {
-      mockReaddir.mockResolvedValueOnce([
-        { name: 'plugin-a', isDirectory: () => true },
-        { name: 'plugin-b', isDirectory: () => true },
-      ]);
-      // Both will fail because no manifest
-      mockAccess.mockRejectedValue(new Error('ENOENT'));
-
-      const result = await pluginLoader.loadPluginsFromDirectory('/plugins');
-      expect(result).toEqual([]);
-      // access should have been called for each plugin's manifest
-      expect(mockAccess.mock.calls.length).toBeGreaterThanOrEqual(2);
-    });
-
-    it('continues loading after one plugin fails', async () => {
-      mockReaddir.mockResolvedValueOnce([
-        { name: 'bad-plugin', isDirectory: () => true },
-        { name: 'another-bad', isDirectory: () => true },
-      ]);
-      mockAccess.mockRejectedValue(new Error('ENOENT'));
-
-      const result = await pluginLoader.loadPluginsFromDirectory('/plugins');
-      expect(result).toHaveLength(0);
-      // Should have attempted both
-      expect(mockAccess.mock.calls.length).toBeGreaterThanOrEqual(2);
-    });
-
-    it('passes correct directory path to readdir', async () => {
-      mockReaddir.mockResolvedValueOnce([]);
-      await pluginLoader.loadPluginsFromDirectory('/my/plugins/dir');
-      expect(mockReaddir).toHaveBeenCalledWith('/my/plugins/dir', expect.any(Object));
-    });
-
-    it('handles permission error on directory', async () => {
-      mockReaddir.mockRejectedValueOnce(new Error('EACCES'));
-      const result = await pluginLoader.loadPluginsFromDirectory('/restricted');
-      expect(result).toEqual([]);
-    });
-  });
-
-  describe('hook runners', () => {
-    it('runMessageHooks returns input unchanged when no plugins', async () => {
-      const msg = { text: 'hello' };
-      const result = await pluginLoader.runMessageHooks(msg);
-      expect(result).toBe(msg);
-    });
-
-    it('runResponseHooks returns input unchanged when no plugins', async () => {
-      const resp = { data: [1, 2, 3] };
-      const result = await pluginLoader.runResponseHooks(resp);
-      expect(result).toBe(resp);
-    });
-
-    it('runMessageHooks passes through null', async () => {
-      expect(await pluginLoader.runMessageHooks(null)).toBeNull();
-    });
-
-    it('runMessageHooks passes through numbers', async () => {
-      expect(await pluginLoader.runMessageHooks(42)).toBe(42);
-    });
-
-    it('runMessageHooks passes through strings', async () => {
-      expect(await pluginLoader.runMessageHooks('test')).toBe('test');
-    });
-
-    it('runResponseHooks passes through null', async () => {
-      expect(await pluginLoader.runResponseHooks(null)).toBeNull();
-    });
-
-    it('runResponseHooks passes through empty array', async () => {
-      const arr: never[] = [];
-      expect(await pluginLoader.runResponseHooks(arr)).toBe(arr);
-    });
-
-    it('runResponseHooks passes through undefined', async () => {
-      expect(await pluginLoader.runResponseHooks(undefined)).toBeUndefined();
+        await expect(p).resolves.toBeUndefined();
+        console_.restore();
+      });
     });
   });
 });
-
 // =============================================================================
 // 10. CLI PROMPTS UTILITY BEHAVIORAL
 // =============================================================================

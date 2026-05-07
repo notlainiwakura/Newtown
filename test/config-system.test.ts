@@ -52,12 +52,13 @@ describe('Config loader (index.ts)', () => {
   });
 
   it('loadConfig returns defaults when no config file exists', async () => {
+    // findings.md P2:171 — `agents` removed from LainConfig.
     const { loadConfig } = await import('../src/config/index.js');
     const config = await loadConfig();
 
     expect(config).toBeDefined();
     expect(config.version).toBe('1');
-    expect(config.agents).toHaveLength(1);
+    expect((config as Record<string, unknown>)['agents']).toBeUndefined();
     expect(config.gateway).toBeDefined();
     expect(config.security).toBeDefined();
     expect(config.logging).toBeDefined();
@@ -98,7 +99,6 @@ describe('Config loader (index.ts)', () => {
     // Defaults for other sections should still exist
     expect(config.gateway).toBeDefined();
     expect(config.security).toBeDefined();
-    expect(config.agents).toHaveLength(1);
   });
 
   it('loadConfig throws on invalid config in file', async () => {
@@ -188,10 +188,11 @@ describe('Default config (defaults.ts)', () => {
     expect(config.version).toBe('1');
   });
 
-  it('default provider count is 3 (personality, memory, light)', async () => {
-    const { getDefaultConfig } = await import('../src/config/index.js');
-    const config = getDefaultConfig();
-    expect(config.agents[0]!.providers).toHaveLength(3);
+  it('DEFAULT_PROVIDERS has 3 tiers (personality, memory, light)', async () => {
+    // findings.md P2:171 — providers now live in characters.json entries;
+    // DEFAULT_PROVIDERS is the fallback chain when none are declared.
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    expect(DEFAULT_PROVIDERS).toHaveLength(3);
   });
 
   it('default security requires auth', async () => {
@@ -212,10 +213,10 @@ describe('Default config (defaults.ts)', () => {
     expect(config.security.tokenLength).toBe(32);
   });
 
-  it('default agent id is "default"', async () => {
-    const { getDefaultConfig } = await import('../src/config/index.js');
-    const config = getDefaultConfig();
-    expect(config.agents[0]!.id).toBe('default');
+  it('DEFAULT_PROVIDERS first tier uses claude-sonnet-4-6', async () => {
+    // findings.md P2:171 — replaces the old `config.agents[0].id === 'default'` check.
+    const { DEFAULT_PROVIDERS } = await import('../src/config/defaults.js');
+    expect(DEFAULT_PROVIDERS[0]!.model).toBe('claude-sonnet-4-6');
   });
 
   it('default logging level is "info"', async () => {
@@ -288,73 +289,101 @@ describe('Schema validation (schema.ts)', () => {
     expect(validate(config)).toBe(true);
   });
 
-  it('rejects invalid agent IDs with uppercase', async () => {
-    const { getDefaultConfig, validate } = await import('../src/config/index.js');
-    const config = getDefaultConfig();
-    config.agents[0]!.id = 'InvalidUpperCase';
-    expect(() => validate(config)).toThrow();
+  // findings.md P2:171 — agent-id / provider schema checks moved from
+  // LainConfig to the character manifest. The tests below exercise
+  // validateManifest in place of the old validate(config).agents[...] cases.
+
+  function baseManifest(entry: Record<string, unknown>) {
+    return {
+      town: { name: 'Test', description: 'test town' },
+      characters: [entry],
+    };
+  }
+
+  it('manifest rejects character IDs with uppercase', async () => {
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    const manifest = baseManifest({
+      id: 'InvalidUpperCase', name: 'X', port: 3000, server: 'character',
+      defaultLocation: 'bar', workspace: 'workspace/characters/x',
+    });
+    expect(() => validateManifest(manifest, 'test')).toThrow();
   });
 
-  it('rejects invalid agent IDs with spaces', async () => {
-    const { getDefaultConfig, validate } = await import('../src/config/index.js');
-    const config = getDefaultConfig();
-    config.agents[0]!.id = 'has space';
-    expect(() => validate(config)).toThrow();
+  it('manifest rejects character IDs with spaces', async () => {
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    const manifest = baseManifest({
+      id: 'has space', name: 'X', port: 3000, server: 'character',
+      defaultLocation: 'bar', workspace: 'workspace/characters/x',
+    });
+    expect(() => validateManifest(manifest, 'test')).toThrow();
   });
 
-  it('rejects invalid agent IDs with special characters', async () => {
-    const { getDefaultConfig, validate } = await import('../src/config/index.js');
-    const config = getDefaultConfig();
-    config.agents[0]!.id = 'agent@name!';
-    expect(() => validate(config)).toThrow();
+  it('manifest rejects character IDs with special characters', async () => {
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    const manifest = baseManifest({
+      id: 'agent@name!', name: 'X', port: 3000, server: 'character',
+      defaultLocation: 'bar', workspace: 'workspace/characters/x',
+    });
+    expect(() => validateManifest(manifest, 'test')).toThrow();
   });
 
-  it('accepts valid agent IDs with lowercase and hyphens', async () => {
-    const { getDefaultConfig, validate } = await import('../src/config/index.js');
-    const config = getDefaultConfig();
-    config.agents[0]!.id = 'my-agent-01';
-    expect(() => validate(config)).not.toThrow();
+  it('manifest accepts character IDs with lowercase and hyphens', async () => {
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    const manifest = baseManifest({
+      id: 'my-agent-01', name: 'X', port: 3000, server: 'character',
+      defaultLocation: 'bar', workspace: 'workspace/characters/x',
+    });
+    expect(() => validateManifest(manifest, 'test')).not.toThrow();
   });
 
-  it('requires at least 1 provider', async () => {
-    const { getDefaultConfig, validate } = await import('../src/config/index.js');
-    const config = getDefaultConfig();
-    config.agents[0]!.providers = [];
-    expect(() => validate(config)).toThrow();
+  it('manifest requires at least 1 provider when providers is present', async () => {
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    const manifest = baseManifest({
+      id: 'x', name: 'X', port: 3000, server: 'character',
+      defaultLocation: 'bar', workspace: 'workspace/characters/x',
+      providers: [],
+    });
+    expect(() => validateManifest(manifest, 'test')).toThrow();
   });
 
-  it('allows only anthropic/openai/google provider types', async () => {
-    const { getDefaultConfig, validate } = await import('../src/config/index.js');
-    const config = getDefaultConfig();
-    (config.agents[0]!.providers[0] as any).type = 'invalid-provider';
-    expect(() => validate(config)).toThrow();
+  it('manifest rejects unknown provider types', async () => {
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    const manifest = baseManifest({
+      id: 'x', name: 'X', port: 3000, server: 'character',
+      defaultLocation: 'bar', workspace: 'workspace/characters/x',
+      providers: [{ type: 'invalid-provider', model: 'foo' }],
+    });
+    expect(() => validateManifest(manifest, 'test')).toThrow();
   });
 
-  it('allows anthropic provider type', async () => {
-    const { getDefaultConfig, validate } = await import('../src/config/index.js');
-    const config = getDefaultConfig();
-    config.agents[0]!.providers[0]!.type = 'anthropic';
-    expect(() => validate(config)).not.toThrow();
+  it('manifest accepts anthropic provider type', async () => {
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    const manifest = baseManifest({
+      id: 'x', name: 'X', port: 3000, server: 'character',
+      defaultLocation: 'bar', workspace: 'workspace/characters/x',
+      providers: [{ type: 'anthropic', model: 'claude-haiku-4-5-20251001' }],
+    });
+    expect(() => validateManifest(manifest, 'test')).not.toThrow();
   });
 
-  it('allows openai provider type', async () => {
-    const { getDefaultConfig, validate } = await import('../src/config/index.js');
-    const config = getDefaultConfig();
-    config.agents[0]!.providers = [{
-      type: 'openai',
-      model: 'gpt-4',
-    }];
-    expect(() => validate(config)).not.toThrow();
+  it('manifest accepts openai provider type', async () => {
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    const manifest = baseManifest({
+      id: 'x', name: 'X', port: 3000, server: 'character',
+      defaultLocation: 'bar', workspace: 'workspace/characters/x',
+      providers: [{ type: 'openai', model: 'gpt-4' }],
+    });
+    expect(() => validateManifest(manifest, 'test')).not.toThrow();
   });
 
-  it('allows google provider type', async () => {
-    const { getDefaultConfig, validate } = await import('../src/config/index.js');
-    const config = getDefaultConfig();
-    config.agents[0]!.providers = [{
-      type: 'google',
-      model: 'gemini-pro',
-    }];
-    expect(() => validate(config)).not.toThrow();
+  it('manifest accepts google provider type', async () => {
+    const { validateManifest } = await import('../src/config/manifest-schema.js');
+    const manifest = baseManifest({
+      id: 'x', name: 'X', port: 3000, server: 'character',
+      defaultLocation: 'bar', workspace: 'workspace/characters/x',
+      providers: [{ type: 'google', model: 'gemini-pro' }],
+    });
+    expect(() => validateManifest(manifest, 'test')).not.toThrow();
   });
 
   it('enforces minimum token length of 16', async () => {
@@ -378,6 +407,7 @@ describe('Schema validation (schema.ts)', () => {
   });
 
   it('getSchema returns schema object', async () => {
+    // findings.md P2:171 — `agents` is no longer a LainConfig field.
     const { getSchema } = await import('../src/config/index.js');
     const schema = getSchema();
 
@@ -387,8 +417,8 @@ describe('Schema validation (schema.ts)', () => {
     expect(schema.required).toContain('version');
     expect(schema.required).toContain('gateway');
     expect(schema.required).toContain('security');
-    expect(schema.required).toContain('agents');
     expect(schema.required).toContain('logging');
+    expect(schema.required).not.toContain('agents');
   });
 });
 

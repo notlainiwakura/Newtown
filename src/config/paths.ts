@@ -1,15 +1,15 @@
 /**
- * Path resolution utilities for Newtown configuration
+ * Path resolution utilities for Lain configuration
  */
 
 import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
 import type { ConfigPaths } from '../types/config.js';
 
-const NEWTOWN_DIR = '.newtown';
+const DEFAULT_HOME_DIR = '.newtown';
 const CONFIG_FILE = 'newtown.json5';
-const SOCKET_FILE = 'newtown.sock';
-const PID_FILE = 'newtown.pid';
+const SOCKET_FILE = 'gateway.sock';
+const PID_FILE = 'gateway.pid';
 const DATABASE_FILE = 'newtown.db';
 
 function getSocketPath(base: string): string {
@@ -26,17 +26,14 @@ function getSocketPath(base: string): string {
 }
 
 /**
- * Get the base Newtown directory path.
- * `LAIN_HOME` remains supported for explicitly isolated process homes.
+ * Get the base Lain directory path
  */
 export function getBasePath(): string {
-  return process.env['LAIN_HOME']
-    ?? process.env['NEWTOWN_HOME']
-    ?? join(homedir(), NEWTOWN_DIR);
+  return process.env['LAIN_HOME'] ?? process.env['NEWTOWN_HOME'] ?? join(homedir(), DEFAULT_HOME_DIR);
 }
 
 /**
- * Get all standard Newtown paths
+ * Get all standard Lain paths
  */
 export function getPaths(): ConfigPaths {
   const base = getBasePath();

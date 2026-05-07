@@ -20,6 +20,11 @@ export interface WhatsAppConfig extends ChannelConfig {
   authDir: string;
   allowedUsers?: string[];
   allowedGroups?: string[];
+  /**
+   * Opt-in to public mode: when no allowedUsers/allowedGroups are set,
+   * empty allowlists deny all incoming messages unless this is `true`.
+   */
+  public?: boolean;
 }
 
 export class WhatsAppChannel extends BaseChannel {
@@ -27,6 +32,11 @@ export class WhatsAppChannel extends BaseChannel {
   readonly type = 'whatsapp';
   private socket: WASocket | null = null;
   private config: WhatsAppConfig;
+  private reconnectAttempt = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private shuttingDown = false;
+  private static readonly MAX_RECONNECT_DELAY_MS = 5 * 60 * 1000;
+  private static readonly MAX_RECONNECT_ATTEMPTS = 15;
 
   constructor(config: WhatsAppConfig) {
     super();
@@ -42,7 +52,25 @@ export class WhatsAppChannel extends BaseChannel {
       return;
     }
 
+    this.shuttingDown = false;
+
     logger.info({ channelId: this.id }, 'Connecting WhatsApp');
+
+    const emptyAllowlists =
+      !this.config.allowedUsers?.length && !this.config.allowedGroups?.length;
+    if (emptyAllowlists) {
+      if (this.config.public === true) {
+        logger.warn(
+          { channelId: this.id },
+          'WhatsApp channel running in PUBLIC mode — every sender will be allowed',
+        );
+      } else {
+        logger.warn(
+          { channelId: this.id },
+          'WhatsApp channel has empty allowlists and public !== true — all incoming messages will be rejected. Set public: true or populate allowedUsers/allowedGroups.',
+        );
+      }
+    }
 
     // Ensure auth directory exists
     await mkdir(this.config.authDir, { recursive: true });
@@ -72,17 +100,24 @@ export class WhatsAppChannel extends BaseChannel {
 
       if (connection === 'close') {
         const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
+        // Null the socket so connect() will proceed past its early-return
+        // guard on the reconnect attempt.
+        this.socket = null;
 
         if (reason === DisconnectReason.loggedOut) {
           logger.info({ channelId: this.id }, 'WhatsApp logged out');
           this.emitDisconnect();
+        } else if (this.shuttingDown) {
+          logger.info({ channelId: this.id }, 'WhatsApp disconnected during shutdown');
+          this.emitDisconnect();
         } else {
-          logger.warn({ channelId: this.id, reason }, 'WhatsApp disconnected, reconnecting...');
-          // Attempt reconnection
-          setTimeout(() => this.connect(), 5000);
+          logger.warn({ channelId: this.id, reason }, 'WhatsApp disconnected, scheduling reconnect');
+          this.emitDisconnect();
+          this.scheduleReconnect();
         }
       } else if (connection === 'open') {
         logger.info({ channelId: this.id }, 'WhatsApp connected');
+        this.reconnectAttempt = 0;
         this.emitConnect();
       }
     });
@@ -100,8 +135,48 @@ export class WhatsAppChannel extends BaseChannel {
     });
   }
 
+  private scheduleReconnect(): void {
+    const logger = getLogger();
+
+    if (this.shuttingDown) {
+      return;
+    }
+
+    this.reconnectAttempt++;
+    if (this.reconnectAttempt > WhatsAppChannel.MAX_RECONNECT_ATTEMPTS) {
+      logger.error(
+        { channelId: this.id, attempts: this.reconnectAttempt },
+        'WhatsApp max reconnect attempts reached, giving up'
+      );
+      return;
+    }
+
+    const delay = Math.min(
+      1000 * Math.pow(2, this.reconnectAttempt - 1),
+      WhatsAppChannel.MAX_RECONNECT_DELAY_MS
+    );
+    logger.warn(
+      { channelId: this.id, attempt: this.reconnectAttempt, delayMs: delay },
+      'Scheduling WhatsApp reconnect'
+    );
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => {
+      if (this.shuttingDown) return;
+      this.connect().catch((err) => {
+        logger.error({ error: err, channelId: this.id }, 'WhatsApp reconnect failed');
+        this.scheduleReconnect();
+      });
+    }, delay);
+  }
+
   async disconnect(): Promise<void> {
     const logger = getLogger();
+
+    this.shuttingDown = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
 
     if (!this.socket) {
       return;
@@ -160,9 +235,10 @@ export class WhatsAppChannel extends BaseChannel {
   }
 
   private isAllowed(message: IncomingMessage): boolean {
-    // If no restrictions, allow all
+    // Empty allowlists are fail-closed by default. Only allow all when
+    // the operator has explicitly set `public: true`.
     if (!this.config.allowedUsers?.length && !this.config.allowedGroups?.length) {
-      return true;
+      return this.config.public === true;
     }
 
     // Check user whitelist
@@ -194,29 +270,26 @@ export class WhatsAppChannel extends BaseChannel {
     } else if (message.extendedTextMessage?.text) {
       content = { type: 'text', text: message.extendedTextMessage.text } satisfies TextContent;
     } else if (message.imageMessage) {
-      const imageContent: IncomingMessage['content'] = {
-        type: 'image',
-        mimeType: message.imageMessage.mimetype ?? 'image/jpeg',
-      };
-      if (message.imageMessage.caption) {
-        (imageContent as { caption?: string }).caption = message.imageMessage.caption;
-      }
-      content = imageContent;
-    } else if (message.documentMessage) {
+      // findings.md P2:199 — Baileys delivers encrypted media that must be
+      // downloaded via downloadMediaMessage(); we don't plumb those bytes
+      // here, so emit a text placeholder instead of an ImageContent with
+      // no url/base64.
+      const caption = message.imageMessage.caption ? ' ' + message.imageMessage.caption : '';
       content = {
-        type: 'file',
-        mimeType: message.documentMessage.mimetype ?? 'application/octet-stream',
-        filename: message.documentMessage.fileName ?? 'document',
-      };
+        type: 'text',
+        text: '[image attachment]' + caption,
+      } satisfies TextContent;
+    } else if (message.documentMessage) {
+      const filename = message.documentMessage.fileName ?? 'document';
+      content = {
+        type: 'text',
+        text: '[file attachment: ' + filename + ']',
+      } satisfies TextContent;
     } else if (message.audioMessage) {
-      const audioContent: IncomingMessage['content'] = {
-        type: 'audio',
-        mimeType: message.audioMessage.mimetype ?? 'audio/ogg',
-      };
-      if (message.audioMessage.seconds !== undefined) {
-        (audioContent as { duration?: number }).duration = message.audioMessage.seconds;
-      }
-      content = audioContent;
+      content = {
+        type: 'text',
+        text: '[audio attachment]',
+      } satisfies TextContent;
     } else {
       // Unsupported message type
       return null;

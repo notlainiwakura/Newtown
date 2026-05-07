@@ -1,0 +1,79 @@
+#laintown-nav {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 32px;
+  background: var(--bg-deep, #0a0a0f);
+  border-bottom: 1px solid var(--border-glow, #1a1a2e);
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  z-index: 99999;
+  font-family: var(--font-mono, "Share Tech Mono", monospace);
+  padding: 0 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+#laintown-nav::-webkit-scrollbar {
+  display: none;
+}
+
+#laintown-nav .ltn-title {
+  color: var(--accent-primary, #4a9eff);
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  height: 32px;
+  font-size: 11px;
+  letter-spacing: 2px;
+  margin-right: 10px;
+  text-decoration: none;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+#laintown-nav a:not(.ltn-title) {
+  color: var(--text-dim, #556);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  height: 24px;
+  border: 1px solid transparent;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  line-height: 1;
+  padding: 0 9px;
+  text-decoration: none;
+  text-transform: uppercase;
+  transition: background 0.2s, border-color 0.2s, color 0.2s;
+  white-space: nowrap;
+}
+
+#laintown-nav a:not(.ltn-title):hover {
+  color: var(--accent-secondary, #8ab4f8);
+  border-color: color-mix(in srgb, var(--accent-secondary, #8ab4f8) 35%, transparent);
+  background: color-mix(in srgb, var(--accent-secondary, #8ab4f8) 8%, transparent);
+}
+
+#laintown-nav a.ltn-active {
+  color: var(--accent-primary, #4a9eff);
+  border-color: color-mix(in srgb, var(--accent-primary, #4a9eff) 50%, transparent);
+  background: color-mix(in srgb, var(--accent-primary, #4a9eff) 10%, transparent);
+}
+
+#laintown-nav.ltn-game {
+  background: var(--nav-game-bg, rgba(10, 10, 15, 0.6));
+  border-bottom-color: var(--nav-game-border, rgba(26, 26, 46, 0.4));
+}
+
+body.ltn-has-nav {
+  padding-top: 32px !important;
+}
+
+body.ltn-game-nav {
+  padding-top: 0 !important;
+}

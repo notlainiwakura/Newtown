@@ -56,7 +56,6 @@
 | `test/world-coherence.test.ts` | 107 | Behavioral & User Expectation | Town geography, character lifecycle, emotional→weather→behavior loop, desire→movement chain, aliveness |
 | `test/commune.test.ts` | 106 | Commune & Town Systems | Buildings (grid layout, properties), weather (effects, computation, thresholds), location system |
 | `test/e2e.test.ts` | 84 | Integration & Cross-System | DB&storage, web API, interlink letter pipeline, security, tool system, config, loops, providers, deployment |
-| `test/browser-system.test.ts` | 84 | Agent Features & Loops | Browser initialization, page navigation, content extraction, screenshots, resource management, errors |
 | `test/frontend.test.ts` | 83 | Frontend & Game Client | Game config, sprites, APIClient, scenes (Title, Dialog, World, Boot), commune map, dashboard, fixtures |
 | `test/agent-content.test.ts` | 82 | Agent Features & Loops | Diary, dreams, letters, bibliomancy, curiosity, book, town life, feed health, dream seeder, data workspace |
 | `test/agent-features.test.ts` | 78 | Agent Features & Loops | clampState, applyDecay, state save/load, preoccupations, movement desire, awareness, desires, relationships |
@@ -460,17 +459,6 @@ Tests the experiment and possession systems. Covers ExperimentConfig defaults, `
 - Feed Health Loop (constants, startFeedHealthLoop, backup pool, checking logic)
 - Dream Seeder Loop (config, HTTP helpers, fragment sizing)
 - Possession System (start/end, pending messages, auth, SSE clients, timeouts)
-
-**`test/browser-system.test.ts`** — 84 tests
-
-Tests the Playwright-based browser automation system used by the curiosity loop. Covers browser initialization (lazy startup, session reuse), page navigation (load, redirect, timeout, error recovery), content extraction (HTML stripping, article detection, boilerplate removal), screenshot capture, resource management (page pool, cleanup on stop), and error handling.
-
-- Browser Initialization (lazy startup, singleton)
-- Page Navigation (load, redirect, timeout)
-- Content Extraction (HTML stripping, article detection)
-- Screenshot capture
-- Resource Management (page pool, cleanup)
-- Error Handling
 
 **`test/novelty.test.ts`** — 16 tests
 

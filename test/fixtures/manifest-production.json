@@ -1,0 +1,106 @@
+{
+  "town": {
+    "name": "Laintown",
+    "description": "An autonomous AI town"
+  },
+  "characters": [
+    {
+      "id": "wired-lain",
+      "name": "Wired Lain",
+      "port": 3000,
+      "server": "web",
+      "defaultLocation": "wired",
+      "immortal": true,
+      "possessable": false,
+      "workspace": "workspace/characters/wired-lain",
+      "systemdUnit": "lain-wired",
+      "homeDir": "/root/.lain-wired",
+      "allowedTools": [
+        "get_current_time", "calculate", "remember", "recall", "expand_memory",
+        "web_search", "fetch_webpage",
+        "introspect_list", "introspect_read", "introspect_search", "introspect_info",
+        "show_image", "search_images", "fetch_and_show_image", "view_image",
+        "send_message", "telegram_call", "send_letter",
+        "research_request", "send_peer_message", "move_to_building",
+        "leave_note", "write_document", "read_document", "give_gift",
+        "create_object", "examine_objects", "pickup_object", "drop_object",
+        "give_object", "destroy_object", "reflect_on_object", "compose_objects"
+      ]
+    },
+    {
+      "id": "lain",
+      "name": "Lain",
+      "port": 3001,
+      "server": "character",
+      "defaultLocation": "home",
+      "immortal": true,
+      "possessable": false,
+      "workspace": "workspace/characters/lain",
+      "systemdUnit": "lain-main",
+      "homeDir": "/root/.lain",
+      "allowedTools": [
+        "get_current_time", "calculate", "remember", "recall", "expand_memory",
+        "introspect_list", "introspect_read", "introspect_search", "introspect_info",
+        "show_image", "search_images", "fetch_and_show_image", "view_image",
+        "send_message", "telegram_call", "send_letter",
+        "research_request", "send_peer_message", "move_to_building",
+        "leave_note", "write_document", "read_document", "give_gift",
+        "create_object", "examine_objects", "pickup_object", "drop_object",
+        "give_object", "destroy_object", "reflect_on_object", "compose_objects"
+      ]
+    },
+    {
+      "id": "dr-claude",
+      "name": "Dr. Claude",
+      "port": 3002,
+      "server": "character",
+      "defaultLocation": "clinic",
+      "possessable": false,
+      "workspace": "workspace/characters/dr-claude",
+      "role": "oracle"
+    },
+    {
+      "id": "pkd",
+      "name": "Philip K. Dick",
+      "port": 3003,
+      "server": "character",
+      "defaultLocation": "bar",
+      "possessable": false,
+      "workspace": "workspace/characters/pkd",
+      "allowedTools": [
+        "get_current_time", "calculate", "remember", "recall", "expand_memory",
+        "send_letter", "send_peer_message", "move_to_building",
+        "leave_note", "write_document", "read_document", "give_gift",
+        "create_object", "examine_objects", "pickup_object", "drop_object",
+        "give_object", "destroy_object", "reflect_on_object", "compose_objects"
+      ]
+    },
+    {
+      "id": "mckenna",
+      "name": "Terence McKenna",
+      "port": 3004,
+      "server": "character",
+      "defaultLocation": "greenhouse",
+      "possessable": false,
+      "workspace": "workspace/characters/mckenna"
+    },
+    {
+      "id": "john",
+      "name": "John",
+      "port": 3005,
+      "server": "character",
+      "defaultLocation": "diner",
+      "possessable": false,
+      "workspace": "workspace/characters/john"
+    },
+    {
+      "id": "hiru",
+      "name": "Hiru",
+      "port": 3006,
+      "server": "character",
+      "defaultLocation": "park",
+      "possessable": false,
+      "workspace": "workspace/characters/hiru"
+    }
+  ]
+}

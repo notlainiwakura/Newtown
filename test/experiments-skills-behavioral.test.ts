@@ -669,214 +669,15 @@ describe('Experiment execution — analysis parsing', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. SKILL SYSTEM BEHAVIORAL
+// 2. SKILL SYSTEM BEHAVIORAL — REMOVED (findings.md P1:1561)
 // ─────────────────────────────────────────────────────────────────────────────
+// The skill system handed `new Function(...)` + `require` + `process` to
+// LLM-authored code. Module and meta-tools deleted; source-regex regression
+// in test/security-deep.test.ts enforces the removal.
 
-describe('Skill system — saveCustomTool execution', () => {
-  let testDir: string;
-
-  beforeEach(async () => {
-    testDir = join(tmpdir(), `lain-skill-beh-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    await mkdir(testDir, { recursive: true });
-    mockBasePath = testDir;
-  });
-
-  afterEach(async () => {
-    try { await rm(testDir, { recursive: true }); } catch {}
-  });
-
-  it('saves skill JSON to disk and returns true', async () => {
-    const { saveCustomTool } = await import('../src/agent/skills.js');
-    const skill = {
-      name: 'behavioral_test_tool',
-      description: 'A tool that returns hello',
-      inputSchema: { type: 'object' as const, properties: { name: { type: 'string', description: 'Name' } } },
-      code: 'return `hello ${input.name}`;',
-    };
-    const result = await saveCustomTool(skill);
-    expect(result).toBe(true);
-  });
-
-  it('creates the skills/tools directory via mkdir recursive', async () => {
-    // The saveCustomTool function calls mkdir(SKILLS_DIR, { recursive: true })
-    // SKILLS_DIR is computed once at module import from getBasePath()
-    // Verifying the mkdir behavior: recursive: true is idempotent
-    const tempSkillsDir = join(tmpdir(), `lain-mkdir-test-${Date.now()}`);
-    await mkdir(join(tempSkillsDir, 'skills', 'tools'), { recursive: true });
-    expect(existsSync(join(tempSkillsDir, 'skills', 'tools'))).toBe(true);
-    await rm(tempSkillsDir, { recursive: true });
-  });
-
-  it('returns false when name is empty', async () => {
-    const { saveCustomTool } = await import('../src/agent/skills.js');
-    const result = await saveCustomTool({
-      name: '',
-      description: 'test',
-      inputSchema: { type: 'object' as const, properties: {} },
-      code: 'return "ok";',
-    });
-    expect(result).toBe(false);
-  });
-
-  it('returns false when description is empty', async () => {
-    const { saveCustomTool } = await import('../src/agent/skills.js');
-    const result = await saveCustomTool({
-      name: 'no_desc',
-      description: '',
-      inputSchema: { type: 'object' as const, properties: {} },
-      code: 'return "ok";',
-    });
-    expect(result).toBe(false);
-  });
-
-  it('returns false when code is empty', async () => {
-    const { saveCustomTool } = await import('../src/agent/skills.js');
-    const result = await saveCustomTool({
-      name: 'no_code',
-      description: 'test tool',
-      inputSchema: { type: 'object' as const, properties: {} },
-      code: '',
-    });
-    expect(result).toBe(false);
-  });
-
-  it('sanitizes filename with special characters', () => {
-    const name = 'My Cool Tool!@#$';
-    const filename = name.replace(/[^a-z0-9_-]/gi, '_') + '.json';
-    // Spaces and special chars become underscores, then .json is appended
-    expect(filename).toBe('My_Cool_Tool____.json');
-    // No special chars leak through (except . in .json)
-    expect(filename.replace('.json', '')).not.toMatch(/[!@#$ ]/);
-  });
-
-  it('registers tool after saving via registerTool', async () => {
-    const { registerTool } = await import('../src/agent/tools.js');
-    vi.mocked(registerTool).mockClear();
-
-    const { saveCustomTool } = await import('../src/agent/skills.js');
-    await saveCustomTool({
-      name: 'register_test',
-      description: 'test',
-      inputSchema: { type: 'object' as const, properties: {} },
-      code: 'return "registered";',
-    });
-
-    expect(vi.mocked(registerTool)).toHaveBeenCalled();
-  });
-});
-
-describe('Skill system — loadCustomTools logic', () => {
-  it('readdir with no JSON files results in 0 loaded', () => {
-    const files = ['readme.txt', 'notes.md'];
-    const jsonFiles = files.filter(f => f.endsWith('.json'));
-    expect(jsonFiles).toHaveLength(0);
-  });
-
-  it('readdir with JSON files identifies them for loading', () => {
-    const files = ['skill_a.json', 'readme.txt', 'skill_b.json'];
-    const jsonFiles = files.filter(f => f.endsWith('.json'));
-    expect(jsonFiles).toHaveLength(2);
-  });
-
-  it('malformed JSON is caught by JSON.parse', () => {
-    expect(() => JSON.parse('{ invalid json }')).toThrow();
-  });
-
-  it('valid JSON skill parses correctly', () => {
-    const raw = JSON.stringify({
-      name: 'test',
-      description: 'A test',
-      inputSchema: { type: 'object', properties: {} },
-      code: 'return 1;',
-    });
-    const parsed = JSON.parse(raw);
-    expect(parsed.name).toBe('test');
-    expect(parsed.code).toBe('return 1;');
-  });
-});
-
-describe('Skill system — listCustomTools logic', () => {
-  it('mapping removes .json extension from filenames', () => {
-    const files = ['my_tool.json', 'other.json'];
-    const result = files.filter(f => f.endsWith('.json')).map(f => f.replace('.json', ''));
-    expect(result).toContain('my_tool');
-    expect(result).toContain('other');
-    expect(result.every(n => !n.endsWith('.json'))).toBe(true);
-  });
-
-  it('non-JSON files are excluded from listing', () => {
-    const files = ['notes.txt', 'real_skill.json', 'readme.md'];
-    const result = files.filter(f => f.endsWith('.json')).map(f => f.replace('.json', ''));
-    expect(result).not.toContain('notes');
-    expect(result).not.toContain('readme');
-    expect(result).toContain('real_skill');
-  });
-
-  it('empty directory produces empty listing', () => {
-    const files: string[] = [];
-    const result = files.filter(f => f.endsWith('.json')).map(f => f.replace('.json', ''));
-    expect(result).toEqual([]);
-  });
-
-  it('multiple JSON files are all listed', () => {
-    const files = ['a.json', 'b.json', 'c.json'];
-    const result = files.filter(f => f.endsWith('.json')).map(f => f.replace('.json', ''));
-    expect(result).toEqual(['a', 'b', 'c']);
-  });
-});
-
-describe('Skill system — deleteCustomTool execution', () => {
-  it('returns false when trying to delete nonexistent skill', async () => {
-    const { deleteCustomTool } = await import('../src/agent/skills.js');
-    const result = await deleteCustomTool('does_not_exist_xyz_' + Date.now());
-    expect(result).toBe(false);
-  });
-
-  it('delete uses same filename sanitization as save', () => {
-    const name = 'my-tool_v2';
-    const filename = name.replace(/[^a-z0-9_-]/gi, '_') + '.json';
-    expect(filename).toBe('my-tool_v2.json');
-  });
-
-  it('delete of special-char name produces sanitized filename', () => {
-    const name = 'Tool With Spaces!';
-    const filename = name.replace(/[^a-z0-9_-]/gi, '_') + '.json';
-    expect(filename).toBe('Tool_With_Spaces_.json');
-  });
-
-  it('unregisterTool is called by the delete flow', async () => {
-    const { unregisterTool } = await import('../src/agent/tools.js');
-    expect(typeof vi.mocked(unregisterTool)).toBe('function');
-  });
-});
-
-describe('Skill system — schema sanitization', () => {
-  it('removes invalid required from individual properties', () => {
-    const prop = { type: 'string', description: 'A prop', required: true } as Record<string, unknown>;
-    const { required: _r, ...cleaned } = prop;
-    expect(cleaned).not.toHaveProperty('required');
-    expect(cleaned).toHaveProperty('type', 'string');
-    expect(cleaned).toHaveProperty('description', 'A prop');
-  });
-
-  it('preserves schema-level required array', () => {
-    const schema = {
-      type: 'object' as const,
-      properties: { name: { type: 'string', description: 'Name' } },
-      required: ['name'],
-    };
-    expect(schema.required).toEqual(['name']);
-  });
-
-  it('handles empty properties object', () => {
-    const schema = { type: 'object' as const, properties: {} };
-    expect(Object.keys(schema.properties)).toHaveLength(0);
-  });
-
-  it('handles properties with only type and description (no junk)', () => {
-    const prop = { type: 'number', description: 'A count' };
-    const { required: _r, ...cleaned } = prop as Record<string, unknown>;
-    expect(cleaned).toEqual({ type: 'number', description: 'A count' });
+describe('Skill system — removed (findings.md P1:1561)', () => {
+  it('src/agent/skills.js no longer imports', async () => {
+    await expect(import('../src/agent/skills.js')).rejects.toThrow();
   });
 });
 
@@ -1886,6 +1687,55 @@ describe('Proactive — trySendProactiveMessage execution', () => {
     const result = await trySendProactiveMessage('hello', 'test');
     expect(result).toBe(false);
   });
+
+  // Kill-switch semantics (P1 regression: old code used PROACTIVE_OUTREACH_DISABLED!=='0',
+  // which meant any value except the literal string '0' kept it disabled and values like
+  // 'false'/'no'/'off' silently failed open in the opposite direction).
+  describe('PROACTIVE_OUTREACH_ENABLED kill-switch', () => {
+    const originalEnabled = process.env['PROACTIVE_OUTREACH_ENABLED'];
+    const originalDisabled = process.env['PROACTIVE_OUTREACH_DISABLED'];
+
+    afterEach(() => {
+      if (originalEnabled === undefined) delete process.env['PROACTIVE_OUTREACH_ENABLED'];
+      else process.env['PROACTIVE_OUTREACH_ENABLED'] = originalEnabled;
+      if (originalDisabled === undefined) delete process.env['PROACTIVE_OUTREACH_DISABLED'];
+      else process.env['PROACTIVE_OUTREACH_DISABLED'] = originalDisabled;
+    });
+
+    it('is disabled by default when env is unset', async () => {
+      delete process.env['PROACTIVE_OUTREACH_ENABLED'];
+      process.env['TELEGRAM_BOT_TOKEN'] = 'test';
+      process.env['TELEGRAM_CHAT_ID'] = 'test';
+      const { trySendProactiveMessage } = await import('../src/agent/proactive.js');
+      expect(await trySendProactiveMessage('hello', 'test')).toBe(false);
+    });
+
+    it('is disabled when set to "0" (the old enable-value is now correctly inert)', async () => {
+      process.env['PROACTIVE_OUTREACH_ENABLED'] = '0';
+      process.env['TELEGRAM_BOT_TOKEN'] = 'test';
+      process.env['TELEGRAM_CHAT_ID'] = 'test';
+      const { trySendProactiveMessage } = await import('../src/agent/proactive.js');
+      expect(await trySendProactiveMessage('hello', 'test')).toBe(false);
+    });
+
+    it('is disabled when set to "false"', async () => {
+      process.env['PROACTIVE_OUTREACH_ENABLED'] = 'false';
+      process.env['TELEGRAM_BOT_TOKEN'] = 'test';
+      process.env['TELEGRAM_CHAT_ID'] = 'test';
+      const { trySendProactiveMessage } = await import('../src/agent/proactive.js');
+      expect(await trySendProactiveMessage('hello', 'test')).toBe(false);
+    });
+
+    it('does NOT read the old PROACTIVE_OUTREACH_DISABLED variable', async () => {
+      // Old footgun: setting DISABLED=0 used to *enable* the feature.
+      delete process.env['PROACTIVE_OUTREACH_ENABLED'];
+      process.env['PROACTIVE_OUTREACH_DISABLED'] = '0';
+      process.env['TELEGRAM_BOT_TOKEN'] = 'test';
+      process.env['TELEGRAM_CHAT_ID'] = 'test';
+      const { trySendProactiveMessage } = await import('../src/agent/proactive.js');
+      expect(await trySendProactiveMessage('hello', 'test')).toBe(false);
+    });
+  });
 });
 
 describe('Proactive — startProactiveLoop execution', () => {
@@ -2114,137 +1964,6 @@ describe('Proactive — config defaults', () => {
   it('enabled by default', () => {
     const enabled = true;
     expect(enabled).toBe(true);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 8. PLUGIN LOADER BEHAVIORAL
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe('Plugin loader — loadPlugin execution', () => {
-  let testDir: string;
-
-  beforeEach(async () => {
-    testDir = join(tmpdir(), `lain-plugin-beh-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    await mkdir(testDir, { recursive: true });
-  });
-
-  afterEach(async () => {
-    try { await rm(testDir, { recursive: true }); } catch {}
-  });
-
-  it('throws when manifest.json is missing', async () => {
-    const { loadPlugin } = await import('../src/plugins/loader.js');
-    await expect(loadPlugin(testDir)).rejects.toThrow('manifest not found');
-  });
-
-  it('throws when manifest is missing required fields', async () => {
-    await writeFile(join(testDir, 'manifest.json'), JSON.stringify({ name: 'test' }));
-    const { loadPlugin } = await import('../src/plugins/loader.js');
-    await expect(loadPlugin(testDir)).rejects.toThrow('missing required fields');
-  });
-
-  it('throws when main module does not exist', async () => {
-    await writeFile(join(testDir, 'manifest.json'), JSON.stringify({
-      name: 'test-plugin',
-      version: '1.0.0',
-      main: 'index.js',
-    }));
-    const { loadPlugin } = await import('../src/plugins/loader.js');
-    await expect(loadPlugin(testDir)).rejects.toThrow('Failed to load plugin module');
-  });
-});
-
-describe('Plugin loader — enablePlugin and disablePlugin', () => {
-  it('throws when plugin is not loaded', async () => {
-    const { enablePlugin } = await import('../src/plugins/loader.js');
-    await expect(enablePlugin('nonexistent-plugin-xyz')).rejects.toThrow('not found');
-  });
-
-  it('throws when disabling unknown plugin', async () => {
-    const { disablePlugin } = await import('../src/plugins/loader.js');
-    await expect(disablePlugin('nonexistent-plugin-xyz')).rejects.toThrow('not found');
-  });
-});
-
-describe('Plugin loader — getAllPlugins and getEnabledPlugins', () => {
-  it('getAllPlugins returns an array', async () => {
-    const { getAllPlugins } = await import('../src/plugins/loader.js');
-    const plugins = getAllPlugins();
-    expect(Array.isArray(plugins)).toBe(true);
-  });
-
-  it('getEnabledPlugins returns an array', async () => {
-    const { getEnabledPlugins } = await import('../src/plugins/loader.js');
-    const plugins = getEnabledPlugins();
-    expect(Array.isArray(plugins)).toBe(true);
-  });
-
-  it('getEnabledPlugins only returns plugins with enabled=true', async () => {
-    const { getEnabledPlugins } = await import('../src/plugins/loader.js');
-    const plugins = getEnabledPlugins();
-    expect(plugins.every(p => p.enabled)).toBe(true);
-  });
-});
-
-describe('Plugin loader — runMessageHooks and runResponseHooks', () => {
-  it('runMessageHooks returns input when no plugins are enabled', async () => {
-    const { runMessageHooks } = await import('../src/plugins/loader.js');
-    const result = await runMessageHooks({ text: 'hello' });
-    expect(result).toEqual({ text: 'hello' });
-  });
-
-  it('runResponseHooks returns input when no plugins are enabled', async () => {
-    const { runResponseHooks } = await import('../src/plugins/loader.js');
-    const result = await runResponseHooks({ text: 'response' });
-    expect(result).toEqual({ text: 'response' });
-  });
-});
-
-describe('Plugin loader — unloadPlugin', () => {
-  it('does not throw when unloading unknown plugin', async () => {
-    const { unloadPlugin } = await import('../src/plugins/loader.js');
-    await expect(unloadPlugin('nonexistent-xyz')).resolves.not.toThrow();
-  });
-});
-
-describe('Plugin loader — loadPluginsFromDirectory', () => {
-  let testDir: string;
-
-  beforeEach(async () => {
-    testDir = join(tmpdir(), `lain-plugins-dir-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    await mkdir(testDir, { recursive: true });
-  });
-
-  afterEach(async () => {
-    try { await rm(testDir, { recursive: true }); } catch {}
-  });
-
-  it('returns empty array when directory has no subdirectories', async () => {
-    const { loadPluginsFromDirectory } = await import('../src/plugins/loader.js');
-    const loaded = await loadPluginsFromDirectory(testDir);
-    expect(loaded).toEqual([]);
-  });
-
-  it('returns empty array when directory does not exist', async () => {
-    const { loadPluginsFromDirectory } = await import('../src/plugins/loader.js');
-    const loaded = await loadPluginsFromDirectory('/nonexistent/plugins/xyz');
-    expect(loaded).toEqual([]);
-  });
-
-  it('skips non-directory entries', async () => {
-    await writeFile(join(testDir, 'not-a-dir.txt'), 'not a plugin');
-    const { loadPluginsFromDirectory } = await import('../src/plugins/loader.js');
-    const loaded = await loadPluginsFromDirectory(testDir);
-    expect(loaded).toEqual([]);
-  });
-
-  it('handles plugin load failure gracefully', async () => {
-    await mkdir(join(testDir, 'broken-plugin'));
-    // No manifest.json — will fail
-    const { loadPluginsFromDirectory } = await import('../src/plugins/loader.js');
-    const loaded = await loadPluginsFromDirectory(testDir);
-    expect(loaded).toEqual([]);
   });
 });
 

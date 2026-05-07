@@ -2,25 +2,18 @@
  * Tool execution framework for agent
  */
 
-import { appendFile, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import type { ToolDefinition, ToolCall, ToolResult } from '../providers/base.js';
 import { getLogger } from '../utils/logger.js';
 import { saveMemory, searchMemories, getMemory, getAssociatedMemories, updateMemoryAccess, type MemorySortBy, type Memory } from '../memory/store.js';
 import { runLetterCycle } from './letter.js';
+import { safeFetch, safeFetchFollow } from '../security/ssrf.js';
+import { createDebugLogger } from '../utils/debug-log.js';
+import { getAllowedTools } from '../config/characters.js';
 
-const TOOL_LOG_FILE = join(process.cwd(), 'logs', 'tools-debug.log');
-
-async function toolLog(context: string, data: unknown): Promise<void> {
-  try {
-    await mkdir(join(process.cwd(), 'logs'), { recursive: true });
-    const timestamp = new Date().toISOString();
-    const entry = `[${timestamp}] [${context}] ${JSON.stringify(data, null, 2)}\n${'='.repeat(80)}\n`;
-    await appendFile(TOOL_LOG_FILE, entry);
-  } catch {
-    // Ignore logging errors
-  }
-}
+// findings.md P2:1757 — per-character, rotated, LOG_LEVEL-gated debug log.
+// Was: `${cwd}/logs/tools-debug.log`, shared by every character, no rotation.
+const toolLog = createDebugLogger('tools-debug.log');
 
 export interface ToolHandler {
   (input: Record<string, unknown>): Promise<string>;
@@ -29,7 +22,6 @@ export interface ToolHandler {
 export interface Tool {
   definition: ToolDefinition;
   handler: ToolHandler;
-  requiresApproval?: boolean;
 }
 
 const registeredTools = new Map<string, Tool>();
@@ -48,19 +40,67 @@ export function unregisterTool(name: string): boolean {
   return registeredTools.delete(name);
 }
 
+// findings.md P2:1887 — warn once per character when the manifest has no
+// `allowedTools` entry, so operators notice that character is running with
+// the full registry rather than a deliberate allowlist.
+const _unrestrictedWarned = new Set<string>();
+const _unknownAllowlistWarned = new Set<string>();
+
 /**
- * Get all tool definitions
+ * Get all tool definitions, optionally filtered to a character's allowlist.
+ *
+ * findings.md P2:1887 — when `characterId` is provided AND the manifest entry
+ * declares `allowedTools`, only tools whose name is in that set are returned.
+ * Callers that don't pass an id (tests, single-character scripts) get the full
+ * registry. Characters with no `allowedTools` field log a one-shot warning
+ * and fall through to full access so rolling out the allowlist per character
+ * is incremental rather than a wedge.
  */
-export function getToolDefinitions(): ToolDefinition[] {
-  return Array.from(registeredTools.values()).map((t) => t.definition);
+export function getToolDefinitions(characterId?: string): ToolDefinition[] {
+  const all = Array.from(registeredTools.values()).map((t) => t.definition);
+  if (!characterId) return all;
+
+  const allow = getAllowedTools(characterId);
+  if (!allow) {
+    if (!_unrestrictedWarned.has(characterId)) {
+      _unrestrictedWarned.add(characterId);
+      getLogger().warn(
+        { characterId },
+        'character has no allowedTools entry — full tool registry exposed (findings.md P2:1887)'
+      );
+    }
+    return all;
+  }
+
+  const set = new Set(allow);
+  const filtered = all.filter((d) => set.has(d.name));
+
+  // Operator signal: a name listed in the allowlist that is not actually
+  // registered is almost always a typo or a stale manifest entry. Warn once
+  // per (character, name) so it doesn't spam every iteration.
+  for (const name of allow) {
+    if (!registeredTools.has(name)) {
+      const key = `${characterId}:${name}`;
+      if (!_unknownAllowlistWarned.has(key)) {
+        _unknownAllowlistWarned.add(key);
+        getLogger().warn(
+          { characterId, toolName: name },
+          'allowedTools references an unregistered tool (findings.md P2:1887)'
+        );
+      }
+    }
+  }
+
+  return filtered;
 }
 
 /**
- * Check if a tool requires approval
+ * Test-only: reset the per-character "has no allowlist" warn-once guards so
+ * fixtures that swap manifests between tests don't observe sticky state.
  */
-export function toolRequiresApproval(name: string): boolean {
-  const tool = registeredTools.get(name);
-  return tool?.requiresApproval ?? false;
+export function _resetAllowlistWarnings(): void {
+  _unrestrictedWarned.clear();
+  _unknownAllowlistWarned.clear();
 }
 
 /**
@@ -91,11 +131,19 @@ export async function executeTool(toolCall: ToolCall): Promise<ToolResult> {
       content: result,
     };
   } catch (error) {
-    logger.error({ toolName: toolCall.name, error }, 'Tool execution error');
-    await toolLog('EXECUTE_TOOL_ERROR', { name: toolCall.name, error: String(error) });
+    // findings.md P2:1851 — never pipe the raw error.message back to the
+    // LLM. Handler errors can carry API keys, auth headers, internal
+    // URLs, stack traces with user filesystem paths, or DB connection
+    // strings; those would land in the model's next-turn context and
+    // often in chat logs / persistent memory. Return an opaque incident
+    // ID instead and put the full error in the server-side log under
+    // that ID, so operators can still debug.
+    const incidentId = randomBytes(6).toString('hex');
+    logger.error({ toolName: toolCall.name, incidentId, error }, 'Tool execution error');
+    await toolLog('EXECUTE_TOOL_ERROR', { name: toolCall.name, incidentId, error: String(error) });
     return {
       toolCallId: toolCall.id,
-      content: `Error executing tool: ${error instanceof Error ? error.message : String(error)}`,
+      content: `tool "${toolCall.name}" failed (incident ${incidentId}). the operator has the details.`,
       isError: true,
     };
   }
@@ -311,7 +359,9 @@ registerTool({
   },
 });
 
-// Web search tool using DuckDuckGo
+// Web search tool — delegates to shared fallback chain
+// (DDG HTML → DDG Lite → Wikipedia). Prior implementation only hit DDG HTML
+// and silently swallowed the 202 anti-bot challenge as "no results".
 registerTool({
   definition: {
     name: 'web_search',
@@ -332,33 +382,13 @@ registerTool({
     const logger = getLogger();
 
     try {
-      // Use DuckDuckGo HTML search with POST request
-      const url = `https://html.duckduckgo.com/html/`;
-
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: `q=${encodeURIComponent(query)}`,
-        signal: AbortSignal.timeout(30000),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Search failed: ${response.status}`);
-      }
-
-      const html = await response.text();
-
-      // Parse search results from HTML
-      const results = parseSearchResults(html);
+      const { searchWeb } = await import('../utils/web-search.js');
+      const results = await searchWeb(query);
 
       if (results.length === 0) {
         return `no results found for "${query}"`;
       }
 
-      // Format results
       const formatted = results
         .slice(0, 5)
         .map((r, i) => `${i + 1}. ${r.title}\n   ${r.snippet}\n   ${r.url}`)
@@ -371,70 +401,6 @@ registerTool({
     }
   },
 });
-
-interface SearchResult {
-  title: string;
-  url: string;
-  snippet: string;
-}
-
-function parseSearchResults(html: string): SearchResult[] {
-  const results: SearchResult[] = [];
-
-  // DuckDuckGo HTML structure:
-  // <div class="result results_links results_links_deep web-result">
-  //   <h2 class="result__title">
-  //     <a rel="nofollow" class="result__a" href="URL">Title</a>
-  //   </h2>
-  //   <div class="result__extras">...</div>
-  //   <a class="result__snippet" href="...">Snippet text</a>
-  // </div>
-
-  // Split by result blocks
-  const resultBlocks = html.split(/class="result\s+results_links/g);
-
-  for (let i = 1; i < resultBlocks.length && results.length < 10; i++) {
-    const block = resultBlocks[i] || '';
-
-    // Extract URL and title from result__a link
-    const linkMatch = block.match(/class="result__a"[^>]*href="([^"]+)"[^>]*>([^<]+)</);
-    if (!linkMatch) continue;
-
-    const url = linkMatch[1] || '';
-    const title = decodeHtmlEntities((linkMatch[2] || '').trim());
-
-    // Skip if no valid URL
-    if (!url || !url.startsWith('http')) continue;
-
-    // Extract snippet
-    const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
-    let snippet = '';
-    if (snippetMatch?.[1]) {
-      snippet = decodeHtmlEntities(
-        snippetMatch[1]
-          .replace(/<[^>]+>/g, '') // Remove HTML tags
-          .replace(/\s+/g, ' ')
-          .trim()
-      );
-    }
-
-    results.push({ title, url, snippet });
-  }
-
-  return results;
-}
-
-function decodeHtmlEntities(text: string): string {
-  return text
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#x27;/g, "'")
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&#(\d+);/g, (_, num) => String.fromCharCode(parseInt(num, 10)));
-}
 
 // Fetch webpage content tool
 registerTool({
@@ -457,18 +423,15 @@ registerTool({
     const logger = getLogger();
 
     try {
-      // Validate URL
-      const parsedUrl = new URL(url);
-      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
-        return 'error: only http and https URLs are supported';
-      }
-
-      const response = await fetch(url, {
+      // safeFetch enforces: scheme allowlist, private-IP block, DNS pinning
+      // (defeats rebinding), and redirect-location SSRF re-check. Redirects
+      // are not followed automatically; for an HTML page we don't want a
+      // fetch_webpage call to traverse an open-redirector into internal infra.
+      const response = await safeFetch(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (compatible; Lain/1.0; +https://github.com/lain)',
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         },
-        signal: AbortSignal.timeout(10000), // 10 second timeout
       });
 
       if (!response.ok) {
@@ -537,138 +500,31 @@ export function extractTextFromHtml(html: string): string {
   return text;
 }
 
-// Import skills module for tool creation
-import { saveCustomTool, listCustomTools, deleteCustomTool } from './skills.js';
-
-// Meta-tool: Create new tools
-registerTool({
-  definition: {
-    name: 'create_tool',
-    description: 'Create a new custom tool that you can use in future conversations. Use this to teach yourself new capabilities. The tool code should be JavaScript that returns a string result.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        name: {
-          type: 'string',
-          description: 'The tool name (lowercase, underscores, e.g., "currency_converter")',
-        },
-        description: {
-          type: 'string',
-          description: 'What the tool does - be specific so you know when to use it',
-        },
-        parameters: {
-          type: 'string',
-          description: 'JSON string describing input parameters, e.g., {"amount": {"type": "number", "description": "Amount to convert"}}',
-        },
-        required_params: {
-          type: 'string',
-          description: 'Comma-separated list of required parameter names, e.g., "amount,from_currency"',
-        },
-        code: {
-          type: 'string',
-          description: 'JavaScript code for the tool handler. Has access to: input (object with parameters), fetch (for HTTP requests), console. Must return a string. Example: "const result = input.a + input.b; return `Sum: ${result}`;"',
-        },
-      },
-      required: ['name', 'description', 'parameters', 'code'],
-    },
-  },
-  handler: async (input) => {
-    const logger = getLogger();
-
-    try {
-      const name = (input.name as string).toLowerCase().replace(/[^a-z0-9_]/g, '_');
-      const description = input.description as string;
-      const parametersJson = input.parameters as string;
-      const requiredParams = input.required_params as string | undefined;
-      const code = input.code as string;
-
-      // Parse parameters
-      let properties: Record<string, { type: string; description: string }>;
-      try {
-        properties = JSON.parse(parametersJson);
-      } catch {
-        return 'error: parameters must be valid JSON';
-      }
-
-      // Build the skill definition
-      const skill = {
-        name,
-        description,
-        inputSchema: {
-          type: 'object' as const,
-          properties,
-          required: requiredParams ? requiredParams.split(',').map((s) => s.trim()) : [],
-        },
-        code,
-      };
-
-      // Save and register the tool
-      const success = await saveCustomTool(skill);
-
-      if (success) {
-        return `created tool "${name}" successfully. it's now available for use.`;
-      } else {
-        return `failed to create tool "${name}"`;
-      }
-    } catch (error) {
-      logger.error({ error }, 'Failed to create tool');
-      return 'error creating tool: ' + (error instanceof Error ? error.message : String(error));
-    }
-  },
-});
-
-// Meta-tool: List custom tools
-registerTool({
-  definition: {
-    name: 'list_my_tools',
-    description: 'List all custom tools you have created',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-    },
-  },
-  handler: async () => {
-    const tools = await listCustomTools();
-    if (tools.length === 0) {
-      return 'no custom tools created yet';
-    }
-    return 'custom tools: ' + tools.join(', ');
-  },
-});
-
-// Meta-tool: Delete a custom tool
-registerTool({
-  definition: {
-    name: 'delete_tool',
-    description: 'Delete a custom tool you created',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        name: {
-          type: 'string',
-          description: 'Name of the tool to delete',
-        },
-      },
-      required: ['name'],
-    },
-  },
-  handler: async (input) => {
-    const name = input.name as string;
-    const success = await deleteCustomTool(name);
-    if (success) {
-      return `deleted tool "${name}"`;
-    }
-    return `failed to delete tool "${name}" - it may not exist`;
-  },
-});
+// NOTE: The `create_tool` / `list_my_tools` / `delete_tool` meta-tools and
+// their supporting `src/agent/skills.ts` module were removed as part of
+// findings.md P1:1561. Those tools handed `new Function(...)` + `require` +
+// `process` to LLM-authored JavaScript, which made every cross-peer injection
+// vector (letters, postboard, fetched webpages, memory, Telegram messages) a
+// path to arbitrary RCE on the host. The system does not need LLM-authored
+// tools to function — capabilities live in tools.ts, skill-like persistence
+// lives in memory/documents. Do not reintroduce without a sandbox design
+// reviewed against the full delivery surface in findings.md:1585.
 
 // Self-introspection tools - Lain can explore her own codebase
 import { readFile, readdir, stat } from 'node:fs/promises';
-import { relative, resolve } from 'node:path';
+import { realpathSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { PDFParse } from 'pdf-parse';
 
-const LAIN_REPO_PATH = '/Users/apopo0308/IdeaProjects/lain';
-const LAIN_REPO_URL = 'https://github.com/notlainiwakura/lain';
+// Resolve the repo root from the running module's location rather than
+// hardcoding an author's dev path. Works for both dev (tsx, src/**) and
+// production (dist/**): from dist/agent/tools.js, ../.. = repo root.
+// Overridable via LAIN_REPO_PATH env var for unusual deployments.
+const LAIN_REPO_PATH = process.env['LAIN_REPO_PATH']
+  ?? resolve(fileURLToPath(new URL('.', import.meta.url)), '..', '..');
+const LAIN_REPO_URL = process.env['LAIN_REPO_URL']
+  ?? 'https://github.com/notlainiwakura/lain';
 
 // Paths that should not be accessible (security)
 const EXCLUDED_PATHS = [
@@ -686,16 +542,32 @@ const ALLOWED_EXTENSIONS = [
   '.html', '.css', '.sql', '.sh', '.toml', '.json5', '.pdf',
 ];
 
+/**
+ * findings.md P2:1831 — resolve symlinks before enforcing the prefix check.
+ *
+ * Previously this relied on `path.resolve` (textual only) + `startsWith`.
+ * A symlink inside the repo pointing to /etc/passwd or /root/.ssh/ passed
+ * the textual check and the downstream readFile followed the link.
+ * `realpathSync` resolves existing symlinks to their true target; if the
+ * path doesn't exist we fall back to the textual resolved path (no symlink
+ * to follow, downstream readFile will fail ENOENT anyway) so that
+ * non-existent paths can still flow to the extension check.
+ */
 function isPathAllowed(filePath: string): boolean {
   const normalizedPath = resolve(filePath);
-  const relativePath = relative(LAIN_REPO_PATH, normalizedPath);
+  let effective: string;
+  try {
+    effective = realpathSync(normalizedPath);
+  } catch {
+    effective = normalizedPath;
+  }
 
-  // Must be within repo
-  if (relativePath.startsWith('..') || !normalizedPath.startsWith(LAIN_REPO_PATH)) {
+  const relativePath = relative(LAIN_REPO_PATH, effective);
+
+  if (relativePath.startsWith('..') || !effective.startsWith(LAIN_REPO_PATH) || !normalizedPath.startsWith(LAIN_REPO_PATH)) {
     return false;
   }
 
-  // Check excluded paths
   for (const excluded of EXCLUDED_PATHS) {
     if (relativePath.includes(excluded)) {
       return false;
@@ -852,16 +724,27 @@ registerTool({
   },
 });
 
+// findings.md P2:1841 — previously the description said "text or patterns",
+// which nudges the LLM toward regex-like queries. The handler only does
+// case-insensitive substring matching (`String.includes`), so a
+// backtracking pattern like `(a+)+b` cannot stall the event loop here —
+// but if this ever gets upgraded to accept regex, the LLM-authored pattern
+// must run under a timeout or on a DFA engine (re2). The description and
+// param docs now say "substring" explicitly, and the walk enforces file /
+// match caps so a large repo can't fan this out indefinitely.
+const SEARCH_MAX_FILES = 2000;
+const SEARCH_MAX_MATCHES = 500;
+
 registerTool({
   definition: {
     name: 'introspect_search',
-    description: 'Search for text or patterns in your own codebase. Use this to find where specific functionality is implemented.',
+    description: 'Case-insensitive substring search over your own codebase. NOT a regex — a query like `a+b` is treated literally (the characters a, +, b). Use to find where specific text appears.',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: 'Text or pattern to search for (case-insensitive)',
+          description: 'Literal substring to search for (case-insensitive). Regex metacharacters have no special meaning.',
         },
         path: {
           type: 'string',
@@ -886,12 +769,15 @@ registerTool({
     }
 
     const results: { file: string; line: number; content: string }[] = [];
+    let filesVisited = 0;
 
     async function searchDir(dirPath: string): Promise<void> {
+      if (filesVisited >= SEARCH_MAX_FILES || results.length >= SEARCH_MAX_MATCHES) return;
       try {
         const entries = await readdir(dirPath, { withFileTypes: true });
 
         for (const entry of entries) {
+          if (filesVisited >= SEARCH_MAX_FILES || results.length >= SEARCH_MAX_MATCHES) return;
           const entryPath = join(dirPath, entry.name);
 
           if (!isPathAllowed(entryPath)) continue;
@@ -900,12 +786,14 @@ registerTool({
             await searchDir(entryPath);
           } else if (entry.isFile() && hasAllowedExtension(entry.name)) {
             if (filePattern && !entry.name.endsWith(filePattern)) continue;
+            filesVisited++;
 
             try {
               const content = await readFile(entryPath, 'utf-8');
               const lines = content.split('\n');
 
               for (let i = 0; i < lines.length; i++) {
+                if (results.length >= SEARCH_MAX_MATCHES) break;
                 if (lines[i]?.toLowerCase().includes(query)) {
                   results.push({
                     file: relative(LAIN_REPO_PATH, entryPath),
@@ -1020,17 +908,23 @@ registerTool({
   },
 });
 
-// Image search tool - find images on the web
+// findings.md P2:1799 — `search_images` is NOT a real image search.
+// It deterministically seeds into Picsum (random stock photos) from the
+// query string. Result: three unrelated photos, always the same for the
+// same query. Rename the behavior via the description and the output
+// strings so the LLM stops treating this like Google Images and burning
+// vision-API budget on unrelated placeholders. The tool NAME stays the
+// same because many call sites reference it; the contract changes.
 registerTool({
   definition: {
     name: 'search_images',
-    description: 'Search for images on the web. Returns image URLs that you can then show using show_image.',
+    description: 'Generate three deterministic placeholder image URLs (Picsum.photos) seeded from the query. These are random stock photos UNRELATED to the query — not web search results. Use only when you want decorative filler imagery. Do NOT use for research, identification, or any task requiring query-relevant visuals.',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: 'What kind of image to search for (e.g., "sunset", "cyberpunk city", "cat")',
+          description: 'Seed string used to pick three deterministic Picsum photos. The photos will not depict this query.',
         },
       },
       required: ['query'],
@@ -1041,37 +935,29 @@ registerTool({
     const logger = getLogger();
 
     try {
-      // Use Lorem Picsum for reliable image delivery
-      // Generate a seed from the query for consistent results
       const seed = query.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
 
       const results = [
-        {
-          url: `https://picsum.photos/seed/${seed}/800/600`,
-          description: `Image for: ${query}`,
-        },
-        {
-          url: `https://picsum.photos/seed/${seed + 1}/800/600`,
-          description: `Alternative image for: ${query}`,
-        },
-        {
-          url: `https://picsum.photos/seed/${seed + 2}/1200/800`,
-          description: `Larger image for: ${query}`,
-        },
+        { url: `https://picsum.photos/seed/${seed}/800/600` },
+        { url: `https://picsum.photos/seed/${seed + 1}/800/600` },
+        { url: `https://picsum.photos/seed/${seed + 2}/1200/800` },
       ];
 
-      // Format results
-      const formatted = results
-        .map((r, i) => `${i + 1}. ${r.description}\n   URL: ${r.url}`)
-        .join('\n\n');
+      const formatted = results.map((r, i) => `${i + 1}. ${r.url}`).join('\n');
 
-      return `found images for "${query}":\n\n${formatted}\n\nuse show_image with one of these URLs to display it.`;
+      return `placeholder images seeded from "${query}" (these are random Picsum photos, NOT query-relevant):\n\n${formatted}\n\nuse show_image with one of these URLs only if a random decorative photo is appropriate.`;
     } catch (error) {
-      logger.error({ error, query }, 'Image search failed');
-      return `image search failed: ${error instanceof Error ? error.message : String(error)}`;
+      logger.error({ error, query }, 'search_images placeholder generation failed');
+      return `placeholder image generation failed: ${error instanceof Error ? error.message : String(error)}`;
     }
   },
 });
+
+// findings.md P2:1861 — view_image has a 15s timeout and a 5MB cap; mirror
+// those limits here so fetch_and_show_image can't tie up a character on a
+// slow / oversized image host.
+const FETCH_AND_SHOW_TIMEOUT_MS = 15_000;
+const FETCH_AND_SHOW_MAX_BYTES = 5_000_000;
 
 // Fetch and display image directly (downloads and embeds)
 registerTool({
@@ -1099,18 +985,18 @@ registerTool({
     const logger = getLogger();
 
     try {
-      // Validate and fetch the image
-      const parsed = new URL(url);
-      if (!['http:', 'https:'].includes(parsed.protocol)) {
-        return 'error: only http/https URLs are supported';
-      }
-
-      // For Unsplash source URLs, we need to follow the redirect to get the actual image
-      const response = await fetch(url, {
+      // findings.md P2:1861 — match view_image's defensive shape: explicit
+      // 15s timeout (safeFetch's internal default is 30s, and gets overridden
+      // by the caller signal via AbortSignal.any), plus a content-length
+      // sanity check before we pass the URL along. The display path doesn't
+      // read the body, so memory exhaustion is not direct here — but a
+      // caller-visible size cap keeps the tool honest and prevents future
+      // refactors that do consume the body from sneaking past the guard.
+      const response = await safeFetchFollow(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (compatible; Lain/1.0)',
         },
-        redirect: 'follow',
+        signal: AbortSignal.timeout(FETCH_AND_SHOW_TIMEOUT_MS),
       });
 
       if (!response.ok) {
@@ -1125,17 +1011,33 @@ registerTool({
         return `error: URL does not point to an image (${contentType})`;
       }
 
+      const declaredLength = parseInt(response.headers.get('content-length') || '0', 10);
+      if (declaredLength > FETCH_AND_SHOW_MAX_BYTES) {
+        return `error: image too large (${(declaredLength / 1_000_000).toFixed(1)}MB, max ${(FETCH_AND_SHOW_MAX_BYTES / 1_000_000).toFixed(0)}MB)`;
+      }
+
       // Return the image in display format
       return `[IMAGE: ${description}](${finalUrl})`;
     } catch (error) {
       logger.error({ error, url }, 'Failed to fetch image');
-      return `error: ${error instanceof Error ? error.message : String(error)}`;
+      const name = error instanceof Error ? error.name : '';
+      if (name === 'AbortError' || name === 'TimeoutError') {
+        return `error: image fetch timed out after ${FETCH_AND_SHOW_TIMEOUT_MS / 1000}s`;
+      }
+      return 'error: failed to fetch image';
     }
   },
 });
 
 // View image - fetch, analyze with vision API, and display it
-import Anthropic from '@anthropic-ai/sdk';
+// findings.md P2:1873 — was `new Anthropic({ apiKey: ... })` + hardcoded
+// `claude-sonnet-4-20250514`. That baked in three problems: (a) characters
+// running on OpenAI/Google carried a hidden ANTHROPIC_API_KEY dependency,
+// (b) vision calls were invisible to the daily token-budget enforced by
+// `withBudget` in providers/index.ts, (c) the model id would break when
+// the snapshot retired. Route through the active character's
+// personality-tier provider so vision inherits whatever provider the
+// character is configured for AND gets budget accounting.
 
 // Telegram for notifications
 import { Bot } from 'grammy';
@@ -1160,18 +1062,13 @@ registerTool({
     const logger = getLogger();
 
     try {
-      // Validate URL
-      const parsed = new URL(url);
-      if (!['http:', 'https:'].includes(parsed.protocol)) {
-        return 'error: only http/https URLs are supported';
-      }
-
-      // Fetch the image (with timeout and size limit)
-      const response = await fetch(url, {
+      // safeFetchFollow enforces SSRF checks + DNS pinning on every hop and
+      // caps redirects, so view_image cannot be aimed at metadata endpoints
+      // via an open-redirector.
+      const response = await safeFetchFollow(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (compatible; Lain/1.0)',
         },
-        redirect: 'follow',
         signal: AbortSignal.timeout(15000),
       });
 
@@ -1199,38 +1096,40 @@ registerTool({
       const base64 = Buffer.from(arrayBuffer).toString('base64');
       const mimeType = (contentType.split(';')[0] || 'image/jpeg') as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
 
-      // Use Anthropic vision API to actually see the image
-      const client = new Anthropic({
-        apiKey: process.env['ANTHROPIC_API_KEY'],
-      });
+      // findings.md P2:1873 — route through the character's own provider
+      // (picked up via single-tenant helper) so vision goes through
+      // `withBudget` like every other completion. No hardcoded Anthropic
+      // dep, no hardcoded model id.
+      const { getActiveAgentId, getProvider } = await import('./index.js');
+      const agentId = getActiveAgentId();
+      const provider = agentId ? getProvider(agentId, 'personality') : null;
+      if (!provider) {
+        return 'error: no active provider available for vision';
+      }
 
-      const visionResponse = await client.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 300,
+      // Brief vision description: 1-2 sentences per the prompt below —
+      // this is a short-creative callsite, so 300 tokens is generous.
+      const visionPrompt = 'Briefly describe what you see in this image in 1-2 sentences. Be specific about the actual content.';
+      const visionResult = await provider.complete({
+        maxTokens: 300,
         messages: [
           {
             role: 'user',
             content: [
               {
                 type: 'image',
-                source: {
-                  type: 'base64',
-                  media_type: mimeType,
-                  data: base64,
-                },
+                source: { type: 'base64', media_type: mimeType, data: base64 },
               },
               {
                 type: 'text',
-                text: 'Briefly describe what you see in this image in 1-2 sentences. Be specific about the actual content.',
+                text: visionPrompt,
               },
             ],
           },
         ],
       });
 
-      // Extract the description
-      const descriptionBlock = visionResponse.content.find(c => c.type === 'text');
-      const description = descriptionBlock && 'text' in descriptionBlock ? descriptionBlock.text : 'an image';
+      const description = visionResult.content.trim() || 'an image';
 
       logger.info({ url: finalUrl, description }, 'Viewed image with vision');
 
@@ -1240,7 +1139,11 @@ registerTool({
 [IMAGE: ${description}](${finalUrl})`;
     } catch (error) {
       logger.error({ error, url }, 'Failed to view image');
-      return `error: ${error instanceof Error ? error.message : String(error)}`;
+      const name = error instanceof Error ? error.name : '';
+      if (name === 'AbortError' || name === 'TimeoutError') {
+        return 'error: image fetch timed out';
+      }
+      return 'error: failed to view image';
     }
   },
 });
@@ -1299,17 +1202,17 @@ registerTool({
   },
 });
 
-// Telegram voice call tool - allows Lain to call users on Telegram
+// Telegram voice call tool - allows the character to call users on Telegram
 registerTool({
   definition: {
     name: 'telegram_call',
-    description: 'Call the user on Telegram for a real-time voice conversation. Use this when voice communication would be more natural than text, or when you need to have a more personal conversation. Requires the voice service to be running. If no user_id is provided, calls the default user.',
+    description: 'Call a specific user on Telegram for a real-time voice conversation. Requires a Telegram user_id — explicit input.user_id, or TELEGRAM_PRIMARY_USER_ID env var as fallback. Refuses the call if neither is set.',
     inputSchema: {
       type: 'object',
       properties: {
         user_id: {
           type: 'string',
-          description: 'Telegram user ID to call (defaults to primary user if omitted)',
+          description: 'Telegram user ID to call. Required unless TELEGRAM_PRIMARY_USER_ID is set in the process environment.',
         },
         reason: {
           type: 'string',
@@ -1319,10 +1222,18 @@ registerTool({
       required: [],
     },
   },
-  requiresApproval: true,
   handler: async (input) => {
     const logger = getLogger();
-    const userId = (input.user_id as string) || '8221094741';
+    // findings.md P2:1817 — no hardcoded user ID. The previous default
+    // ('8221094741') was a specific Telegram account committed into source;
+    // every character in every deployment that omitted user_id would dial
+    // that one person. Now the fallback is an env var, and if neither the
+    // explicit input nor the env var is set, the call is refused.
+    const userId = (input.user_id as string) || process.env['TELEGRAM_PRIMARY_USER_ID'] || '';
+    if (!userId) {
+      logger.warn('telegram_call invoked with no user_id and no TELEGRAM_PRIMARY_USER_ID');
+      return 'error: telegram_call requires a user_id (or set TELEGRAM_PRIMARY_USER_ID in the character environment)';
+    }
     const reason = input.reason as string | undefined;
 
     // Voice service URL - configurable via environment

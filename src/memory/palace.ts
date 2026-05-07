@@ -7,7 +7,7 @@
  */
 
 import { nanoid } from 'nanoid';
-import { execute, query, queryOne } from '../storage/database.js';
+import { execute, query, queryOne, transaction } from '../storage/database.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -107,11 +107,22 @@ export function listWings(): Wing[] {
  * Get-or-create a wing by name.
  * If the wing already exists, its ID is returned without modification.
  * If it does not exist, it is created with the optional description.
+ *
+ * findings.md P2:610 — the get-then-insert sequence is wrapped in a
+ * `transaction(...)` so that a second caller looking up the same name
+ * sees a consistent view: either it finds the row this call inserted,
+ * or it begins its transaction after this one's commit and its SELECT
+ * returns the freshly-inserted row. Without the wrap, concurrent
+ * callers each saw "not found" between the SELECT and INSERT and both
+ * created duplicate wings with identical names but distinct IDs —
+ * splitting memories across ghost duplicates and confusing `listWings`.
  */
 export function resolveWing(name: string, description?: string): string {
-  const existing = getWingByName(name);
-  if (existing) return existing.id;
-  return createWing(name, description);
+  return transaction<string>(() => {
+    const existing = getWingByName(name);
+    if (existing) return existing.id;
+    return createWing(name, description);
+  });
 }
 
 /** Atomically increment the memory_count for a wing. */
@@ -167,11 +178,17 @@ export function listRooms(wingId: string): Room[] {
 /**
  * Get-or-create a room within a wing by name.
  * Idempotent: returns the same ID for repeated calls with the same wing+name.
+ *
+ * findings.md P2:610 — same transactional wrap as `resolveWing`. Closes
+ * the race where two concurrent callers both saw "not found" and both
+ * inserted duplicate rooms with the same `(wing_id, name)` pair.
  */
 export function resolveRoom(wingId: string, name: string, description?: string): string {
-  const existing = getRoomByName(wingId, name);
-  if (existing) return existing.id;
-  return createRoom(wingId, name, description);
+  return transaction<string>(() => {
+    const existing = getRoomByName(wingId, name);
+    if (existing) return existing.id;
+    return createRoom(wingId, name, description);
+  });
 }
 
 /** Atomically increment the memory_count for a room. */
@@ -244,7 +261,19 @@ export function resolveWingForMemory(
   sessionKey: string,
   userId: string | null | undefined,
   _metadata?: Record<string, unknown>,
-): { wingName: string; wingDescription: string } {
+): {
+  wingName: string;
+  wingDescription: string;
+  /**
+   * findings.md P2:652 — when present, the caller should use this as
+   * the room name inside the wing instead of the hall-derived name.
+   * Used by the `visitors` branch to give each user their own room
+   * under a single shared wing, which avoids wing-table proliferation
+   * on public-facing characters.
+   */
+  roomName?: string;
+  roomDescription?: string;
+} {
   const key = sessionKey.toLowerCase();
 
   // ── Internal background loops ──────────────────────────────────────────────
@@ -264,16 +293,24 @@ export function resolveWingForMemory(
   }
 
   // ── Inter-inhabitant communication ─────────────────────────────────────────
+  // findings.md P2:644 — the prefix match above was already case-insensitive
+  // via `sessionKey.toLowerCase()`, but the tail used to preserve the
+  // original casing. That let `letter:Wired-Lain` and `letter:wired-lain`
+  // create two separate wings for the same peer, splitting the
+  // correspondence view. We now lowercase the tail too (prefix-and-tail
+  // symmetry). Character IDs in this codebase are already lowercase-kebab;
+  // this enforces the convention at the resolution boundary instead of
+  // trusting every caller.
   if (key.startsWith('letter:')) {
     // e.g. 'letter:wired-lain' → 'wired-lain'
-    const target = sessionKey.slice('letter:'.length).trim() || 'unknown';
+    const target = key.slice('letter:'.length).trim() || 'unknown';
     return { wingName: target, wingDescription: `Letters and correspondence with ${target}` };
   }
 
   if (key.startsWith('commune:') || key.startsWith('peer:')) {
     // e.g. 'commune:pkd' or 'peer:mckenna'
-    const colonIdx = sessionKey.indexOf(':');
-    const target = colonIdx >= 0 ? sessionKey.slice(colonIdx + 1).trim() : 'unknown';
+    const colonIdx = key.indexOf(':');
+    const target = colonIdx >= 0 ? key.slice(colonIdx + 1).trim() : 'unknown';
     return { wingName: target, wingDescription: `Encounters and conversations with ${target}` };
   }
 
@@ -295,10 +332,19 @@ export function resolveWingForMemory(
   }
 
   // ── Visitor-specific wing ──────────────────────────────────────────────────
+  // findings.md P2:652 — was `visitor-${userId}` per user, which grew
+  // `palace_wings` unbounded on public-facing characters (one wing
+  // per random visitor, most never returning). Consolidated into a
+  // single `visitors` wing with per-user rooms. The room table
+  // absorbs the per-user cardinality but stays lighter than wings
+  // (rooms are a thinner grouping — no wing-level metadata counters
+  // or palace-navigation entry) and the wing list stays bounded.
   if (userId) {
     return {
-      wingName: `visitor-${userId}`,
-      wingDescription: `Memories from interactions with visitor ${userId}`,
+      wingName: 'visitors',
+      wingDescription: 'Memories from interactions with visitors',
+      roomName: `visitor-${userId}`,
+      roomDescription: `Interactions with visitor ${userId}`,
     };
   }
 

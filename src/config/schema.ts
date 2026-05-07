@@ -58,37 +58,6 @@ const configSchema: JSONSchemaType<LainConfig> = {
       ],
       additionalProperties: false,
     },
-    agents: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          id: { type: 'string', pattern: '^[a-z0-9-]+$' },
-          name: { type: 'string' },
-          enabled: { type: 'boolean' },
-          workspace: { type: 'string' },
-          providers: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                type: { type: 'string', enum: ['anthropic', 'openai', 'google'] },
-                model: { type: 'string' },
-                apiKeyEnv: { type: 'string', nullable: true },
-                baseURL: { type: 'string', nullable: true },
-                fallbackModels: { type: 'array', items: { type: 'string' }, nullable: true },
-              },
-              required: ['type', 'model'],
-              additionalProperties: false,
-            },
-            minItems: 1,
-          },
-        },
-        required: ['id', 'name', 'enabled', 'workspace', 'providers'],
-        additionalProperties: false,
-      },
-      minItems: 1,
-    },
     logging: {
       type: 'object',
       properties: {
@@ -103,7 +72,7 @@ const configSchema: JSONSchemaType<LainConfig> = {
       additionalProperties: false,
     },
   },
-  required: ['version', 'gateway', 'security', 'agents', 'logging'],
+  required: ['version', 'gateway', 'security', 'logging'],
   additionalProperties: false,
 };
 

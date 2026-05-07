@@ -1,0 +1,51 @@
+{
+  "town": {
+    "name": "Newtown",
+    "description": "A local-only autonomous town where three residents live, think, dream, and converse."
+  },
+  "characters": [
+    {
+      "id": "newtown",
+      "name": "Newtown",
+      "port": 3000,
+      "server": "web",
+      "defaultLocation": "square",
+      "immortal": true,
+      "possessable": false,
+      "workspace": "workspace",
+      "providers": [
+        {
+          "type": "openai",
+          "model": "MiniMax-M2.7",
+          "apiKeyEnv": "OPENAI_API_KEY",
+          "baseURL": "http://192.168.68.69:8080/v1"
+        }
+      ]
+    },
+    {
+      "id": "neo",
+      "name": "Neo",
+      "port": 3003,
+      "server": "character",
+      "defaultLocation": "station",
+      "workspace": "workspace/characters/neo"
+    },
+    {
+      "id": "plato",
+      "name": "Plato",
+      "port": 3004,
+      "server": "character",
+      "defaultLocation": "mystery-tower",
+      "workspace": "workspace/characters/plato"
+    },
+    {
+      "id": "joe",
+      "name": "Joe",
+      "port": 3005,
+      "server": "character",
+      "defaultLocation": "square",
+      "possessable": true,
+      "workspace": "workspace/characters/joe"
+    }
+  ]
+}

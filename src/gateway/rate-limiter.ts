@@ -7,8 +7,16 @@ import type { ConnectionRateLimit } from '../types/gateway.js';
 
 interface RateLimitState {
   connections: Map<string, ConnectionState>;
-  globalConnectionCount: number;
-  globalWindowStart: number;
+  // findings.md P2:2616 — `canConnect()` used to share a single global
+  // counter with the authenticated-connection limit, so unauth'd
+  // connect storms ate the budget and locked out legit users. Split
+  // into a cheap pre-auth quota (big enough that single-attacker DoS
+  // is hard but not impossible) and a separate authenticated quota
+  // bumped from the configured `connectionsPerMinute`.
+  preAuthConnectionCount: number;
+  preAuthWindowStart: number;
+  authConnectionCount: number;
+  authWindowStart: number;
 }
 
 interface ConnectionState {
@@ -20,9 +28,17 @@ interface ConnectionState {
 
 const state: RateLimitState = {
   connections: new Map(),
-  globalConnectionCount: 0,
-  globalWindowStart: Date.now(),
+  preAuthConnectionCount: 0,
+  preAuthWindowStart: Date.now(),
+  authConnectionCount: 0,
+  authWindowStart: Date.now(),
 };
+
+// Pre-auth budget is 10x the authenticated rate, floored at 1000/min —
+// cheap enough that a single client can't starve it accidentally but
+// still a backstop against runaway connect loops on a shared host.
+const PRE_AUTH_BUDGET_MULTIPLIER = 10;
+const PRE_AUTH_MIN_PER_MINUTE = 1000;
 
 let config: RateLimitConfig = {
   connectionsPerMinute: 60,
@@ -38,24 +54,54 @@ export function configureRateLimiter(rateLimitConfig: RateLimitConfig): void {
 }
 
 /**
- * Check if a new connection is allowed
+ * Pre-auth connection throttle — cheap per-minute cap that prevents
+ * unauth'd connect storms from starving the authenticated connection
+ * budget. See findings.md P2:2616.
  */
 export function canConnect(): { allowed: boolean; retryAfter?: number } {
   const now = Date.now();
   const windowDuration = 60 * 1000; // 1 minute
 
-  // Reset window if needed
-  if (now - state.globalWindowStart > windowDuration) {
-    state.globalConnectionCount = 0;
-    state.globalWindowStart = now;
+  if (now - state.preAuthWindowStart > windowDuration) {
+    state.preAuthConnectionCount = 0;
+    state.preAuthWindowStart = now;
   }
 
-  if (state.globalConnectionCount >= config.connectionsPerMinute) {
-    const retryAfter = Math.ceil((state.globalWindowStart + windowDuration - now) / 1000);
+  const preAuthLimit = Math.max(
+    PRE_AUTH_MIN_PER_MINUTE,
+    config.connectionsPerMinute * PRE_AUTH_BUDGET_MULTIPLIER,
+  );
+
+  if (state.preAuthConnectionCount >= preAuthLimit) {
+    const retryAfter = Math.ceil((state.preAuthWindowStart + windowDuration - now) / 1000);
     return { allowed: false, retryAfter };
   }
 
-  state.globalConnectionCount++;
+  state.preAuthConnectionCount++;
+  return { allowed: true };
+}
+
+/**
+ * Authenticated-connection throttle — enforced on successful auth.
+ * Uses the configured `connectionsPerMinute`. Separate from the pre-auth
+ * counter so unauth'd noise can't lock out legitimate operators.
+ * See findings.md P2:2616.
+ */
+export function canAuthenticate(): { allowed: boolean; retryAfter?: number } {
+  const now = Date.now();
+  const windowDuration = 60 * 1000;
+
+  if (now - state.authWindowStart > windowDuration) {
+    state.authConnectionCount = 0;
+    state.authWindowStart = now;
+  }
+
+  if (state.authConnectionCount >= config.connectionsPerMinute) {
+    const retryAfter = Math.ceil((state.authWindowStart + windowDuration - now) / 1000);
+    return { allowed: false, retryAfter };
+  }
+
+  state.authConnectionCount++;
   return { allowed: true };
 }
 
@@ -155,8 +201,10 @@ export function getRateLimitStatus(connectionId: string): ConnectionRateLimit | 
  */
 export function resetRateLimiter(): void {
   state.connections.clear();
-  state.globalConnectionCount = 0;
-  state.globalWindowStart = Date.now();
+  state.preAuthConnectionCount = 0;
+  state.preAuthWindowStart = Date.now();
+  state.authConnectionCount = 0;
+  state.authWindowStart = Date.now();
 }
 
 /**

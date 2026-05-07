@@ -12,13 +12,13 @@ import { query } from '../storage/database.js';
 import { getMeta, setMeta } from '../storage/database.js';
 import { getLogger } from '../utils/logger.js';
 import { getBasePath } from '../config/paths.js';
+import { getInterlinkHeaders } from '../security/interlink-auth.js';
 import type { WiredLetter } from './membrane.js';
 
 interface LetterConfig {
   intervalMs: number;
   targetHour: number;
   targetUrl: string | null;
-  authToken: string | null;
   enabled: boolean;
   maxJitterMs: number;
 }
@@ -43,7 +43,6 @@ const DEFAULT_CONFIG: LetterConfig = {
   intervalMs: 24 * 60 * 60 * 1000,
   targetHour: 21,
   targetUrl: process.env['LAIN_INTERLINK_TARGET'] ?? null,
-  authToken: process.env['LAIN_INTERLINK_TOKEN'] ?? null,
   enabled: true,
   maxJitterMs: 30 * 60 * 1000,
 };
@@ -295,7 +294,7 @@ export async function runLetterCycle(cfg: LetterConfig = DEFAULT_CONFIG): Promis
         .join('\n')
     : '(emotionally quiet period)';
 
-  const characterId = process.env['LAIN_CHARACTER_ID'] || 'newtown';
+  const characterId = process.env['LAIN_CHARACTER_ID'] || 'lain';
   const isWired = characterId === 'wired-lain';
 
   const identity = isWired
@@ -367,13 +366,15 @@ Return ONLY the JSON object, no markdown fencing.`;
   }
 
   // Deliver
+  const headers = getInterlinkHeaders();
+  if (!headers) {
+    logger.warn('Letter delivery skipped: interlink not configured');
+    return;
+  }
   try {
     const response = await fetch(cfg.targetUrl!, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(cfg.authToken ? { 'Authorization': `Bearer ${cfg.authToken}` } : {}),
-      },
+      headers,
       body: JSON.stringify(letter),
     });
 

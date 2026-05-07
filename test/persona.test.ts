@@ -19,11 +19,12 @@ vi.mock('node:fs/promises', () => ({
 
 vi.mock('../src/config/characters.js', () => ({
   getWebCharacter: vi.fn(),
+  getAllCharacters: vi.fn(() => []),
 }));
 
 import { readFile } from 'node:fs/promises';
 import { eventBus } from '../src/events/bus.js';
-import { getWebCharacter } from '../src/config/characters.js';
+import { getWebCharacter, getAllCharacters } from '../src/config/characters.js';
 import {
   loadPersona,
   buildSystemPrompt,
@@ -34,6 +35,7 @@ import {
 
 const mockedReadFile = vi.mocked(readFile);
 const mockedGetWebCharacter = vi.mocked(getWebCharacter);
+const mockedGetAllCharacters = vi.mocked(getAllCharacters);
 
 describe('Persona Engine', () => {
   beforeEach(() => {
@@ -49,6 +51,7 @@ describe('Persona Engine', () => {
       immortal: true,
       workspace: 'workspace/characters/wired-lain',
     });
+    mockedGetAllCharacters.mockReturnValue([]);
   });
 
   describe('loadPersona', () => {
@@ -126,7 +129,7 @@ describe('Persona Engine', () => {
       expect(prompt).toContain('My name is Test.');
     });
 
-    it('should include section headers', () => {
+    it('should include Operating Instructions and Identity section headers', () => {
       const prompt = buildSystemPrompt({
         soul: 'soul',
         agents: 'agents',
@@ -134,7 +137,6 @@ describe('Persona Engine', () => {
       });
       expect(prompt).toContain('Operating Instructions');
       expect(prompt).toContain('Identity');
-      expect(prompt).toContain('Communication Guidelines');
     });
 
     it('should separate sections with horizontal rules', () => {
@@ -143,25 +145,28 @@ describe('Persona Engine', () => {
         agents: 'agents',
         identity: 'identity',
       });
-      expect(prompt.match(/---/g)!.length).toBeGreaterThanOrEqual(3);
+      expect(prompt.match(/---/g)!.length).toBeGreaterThanOrEqual(2);
     });
 
-    it('should include communication guidelines about lowercase usage', () => {
-      const prompt = buildSystemPrompt({
-        soul: 's',
-        agents: 'a',
-        identity: 'i',
-      });
+    it('should append Communication Guidelines only for Lain', () => {
+      const prompt = buildSystemPrompt({ soul: 's', agents: 'a', identity: 'i' }, 'lain');
+      expect(prompt).toContain('Communication Guidelines');
       expect(prompt).toContain('lowercase');
+      expect(prompt).toContain('...');
     });
 
-    it('should include guideline about ellipsis usage', () => {
-      const prompt = buildSystemPrompt({
-        soul: 's',
-        agents: 'a',
-        identity: 'i',
-      });
-      expect(prompt).toContain('...');
+    it('should NOT append Communication Guidelines for non-Lain characters (identity-contamination regression)', () => {
+      const prompt = buildSystemPrompt(
+        { soul: 'I am Philip K. Dick.', agents: 'a', identity: 'i' },
+        'pkd'
+      );
+      expect(prompt).not.toContain('You are Lain Iwakura');
+      expect(prompt).not.toContain('Communication Guidelines');
+    });
+
+    it('should NOT append Communication Guidelines when characterId omitted', () => {
+      const prompt = buildSystemPrompt({ soul: 's', agents: 'a', identity: 'i' });
+      expect(prompt).not.toContain('You are Lain Iwakura');
     });
   });
 

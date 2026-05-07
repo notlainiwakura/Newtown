@@ -47,11 +47,17 @@ const {
   };
 });
 
-vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: { create: mockAnthropicCreate, stream: mockAnthropicStream },
-  })),
-}));
+vi.mock('@anthropic-ai/sdk', async () => {
+  // findings.md P2:838 — preserve real APIError exports so the provider's
+  // `err instanceof APIError` retry classification works under test.
+  const actual = await vi.importActual<typeof import('@anthropic-ai/sdk')>('@anthropic-ai/sdk');
+  return {
+    ...actual,
+    default: vi.fn().mockImplementation(() => ({
+      messages: { create: mockAnthropicCreate, stream: mockAnthropicStream },
+    })),
+  };
+});
 
 vi.mock('openai', () => ({
   default: vi.fn().mockImplementation(() => ({
@@ -63,6 +69,12 @@ vi.mock('@google/generative-ai', () => ({
   GoogleGenerativeAI: vi.fn().mockImplementation(() => ({
     getGenerativeModel: mockGetGenerativeModel,
   })),
+  FunctionCallingMode: {
+    MODE_UNSPECIFIED: 'MODE_UNSPECIFIED',
+    AUTO: 'AUTO',
+    ANY: 'ANY',
+    NONE: 'NONE',
+  },
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -284,10 +296,10 @@ describe('Anthropic: finish reason surfaced on every method', () => {
     expect(r.finishReason).toBe('stop');
   });
 
-  it('complete() returns "stop" for unknown stop_reason values', async () => {
+  it('complete() returns "unknown" for unrecognized stop_reason values (findings.md P2:940)', async () => {
     mockAnthropicCreate.mockResolvedValue(anthropicResponse('hello', 'something_new'));
     const r = await makeAnthropic().complete({ messages: simpleMessages });
-    expect(r.finishReason).toBe('stop');
+    expect(r.finishReason).toBe('unknown');
   });
 
   // --- completeWithTools() ---
@@ -372,13 +384,13 @@ describe('Anthropic: finish reason surfaced on every method', () => {
     expect(r.finishReason).toBe('stop');
   });
 
-  it('completeStream() returns "stop" for unknown stream stop_reason', async () => {
+  it('completeStream() returns "unknown" for unrecognized stream stop_reason (findings.md P2:940)', async () => {
     mockAnthropicStream.mockReturnValue(makeStreamEvents('text', 'unknown_reason'));
     const r = await makeAnthropic().completeStream!(
       { messages: simpleMessages },
       () => {}
     );
-    expect(r.finishReason).toBe('stop');
+    expect(r.finishReason).toBe('unknown');
   });
 
   // --- completeWithToolsStream() ---
@@ -553,10 +565,10 @@ describe('OpenAI: finish reason surfaced on every method', () => {
     expect(r.finishReason).toBe('stop');
   });
 
-  it('complete() returns "stop" for unknown finish_reason', async () => {
+  it('complete() returns "tool_use" for deprecated function_call finish_reason (findings.md P2:940)', async () => {
     mockOpenAICreate.mockResolvedValue(openaiResponse('text', 'function_call'));
     const r = await makeOpenAI().complete({ messages: simpleMessages });
-    expect(r.finishReason).toBe('stop');
+    expect(r.finishReason).toBe('tool_use');
   });
 
   // --- completeWithTools() ---
@@ -690,16 +702,22 @@ describe('Google: finish reason surfaced on every method', () => {
     expect(r.finishReason).toBe('stop');
   });
 
-  it('complete() returns "stop" for unknown Google finishReason values', async () => {
+  it('complete() returns "content_filter" for RECITATION (findings.md P2:1000)', async () => {
     mockGenerateContent.mockResolvedValue(googleResponse('text', 'RECITATION'));
     const r = await makeGoogle().complete({ messages: simpleMessages });
-    expect(r.finishReason).toBe('stop');
+    expect(r.finishReason).toBe('content_filter');
   });
 
-  it('complete() returns "stop" for BLOCKLIST finishReason', async () => {
+  it('complete() returns "content_filter" for BLOCKLIST (findings.md P2:1000)', async () => {
     mockGenerateContent.mockResolvedValue(googleResponse('text', 'BLOCKLIST'));
     const r = await makeGoogle().complete({ messages: simpleMessages });
-    expect(r.finishReason).toBe('stop');
+    expect(r.finishReason).toBe('content_filter');
+  });
+
+  it('complete() returns "unknown" for unrecognized Google finishReason values (findings.md P2:940)', async () => {
+    mockGenerateContent.mockResolvedValue(googleResponse('text', 'WHO_KNOWS'));
+    const r = await makeGoogle().complete({ messages: simpleMessages });
+    expect(r.finishReason).toBe('unknown');
   });
 
   // --- completeWithTools() ---
@@ -965,8 +983,11 @@ describe('Provider source: mapStopReason / mapFinishReason correctness', () => {
   });
 
   it('OpenAI mapFinishReason handles tool_calls -> tool_use', () => {
+    // findings.md P2:940 — 'function_call' now falls through into the same
+    // return as 'tool_calls', so the case label may be followed by another
+    // case label before the return.
     const src = readSrc('providers/openai.ts');
-    expect(src).toMatch(/case\s*['"]tool_calls['"]\s*:\s*\n\s*return\s*['"]tool_use['"]/);
+    expect(src).toMatch(/case\s*['"]tool_calls['"]\s*:\s*\n(?:\s*case\s*['"][^'"]+['"]\s*:\s*\n)*\s*return\s*['"]tool_use['"]/);
   });
 
   it('OpenAI mapFinishReason has a default fallback', () => {
@@ -986,8 +1007,17 @@ describe('Provider source: mapStopReason / mapFinishReason correctness', () => {
   });
 
   it('Google mapFinishReason handles SAFETY -> content_filter', () => {
+    // findings.md P2:1000 — SAFETY now shares the content_filter branch with
+    // RECITATION / BLOCKLIST / PROHIBITED_CONTENT / SPII via case fall-through.
     const src = readSrc('providers/google.ts');
-    expect(src).toMatch(/case\s*['"]SAFETY['"]\s*:\s*\n\s*return\s*['"]content_filter['"]/);
+    expect(src).toMatch(/case\s*['"]SAFETY['"]\s*:[\s\S]*?return\s*['"]content_filter['"]/);
+  });
+
+  it('Google mapFinishReason handles RECITATION/BLOCKLIST/PROHIBITED_CONTENT -> content_filter (findings.md P2:1000)', () => {
+    const src = readSrc('providers/google.ts');
+    for (const label of ['RECITATION', 'BLOCKLIST', 'PROHIBITED_CONTENT']) {
+      expect(src).toMatch(new RegExp(`case\\s*['"]${label}['"]\\s*:[\\s\\S]*?return\\s*['"]content_filter['"]`));
+    }
   });
 
   it('Google mapFinishReason has a default fallback', () => {
@@ -1466,9 +1496,9 @@ describe('Dreams truncation is silent', () => {
     expect(src).not.toContain('finishReason');
   });
 
-  it('dreams uses maxTokens: 400 for fragment generation', () => {
+  it('dreams uses maxTokens: 500 for fragment generation', () => {
     const src = readSrc('agent/dreams.ts');
-    expect(src).toContain('maxTokens: 400');
+    expect(src).toContain('maxTokens: 500');
   });
 
   it('dreams parses response directly without truncation awareness', () => {
@@ -1482,11 +1512,11 @@ describe('Dreams truncation is silent', () => {
 
   it('dreams has a dream residue compression call with low maxTokens', () => {
     const src = readSrc('agent/dreams.ts');
-    // The compression call uses a very low maxTokens
+    // The compression call uses a low maxTokens relative to fragment generation
     const compressionMatch = src.match(/Compress this dream[\s\S]*?maxTokens:\s*(\d+)/);
     if (compressionMatch) {
       const tokens = Number(compressionMatch[1]);
-      expect(tokens).toBeLessThanOrEqual(100);
+      expect(tokens).toBeLessThanOrEqual(200);
       // This is intentionally low but the result is never checked for truncation
     }
   });
@@ -1536,11 +1566,9 @@ describe('Self-concept truncation is silent', () => {
     expect(src).not.toContain('finishReason');
   });
 
-  it('self-concept uses maxTokens: 800 which could truncate 300-500 word target', () => {
+  it('self-concept uses maxTokens: 1024 for 300-500 word target', () => {
     const src = readSrc('agent/self-concept.ts');
-    expect(src).toContain('maxTokens: 800');
-    // 800 tokens is roughly 600 words — should be sufficient for 300-500 word target
-    // but if the LLM is verbose, it could be truncated
+    expect(src).toContain('maxTokens: 1024');
   });
 });
 
@@ -1560,9 +1588,9 @@ describe('Internal state truncation would corrupt emotional JSON', () => {
     expect(src).toContain('JSON.parse');
   });
 
-  it('internal-state uses maxTokens: 512 for JSON that could exceed that', () => {
+  it('internal-state uses maxTokens: 500 for JSON that could exceed that', () => {
     const src = readSrc('agent/internal-state.ts');
-    expect(src).toContain('maxTokens: 512');
+    expect(src).toContain('maxTokens: 500');
   });
 });
 
@@ -1577,9 +1605,9 @@ describe('Curiosity truncation is silent', () => {
     expect(src).not.toContain('finishReason');
   });
 
-  it('curiosity uses maxTokens: 256 — borderline for summaries', () => {
+  it('curiosity uses maxTokens: 400 for query generation', () => {
     const src = readSrc('agent/curiosity.ts');
-    expect(src).toContain('maxTokens: 256');
+    expect(src).toContain('maxTokens: 400');
   });
 
   it('curiosity checks for [NOTHING] sentinel but not truncation', () => {
@@ -1601,24 +1629,24 @@ describe('Book system truncation is silent', () => {
     expect(src).not.toContain('finishReason');
   });
 
-  it('book chapter drafts use maxTokens: 5000 — could truncate long chapters', () => {
+  it('book chapter drafts use maxTokens: 8000', () => {
     const src = readSrc('agent/book.ts');
-    expect(src).toContain('maxTokens: 5000');
+    expect(src).toContain('maxTokens: 8000');
   });
 
-  it('book revision uses maxTokens: 6000 — could truncate rewrites', () => {
+  it('book revision uses maxTokens: 8000', () => {
+    const src = readSrc('agent/book.ts');
+    expect(src).toContain('maxTokens: 8000');
+  });
+
+  it('book outline generation uses maxTokens: 4096', () => {
+    const src = readSrc('agent/book.ts');
+    expect(src).toContain('maxTokens: 4096');
+  });
+
+  it('book synthesis uses maxTokens: 6000', () => {
     const src = readSrc('agent/book.ts');
     expect(src).toContain('maxTokens: 6000');
-  });
-
-  it('book outline generation uses maxTokens: 3000', () => {
-    const src = readSrc('agent/book.ts');
-    expect(src).toContain('maxTokens: 3000');
-  });
-
-  it('book synthesis uses maxTokens: 4000', () => {
-    const src = readSrc('agent/book.ts');
-    expect(src).toContain('maxTokens: 4000');
   });
 
   it('book decideAction uses maxTokens: 10 intentionally for single-word', () => {
@@ -1888,7 +1916,7 @@ describe('Multiple tool rounds: finishReason per round', () => {
     const r2 = await p.continueWithToolResults(
       { messages: simpleMessages, tools: sampleTools },
       r1.toolCalls!,
-      [{ toolCallId: 'call_0', content: 'result' }]
+      [{ toolCallId: r1.toolCalls![0]!.id, content: 'result' }]
     );
     expect(r2.finishReason).toBe('length');
   });
@@ -2263,16 +2291,17 @@ describe('Provider methods that return finishReason', () => {
     expect(typeof makeOpenAI().continueWithToolResults).toBe('function');
   });
 
-  it('OpenAIProvider does NOT have completeStream (not implemented)', () => {
-    expect(makeOpenAI().completeStream).toBeUndefined();
+  // findings.md P2:990 — OpenAI now implements the streaming methods.
+  it('OpenAIProvider has completeStream', () => {
+    expect(typeof makeOpenAI().completeStream).toBe('function');
   });
 
-  it('OpenAIProvider does NOT have completeWithToolsStream (not implemented)', () => {
-    expect(makeOpenAI().completeWithToolsStream).toBeUndefined();
+  it('OpenAIProvider has completeWithToolsStream', () => {
+    expect(typeof makeOpenAI().completeWithToolsStream).toBe('function');
   });
 
-  it('OpenAIProvider does NOT have continueWithToolResultsStream (not implemented)', () => {
-    expect(makeOpenAI().continueWithToolResultsStream).toBeUndefined();
+  it('OpenAIProvider has continueWithToolResultsStream', () => {
+    expect(typeof makeOpenAI().continueWithToolResultsStream).toBe('function');
   });
 
   it('GoogleProvider has complete()', () => {
@@ -2333,15 +2362,15 @@ describe('Commune loop maxTokens values and their truncation risk', () => {
     expect(Number(match![1])).toBe(512);
   });
 
-  it('commune approach decision uses maxTokens: 150', () => {
+  it('commune approach decision uses maxTokens: 300', () => {
     const src = readSrc('agent/commune-loop.ts');
     // The approach decision is a short yes/no + tool use
-    expect(src).toContain('maxTokens: 150');
+    expect(src).toContain('maxTokens: 300');
   });
 
-  it('commune aftermath uses maxTokens: 600', () => {
+  it('commune aftermath uses maxTokens: 800', () => {
     const src = readSrc('agent/commune-loop.ts');
-    expect(src).toContain('maxTokens: 600');
+    expect(src).toContain('maxTokens: 800');
   });
 
   it('all commune maxTokens values are documented in this test', () => {
@@ -2350,7 +2379,7 @@ describe('Commune loop maxTokens values and their truncation risk', () => {
     expect(allTokenValues.length).toBeGreaterThanOrEqual(4);
     // Every value should be accounted for in the tests above
     for (const val of allTokenValues) {
-      expect([150, 512, 600, 1024]).toContain(val);
+      expect([300, 512, 800, 1024]).toContain(val);
     }
   });
 });
@@ -2562,10 +2591,13 @@ describe('OpenAI edge cases: missing or unusual response data', () => {
     expect(r.usage.outputTokens).toBe(0);
   });
 
-  it('finish_reason "function_call" (deprecated) maps to "stop" (default)', async () => {
+  it('finish_reason "function_call" (deprecated) maps to "tool_use" (findings.md P2:940)', async () => {
+    // findings.md P2:940 — OpenAI's legacy function_call enum value is still
+    // the model signaling tool use; mapping it to 'stop' swallowed the
+    // signal. Route it to 'tool_use' alongside the current 'tool_calls'.
     mockOpenAICreate.mockResolvedValue(openaiResponse('text', 'function_call'));
     const r = await makeOpenAI().complete({ messages: simpleMessages });
-    expect(r.finishReason).toBe('stop');
+    expect(r.finishReason).toBe('tool_use');
   });
 
   it('continueWithToolResults with "length" finishReason reports truncation', async () => {
